@@ -275,8 +275,6 @@ pub mod status;
 pub mod subject;
 mod tls;
 
-pub mod leafnode;
-
 pub use message::Message;
 pub use status::StatusCode;
 
@@ -404,7 +402,7 @@ pub(crate) enum Command {
 
 /// `ClientOp` represents all actions of `Client`.
 #[derive(Debug)]
-pub(crate) enum ClientOp {
+pub enum ClientOp {
     Publish {
         subject: Subject,
         payload: Bytes,
@@ -1478,7 +1476,8 @@ impl std::fmt::Display for ServerError {
 }
 
 /// Info to construct a CONNECT message.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ConnectInfo {
     /// Turns on +OK protocol acknowledgments.
     pub verbose: bool,
@@ -1539,10 +1538,11 @@ pub struct ConnectInfo {
 }
 
 /// Protocol version used by the client.
-#[derive(Serialize_repr, Deserialize_repr, PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(Serialize_repr, Deserialize_repr, PartialEq, Eq, Debug, Clone, Copy, Default)]
 #[repr(u8)]
 pub enum Protocol {
     /// Original protocol.
+    #[default]
     Original = 0,
     /// Protocol with dynamic reconfiguration of cluster and lame duck mode functionality.
     Dynamic = 1,

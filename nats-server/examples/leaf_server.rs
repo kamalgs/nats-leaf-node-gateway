@@ -3,8 +3,9 @@
 // Usage:
 //   cargo run --example leaf_server -- --port 4222
 //   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:4111
+//   cargo run --example leaf_server -- --port 4222 --ws-port 4223
 
-use async_nats::leafnode::{LeafServer, LeafServerConfig};
+use nats_server::{LeafServer, LeafServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,9 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.server_name = args[i].clone();
             }
+            #[cfg(feature = "websockets")]
+            "--ws-port" => {
+                i += 1;
+                config.ws_port = Some(args[i].parse().expect("invalid ws-port"));
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
-                eprintln!("Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME]");
+                eprintln!(
+                    "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] [--ws-port PORT]"
+                );
                 std::process::exit(1);
             }
         }
@@ -49,6 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(ref hub) = config.hub_url {
         println!("Upstream hub: {hub}");
+    }
+    #[cfg(feature = "websockets")]
+    if let Some(ws_port) = config.ws_port {
+        println!("WebSocket listener on port {ws_port}");
     }
 
     let server = LeafServer::new(config);

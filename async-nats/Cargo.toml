@@ -41,7 +41,7 @@ ring = { version = "0.17", optional = true }
 rand = "0.8"
 rustls-webpki = { package = "rustls-webpki", default-features = false, version = "0.102" }
 portable-atomic = "1"
-tokio-websockets = { version = "0.10", default-features = false, features = ["client", "rand", "rustls-webpki-roots"], optional = true }
+tokio-websockets = { version = "0.10", default-features = false, features = ["client", "server", "sha1_smol", "rand", "rustls-webpki-roots"], optional = true }
 pin-project = "1.0"
 
 [dev-dependencies]

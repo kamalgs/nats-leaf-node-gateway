@@ -10,13 +10,13 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::connection::AsyncReadWrite;
-use crate::ClientOp;
+use async_nats::connection::AsyncReadWrite;
+use async_nats::ClientOp;
 
-use super::protocol::ServerConn;
-use super::server::ServerState;
-use super::sub_list::Subscription;
-use super::upstream::ClientMsg;
+use crate::protocol::ServerConn;
+use crate::server::ServerState;
+use crate::sub_list::Subscription;
+use crate::upstream::ClientMsg;
 
 /// Handle held by the server for sending messages to a client connection.
 pub(crate) struct ClientHandle {
@@ -89,10 +89,7 @@ impl ClientConnection {
                 debug!(id = self.id, "received CONNECT");
             }
             Some(other) => {
-                self.conn
-                    .send_err("expected CONNECT")
-                    .await
-                    .ok();
+                self.conn.send_err("expected CONNECT").await.ok();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("expected CONNECT, got {:?}", other),
@@ -244,7 +241,6 @@ impl ClientConnection {
         }
         Ok(())
     }
-
 }
 
 async fn cleanup_conn(id: u64, state: &ServerState) {

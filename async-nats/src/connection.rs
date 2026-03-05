@@ -50,7 +50,7 @@ const WRITE_FLATTEN_THRESHOLD: usize = 4096;
 const WRITE_VECTORED_CHUNKS: usize = 64;
 
 /// Supertrait enabling trait object for containing both TLS and non TLS `TcpStream` connection.
-pub(crate) trait AsyncReadWrite: AsyncWrite + AsyncRead + Send + Unpin {}
+pub trait AsyncReadWrite: AsyncWrite + AsyncRead + Send + Unpin {}
 
 /// Blanked implementation that applies to both TLS and non-TLS `TcpStream`.
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -762,7 +762,7 @@ impl Connection {
 
 #[cfg(feature = "websockets")]
 #[pin_project]
-pub(crate) struct WebSocketAdapter<T> {
+pub struct WebSocketAdapter<T> {
     #[pin]
     pub(crate) inner: WebSocketStream<T>,
     pub(crate) read_buf: BytesMut,
@@ -770,7 +770,7 @@ pub(crate) struct WebSocketAdapter<T> {
 
 #[cfg(feature = "websockets")]
 impl<T> WebSocketAdapter<T> {
-    pub(crate) fn new(inner: WebSocketStream<T>) -> Self {
+    pub fn new(inner: WebSocketStream<T>) -> Self {
         Self {
             inner,
             read_buf: BytesMut::new(),

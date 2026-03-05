@@ -12,9 +12,9 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use tracing::debug;
 
-use crate::Client;
+use async_nats::Client;
 
-use super::server::ServerState;
+use crate::server::ServerState;
 
 /// Manages connection to an upstream NATS hub server.
 /// Mirrors local subscriptions to the hub and routes hub messages
@@ -37,7 +37,7 @@ impl Upstream {
 
     /// Add a subscription interest for the given subject.
     /// If this is the first interest, subscribe on the hub.
-    pub(crate) async fn add_interest(&mut self, subject: String) -> Result<(), crate::Error> {
+    pub(crate) async fn add_interest(&mut self, subject: String) -> Result<(), async_nats::Error> {
         if let Some(entry) = self.hub_subs.get_mut(&subject) {
             entry.1 += 1;
             return Ok(());
@@ -58,13 +58,16 @@ impl Upstream {
                 let conns = state.conns.read().await;
                 for sub in &matches {
                     if let Some(handle) = conns.get(&sub.conn_id) {
-                        let _ = handle.msg_tx.send(ClientMsg {
-                            subject: msg.subject.to_string(),
-                            sid: sub.sid,
-                            reply: msg.reply.as_ref().map(|r| r.to_string()),
-                            headers: msg.headers.clone(),
-                            payload: msg.payload.clone(),
-                        }).await;
+                        let _ = handle
+                            .msg_tx
+                            .send(ClientMsg {
+                                subject: msg.subject.to_string(),
+                                sid: sub.sid,
+                                reply: msg.reply.as_ref().map(|r| r.to_string()),
+                                headers: msg.headers.clone(),
+                                payload: msg.payload.clone(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -92,9 +95,9 @@ impl Upstream {
         &self,
         subject: String,
         reply: Option<String>,
-        headers: Option<crate::HeaderMap>,
+        headers: Option<async_nats::HeaderMap>,
         payload: Bytes,
-    ) -> Result<(), crate::Error> {
+    ) -> Result<(), async_nats::Error> {
         match (reply, headers) {
             (Some(reply), Some(headers)) if !headers.is_empty() => {
                 self.client
@@ -121,10 +124,13 @@ impl Upstream {
     /// Re-subscribe for all currently tracked subjects.
     /// Called after reconnection.
     #[allow(dead_code)]
-    pub(crate) async fn resync_interests(&mut self) -> Result<(), crate::Error> {
+    pub(crate) async fn resync_interests(&mut self) -> Result<(), async_nats::Error> {
         let subjects: Vec<String> = {
             let subs = self.state.subs.read().await;
-            subs.unique_subjects().into_iter().map(String::from).collect()
+            subs.unique_subjects()
+                .into_iter()
+                .map(String::from)
+                .collect()
         };
 
         // Abort old forwarding tasks
@@ -155,6 +161,6 @@ pub(crate) struct ClientMsg {
     pub subject: String,
     pub sid: u64,
     pub reply: Option<String>,
-    pub headers: Option<crate::HeaderMap>,
+    pub headers: Option<async_nats::HeaderMap>,
     pub payload: Bytes,
 }

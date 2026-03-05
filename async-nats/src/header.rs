@@ -253,7 +253,7 @@ impl HeaderMap {
         GetAll { inner }
     }
 
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = vec![];
         buf.extend_from_slice(b"NATS/1.0\r\n");
         for (k, vs) in &self.inner {

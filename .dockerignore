@@ -1,1 +1,5 @@
 target
+.cargo
+.git
+sample-app
+nats

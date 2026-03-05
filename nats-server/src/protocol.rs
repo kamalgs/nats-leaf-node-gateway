@@ -8,10 +8,10 @@
 use bytes::{Buf, BytesMut};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 
-use crate::connection::AsyncReadWrite;
-use crate::header::{HeaderMap, HeaderName, IntoHeaderValue};
-use crate::subject::Subject;
-use crate::{ClientOp, ConnectInfo, ServerInfo};
+use async_nats::connection::AsyncReadWrite;
+use async_nats::header::{HeaderMap, HeaderName, IntoHeaderValue};
+use async_nats::subject::Subject;
+use async_nats::{ClientOp, ConnectInfo, ServerInfo};
 
 /// Server-side connection wrapper.
 /// Owns the raw stream and its own read buffer for parsing client operations.
@@ -177,9 +177,7 @@ impl ServerConn {
             let mut args = line.split_whitespace();
             let (sid_str, max_str) = (args.next(), args.next());
             let sid = sid_str
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing sid in UNSUB")
-                })?
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing sid in UNSUB"))?
                 .parse::<u64>()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let max = max_str
@@ -315,9 +313,9 @@ fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
         if line.is_empty() {
             continue;
         }
-        let (name, value) = line.split_once(':').ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid header line")
-        })?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid header line"))?;
         let name = HeaderName::from_str(name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut value = value.trim_start().to_owned();
