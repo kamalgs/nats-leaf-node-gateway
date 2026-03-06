@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use async_nats::header::HeaderMap;
-use crate::protocol::{LeafConn, LeafOp};
+use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;
 
 /// Commands sent from the Upstream handle to the background writer task.
@@ -121,10 +121,26 @@ impl Upstream {
             leaf.flush().await?;
         }
 
-        // 5. Split into reader/writer and spawn background task
+        // 5. Split into independent reader/writer and spawn two tasks
+        let (leaf_reader, leaf_writer) = leaf.split();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
-        let task = tokio::spawn(run_leaf_io(leaf, cmd_rx, state));
+        // The reader sends Pong commands through the cmd channel
+        let reader_cmd_tx = cmd_tx.clone();
+        let reader_state = Arc::clone(&state);
+        let reader_task = tokio::spawn(run_leaf_reader(leaf_reader, reader_cmd_tx, reader_state));
+        let writer_task = tokio::spawn(run_leaf_writer(leaf_writer, cmd_rx));
+
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                _ = reader_task => {
+                    debug!("leaf reader task finished");
+                }
+                _ = writer_task => {
+                    debug!("leaf writer task finished");
+                }
+            }
+        });
 
         Ok(Self {
             cmd_tx,
@@ -204,80 +220,68 @@ impl Drop for Upstream {
     }
 }
 
-/// Background task: reads from the hub and writes commands to it.
-///
-/// Uses a single `LeafConn` that handles both reading and writing.
-/// The writer side drains the command channel in a batch before flushing.
-async fn run_leaf_io(
-    mut leaf: LeafConn,
-    mut cmd_rx: mpsc::UnboundedReceiver<UpstreamCmd>,
+/// Background reader task: reads ops from the hub and dispatches them.
+/// Runs independently from the writer, so hub PINGs are always answered
+/// promptly even during write floods.
+async fn run_leaf_reader(
+    mut reader: LeafReader,
+    cmd_tx: mpsc::UnboundedSender<UpstreamCmd>,
     state: Arc<ServerState>,
 ) {
-    // We need to split reading and writing. Since LeafConn owns the stream,
-    // we'll use a channel approach: the reader and writer share access via
-    // an inner loop that alternates between reading and writing.
     loop {
-        tokio::select! {
-            biased;
-
-            // Drain commands first (writer path)
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(cmd) => {
-                        if let Err(e) = process_cmd(&mut leaf, &cmd).await {
-                            error!(error = %e, "upstream write error");
-                            break;
-                        }
-                        // Batch: drain any remaining commands without blocking
-                        while let Ok(cmd) = cmd_rx.try_recv() {
-                            if let Err(e) = process_cmd(&mut leaf, &cmd).await {
-                                error!(error = %e, "upstream write error");
-                                return;
-                            }
-                        }
-                        if let Err(e) = leaf.flush().await {
-                            error!(error = %e, "upstream flush error");
-                            break;
-                        }
-                    }
-                    None => {
-                        debug!("upstream command channel closed");
-                        break;
-                    }
+        match reader.read_leaf_op().await {
+            Ok(Some(op)) => {
+                if let Err(e) = handle_hub_op(op, &cmd_tx, &state) {
+                    error!(error = %e, "error handling hub op");
+                    break;
                 }
             }
-
-            // Read from hub (reader path)
-            op = leaf.read_leaf_op() => {
-                match op {
-                    Ok(Some(leaf_op)) => {
-                        if let Err(e) = handle_hub_op(&mut leaf, leaf_op, &state).await {
-                            error!(error = %e, "error handling hub op");
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        warn!("hub connection closed");
-                        break;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "upstream read error");
-                        break;
-                    }
-                }
+            Ok(None) => {
+                warn!("hub connection closed");
+                break;
+            }
+            Err(e) => {
+                error!(error = %e, "upstream read error");
+                break;
             }
         }
     }
 }
 
+/// Background writer task: drains the command channel and writes to the hub.
+/// Batches multiple commands before flushing for efficiency.
+async fn run_leaf_writer(
+    mut writer: LeafWriter,
+    mut cmd_rx: mpsc::UnboundedReceiver<UpstreamCmd>,
+) {
+    while let Some(cmd) = cmd_rx.recv().await {
+        if let Err(e) = process_cmd(&mut writer, &cmd).await {
+            error!(error = %e, "upstream write error");
+            break;
+        }
+        // Batch: drain any remaining commands without blocking
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let Err(e) = process_cmd(&mut writer, &cmd).await {
+                error!(error = %e, "upstream write error");
+                return;
+            }
+        }
+        if let Err(e) = writer.flush().await {
+            error!(error = %e, "upstream flush error");
+            break;
+        }
+    }
+    debug!("upstream writer finished");
+}
+
 /// Process a single upstream command (write to hub, no flush).
-async fn process_cmd(leaf: &mut LeafConn, cmd: &UpstreamCmd) -> std::io::Result<()> {
+async fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Result<()> {
     match cmd {
         UpstreamCmd::Subscribe(subject) => {
-            leaf.send_leaf_sub(subject).await?;
+            writer.send_leaf_sub(subject).await?;
         }
         UpstreamCmd::Unsubscribe(subject) => {
-            leaf.send_leaf_unsub(subject).await?;
+            writer.send_leaf_unsub(subject).await?;
         }
         UpstreamCmd::Publish {
             subject,
@@ -285,20 +289,22 @@ async fn process_cmd(leaf: &mut LeafConn, cmd: &UpstreamCmd) -> std::io::Result<
             headers,
             payload,
         } => {
-            leaf.send_leaf_msg(subject, reply.as_deref(), headers.as_ref(), payload)
+            writer
+                .send_leaf_msg(subject, reply.as_deref(), headers.as_ref(), payload)
                 .await?;
         }
         UpstreamCmd::Pong => {
-            leaf.send_pong().await?;
+            writer.send_pong().await?;
         }
     }
     Ok(())
 }
 
-/// Handle an operation received from the hub.
-async fn handle_hub_op(
-    leaf: &mut LeafConn,
+/// Handle an operation received from the hub (reader side).
+/// PING responses are sent via the command channel to the writer task.
+fn handle_hub_op(
     op: LeafOp,
+    cmd_tx: &mpsc::UnboundedSender<UpstreamCmd>,
     state: &ServerState,
 ) -> std::io::Result<()> {
     match op {
@@ -329,8 +335,8 @@ async fn handle_hub_op(
             }
         }
         LeafOp::Ping => {
-            leaf.send_pong().await?;
-            leaf.flush().await?;
+            // Send PONG via the writer task
+            let _ = cmd_tx.send(UpstreamCmd::Pong);
         }
         LeafOp::Pong | LeafOp::Ok => {
             // No action needed

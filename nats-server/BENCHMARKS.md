@@ -5,6 +5,28 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-06 — Split upstream reader/writer
+
+**Optimization applied:**
+7. Split LeafConn into independent reader/writer tasks (fixes slow consumer)
+8. BufWriter (64KB) on LeafWriter (upstream write batching)
+
+| Scenario | Direct Hub | Go Leaf | Rust Leaf | Rust/Go % |
+|---|---|---|---|---|
+| Pub only | 2.09M | 2.04M | 860K | 42% |
+| Local pub/sub (sub) | 760K | 799K | 452K | 57% |
+| Fan-out x5 (per sub) | 227K | 243K | 155K | 64% |
+| Leaf → Hub (sub on hub) | — | 629K | 697K | **111%** |
+| Hub → Leaf (sub) | — | 573K | 705K | **123%** |
+
+**Highlights:**
+- **Leaf→Hub fixed!** No more slow consumer — Rust now **exceeds Go** (697K vs 629K)
+- Hub→Leaf also improved, Rust at 123% of Go (705K vs 573K)
+- Cross-server scenarios (Leaf↔Hub) are now Rust's strength
+- Local pub/sub and fan-out slightly down from previous run (variance)
+
+---
+
 ## 2026-03-06 — Commit 9109b4b
 
 **Optimizations applied (cumulative):**
