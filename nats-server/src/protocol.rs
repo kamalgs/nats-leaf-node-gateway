@@ -6,7 +6,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use bytes::{Buf, BytesMut};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
 
 use async_nats::connection::AsyncReadWrite;
 use async_nats::header::{HeaderMap, HeaderName, IntoHeaderValue};
@@ -14,16 +14,21 @@ use async_nats::subject::Subject;
 use async_nats::{ClientOp, ConnectInfo, ServerInfo};
 
 /// Server-side connection wrapper.
-/// Owns the raw stream and its own read buffer for parsing client operations.
+/// Uses split read/write halves so the writer is wrapped in a BufWriter.
+/// This ensures `write_msg` calls go into a memory buffer and only hit the
+/// socket on `flush()`, dramatically reducing syscalls when batching.
 pub(crate) struct ServerConn {
-    stream: Box<dyn AsyncReadWrite>,
+    reader: ReadHalf<Box<dyn AsyncReadWrite>>,
+    writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
     read_buf: BytesMut,
 }
 
 impl ServerConn {
     pub(crate) fn new(stream: Box<dyn AsyncReadWrite>) -> Self {
+        let (reader, writer) = io::split(stream);
         Self {
-            stream,
+            reader,
+            writer: BufWriter::with_capacity(64 * 1024, writer),
             read_buf: BytesMut::with_capacity(64 * 1024),
         }
     }
@@ -36,8 +41,23 @@ impl ServerConn {
         self.write_flush(line.as_bytes()).await
     }
 
-    /// Send MSG to connected client.
+    /// Send MSG to connected client (write + flush).
+    #[cfg(test)]
     pub(crate) async fn send_msg(
+        &mut self,
+        subject: &str,
+        sid: u64,
+        reply: Option<&str>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        self.write_msg(subject, sid, reply, headers, payload).await?;
+        self.flush().await
+    }
+
+    /// Write a MSG to the client without flushing.
+    /// Data goes into the BufWriter's 64KB buffer; call `flush()` to send.
+    pub(crate) async fn write_msg(
         &mut self,
         subject: &str,
         sid: u64,
@@ -59,7 +79,7 @@ impl ServerConn {
                 buf.extend_from_slice(&hdr_bytes);
                 buf.extend_from_slice(payload);
                 buf.extend_from_slice(b"\r\n");
-                self.write_flush(&buf).await
+                self.writer.write_all(&buf).await
             }
             _ => {
                 let payload_len = payload.len();
@@ -71,9 +91,14 @@ impl ServerConn {
                 buf.extend_from_slice(line.as_bytes());
                 buf.extend_from_slice(payload);
                 buf.extend_from_slice(b"\r\n");
-                self.write_flush(&buf).await
+                self.writer.write_all(&buf).await
             }
         }
+    }
+
+    /// Flush buffered writes to the wire.
+    pub(crate) async fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush().await
     }
 
     #[allow(dead_code)]
@@ -101,7 +126,7 @@ impl ServerConn {
             if let Some(op) = self.try_parse_client_op()? {
                 return Ok(Some(op));
             }
-            let n = self.stream.read_buf(&mut self.read_buf).await?;
+            let n = self.reader.read_buf(&mut self.read_buf).await?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
@@ -284,8 +309,8 @@ impl ServerConn {
     }
 
     async fn write_flush(&mut self, data: &[u8]) -> io::Result<()> {
-        self.stream.write_all(data).await?;
-        self.stream.flush().await?;
+        self.writer.write_all(data).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 }

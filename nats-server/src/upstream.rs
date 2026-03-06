@@ -19,7 +19,7 @@ use crate::protocol::{LeafConn, LeafOp};
 use crate::server::ServerState;
 
 /// Commands sent from the Upstream handle to the background writer task.
-enum UpstreamCmd {
+pub(crate) enum UpstreamCmd {
     Subscribe(String),
     Unsubscribe(String),
     Publish {
@@ -111,8 +111,11 @@ impl Upstream {
 
         // 4. Send LS+ for any existing local subscriptions
         {
-            let subs = state.subs.read().await;
-            for subject in subs.unique_subjects() {
+            let subjects: Vec<String> = {
+                let subs = state.subs.read().unwrap();
+                subs.unique_subjects().into_iter().map(|s| s.to_string()).collect()
+            };
+            for subject in &subjects {
                 leaf.send_leaf_sub(subject).await?;
             }
             leaf.flush().await?;
@@ -164,7 +167,13 @@ impl Upstream {
         }
     }
 
+    /// Get a clone of the command sender for lock-free publish forwarding.
+    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<UpstreamCmd> {
+        self.cmd_tx.clone()
+    }
+
     /// Forward a publish from a local client to the hub as LMSG.
+    #[allow(dead_code)]
     pub(crate) async fn publish(
         &self,
         subject: String,
@@ -299,13 +308,13 @@ async fn handle_hub_op(
             headers,
             payload,
         } => {
-            let subs = state.subs.read().await;
+            let subs = state.subs.read().unwrap();
             let matches = subs.match_subject(&subject);
             if matches.is_empty() {
                 return Ok(());
             }
 
-            let conns = state.conns.read().await;
+            let conns = state.conns.read().unwrap();
             for sub in &matches {
                 if let Some(handle) = conns.get(&sub.conn_id) {
                     let msg = ClientMsg {
@@ -315,7 +324,7 @@ async fn handle_hub_op(
                         headers: headers.clone(),
                         payload: payload.clone(),
                     };
-                    let _ = handle.msg_tx.send(msg).await;
+                    let _ = handle.msg_tx.send(msg);
                 }
             }
         }

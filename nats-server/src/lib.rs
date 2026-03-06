@@ -19,7 +19,7 @@
 pub(crate) mod client_conn;
 pub(crate) mod protocol;
 pub mod server;
-pub(crate) mod sub_list;
+pub mod sub_list;
 pub(crate) mod upstream;
 
 pub use server::{LeafServer, LeafServerConfig};

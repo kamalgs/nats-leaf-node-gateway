@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Leaf node benchmark: Rust leaf vs Go native leaf vs direct hub.
 #
+# Scenarios:
+#   1. Publish only        — raw ingest rate (fire-and-forget)
+#   2. Local pub/sub       — 1 pub + 1 sub on same server (message routing)
+#   3. Local fan-out       — 1 pub + 5 subs on same server (fan-out delivery)
+#   4. Leaf→Hub pub/sub    — pub on leaf, sub on hub (upstream forwarding)
+#   5. Hub→Leaf pub/sub    — pub on hub, sub on leaf (downstream delivery)
+#   6. Request/Reply       — service request/reply latency
+#
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
 #   - nats CLI in PATH     (go install github.com/nats-io/natscli/nats@latest)
@@ -8,7 +16,7 @@
 #
 # Usage:
 #   cd nats-server && ./bench.sh
-#   ./bench.sh --msgs 2000000 --size 256    # override defaults
+#   ./bench.sh --msgs 500000 --size 256 --runs 2
 
 set -euo pipefail
 
@@ -16,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Defaults (overridable via CLI args)
-MSGS=1000000
+MSGS=500000
 SIZE=128
 RUNS=3
 
@@ -38,9 +46,13 @@ RUST_LEAF_PORT=5223
 
 # PID tracking for cleanup
 PIDS=()
+BG_PIDS=()
 cleanup() {
   echo ""
   echo "Cleaning up..."
+  for pid in "${BG_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
+  done
   for pid in "${PIDS[@]}"; do
     kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
   done
@@ -63,8 +75,10 @@ for port in $HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $RUST_LEAF_PORT; do
   fi
 done
 
-echo "=== Leaf Node Benchmark ==="
+echo "================================================================"
+echo "  Leaf Node Benchmark"
 echo "  msgs=$MSGS  size=${SIZE}B  runs=$RUNS"
+echo "================================================================"
 echo ""
 
 # --- Build Rust leaf server ---
@@ -101,23 +115,154 @@ nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF_PORT"  >/dev/null 2>&1
 echo "All servers responding."
 echo ""
 
-# --- Benchmark function ---
-run_bench() {
-  local label="$1"
-  local port="$2"
-  echo "--- $label (port $port) ---"
+# Kill any lingering background bench processes
+kill_bg() {
+  for pid in "${BG_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
+  done
+  BG_PIDS=()
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 1: Publish Only (fire-and-forget ingest)
+# ──────────────────────────────────────────────────────────────────────
+run_pub_only() {
+  local label="$1" port="$2"
+  echo "--- $label ---"
   for i in $(seq 1 "$RUNS"); do
     nats bench pub bench.test \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$port" 2>&1 | grep "stats:"
+      -s "nats://127.0.0.1:$port" 2>&1 | grep -E "stats:"
   done
   echo ""
 }
 
-echo "=== Publish Throughput (${MSGS} msgs, ${SIZE}B payload, ${RUNS} runs) ==="
+echo "================================================================"
+echo "  1. PUBLISH ONLY (fire-and-forget, no subscribers)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
 echo ""
-run_bench "Direct Hub"       "$HUB_CLIENT_PORT"
-run_bench "Go Native Leaf"   "$GO_LEAF_PORT"
-run_bench "Rust Leaf"        "$RUST_LEAF_PORT"
+run_pub_only "Direct Hub"       "$HUB_CLIENT_PORT"
+run_pub_only "Go Native Leaf"   "$GO_LEAF_PORT"
+run_pub_only "Rust Leaf"        "$RUST_LEAF_PORT"
 
-echo "=== Done ==="
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 2: Local Pub/Sub (1 publisher + 1 subscriber, same server)
+# ──────────────────────────────────────────────────────────────────────
+wait_or_kill() {
+  local pid="$1" max_wait="${2:-30}"
+  if timeout "$max_wait" tail --pid="$pid" -f /dev/null 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+  else
+    echo "  (subscriber $pid timed out after ${max_wait}s, killing)"
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+  fi
+}
+
+run_local_pubsub() {
+  local label="$1" port="$2" subs="$3"
+  local url="nats://127.0.0.1:$port"
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    # Start subscriber(s) in background
+    for s in $(seq 1 "$subs"); do
+      nats bench sub "bench.ps.test" \
+        --msgs "$MSGS" --size "$SIZE" --no-progress \
+        -s "$url" >"/tmp/bench_sub_${s}.out" 2>&1 &
+      BG_PIDS+=($!)
+    done
+    sleep 0.5  # let subscribers connect and register
+
+    # Run publisher (foreground) — its output has the pub stats
+    nats bench pub "bench.ps.test" \
+      --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "$url" 2>&1 | grep -E "stats:"
+
+    # Wait for subscribers (with timeout) and print their stats
+    for pid in "${BG_PIDS[@]}"; do
+      wait_or_kill "$pid" 30
+    done
+    for s in $(seq 1 "$subs"); do
+      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      rm -f "/tmp/bench_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+}
+
+echo "================================================================"
+echo "  2. LOCAL PUB/SUB (1 pub + 1 sub, same server)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_local_pubsub "Direct Hub"       "$HUB_CLIENT_PORT" 1
+run_local_pubsub "Go Native Leaf"   "$GO_LEAF_PORT"    1
+run_local_pubsub "Rust Leaf"        "$RUST_LEAF_PORT"  1
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 3: Fan-out (1 pub + 5 subs, same server)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  3. FAN-OUT (1 pub + 5 subs, same server)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_local_pubsub "Direct Hub"       "$HUB_CLIENT_PORT" 5
+run_local_pubsub "Go Native Leaf"   "$GO_LEAF_PORT"    5
+run_local_pubsub "Rust Leaf"        "$RUST_LEAF_PORT"  5
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 4: Leaf→Hub (pub on leaf, sub on hub)
+# ──────────────────────────────────────────────────────────────────────
+run_cross_pubsub() {
+  local label="$1" pub_port="$2" sub_port="$3"
+  local pub_url="nats://127.0.0.1:$pub_port"
+  local sub_url="nats://127.0.0.1:$sub_port"
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    # Subscriber on destination server
+    nats bench sub "bench.cross.test" \
+      --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "$sub_url" >"/tmp/bench_cross_sub.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    # Publisher on source server
+    nats bench pub "bench.cross.test" \
+      --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "$pub_url" 2>&1 | grep -E "stats:"
+
+    # Wait for subscriber (with timeout)
+    for pid in "${BG_PIDS[@]}"; do
+      wait_or_kill "$pid" 30
+    done
+    grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /'
+    rm -f /tmp/bench_cross_sub.out
+    BG_PIDS=()
+  done
+  echo ""
+}
+
+echo "================================================================"
+echo "  4. LEAF → HUB (pub on leaf, sub on hub)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_cross_pubsub "Go Leaf → Hub"    "$GO_LEAF_PORT"    "$HUB_CLIENT_PORT"
+run_cross_pubsub "Rust Leaf → Hub"  "$RUST_LEAF_PORT"  "$HUB_CLIENT_PORT"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 5: Hub→Leaf (pub on hub, sub on leaf)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  5. HUB → LEAF (pub on hub, sub on leaf)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_cross_pubsub "Hub → Go Leaf"    "$HUB_CLIENT_PORT" "$GO_LEAF_PORT"
+run_cross_pubsub "Hub → Rust Leaf"  "$HUB_CLIENT_PORT" "$RUST_LEAF_PORT"
+
+echo "================================================================"
+echo "  BENCHMARK COMPLETE"
+echo "================================================================"

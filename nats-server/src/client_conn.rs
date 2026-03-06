@@ -16,11 +16,11 @@ use async_nats::ClientOp;
 use crate::protocol::ServerConn;
 use crate::server::ServerState;
 use crate::sub_list::Subscription;
-use crate::upstream::ClientMsg;
+use crate::upstream::{ClientMsg, UpstreamCmd};
 
 /// Handle held by the server for sending messages to a client connection.
 pub(crate) struct ClientHandle {
-    pub msg_tx: mpsc::Sender<ClientMsg>,
+    pub msg_tx: mpsc::UnboundedSender<ClientMsg>,
 }
 
 /// Per-client connection handler.
@@ -28,7 +28,7 @@ pub(crate) struct ClientConnection {
     id: u64,
     conn: ServerConn,
     state: Arc<ServerState>,
-    msg_rx: mpsc::Receiver<ClientMsg>,
+    msg_rx: mpsc::UnboundedReceiver<ClientMsg>,
 }
 
 impl ClientConnection {
@@ -37,7 +37,7 @@ impl ClientConnection {
         stream: Box<dyn AsyncReadWrite>,
         state: Arc<ServerState>,
     ) -> (Self, ClientHandle) {
-        let (msg_tx, msg_rx) = mpsc::channel(256);
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let conn = ServerConn::new(stream);
         let handle = ClientHandle { msg_tx };
         let client = Self {
@@ -121,13 +121,26 @@ impl ClientConnection {
                 msg = self.msg_rx.recv() => {
                     match msg {
                         Some(msg) => {
-                            self.conn.send_msg(
+                            // Write first message without flushing
+                            self.conn.write_msg(
                                 &msg.subject,
                                 msg.sid,
                                 msg.reply.as_deref(),
                                 msg.headers.as_ref(),
                                 &msg.payload,
                             ).await?;
+                            // Drain any additional queued messages (batch write)
+                            while let Ok(msg) = self.msg_rx.try_recv() {
+                                self.conn.write_msg(
+                                    &msg.subject,
+                                    msg.sid,
+                                    msg.reply.as_deref(),
+                                    msg.headers.as_ref(),
+                                    &msg.payload,
+                                ).await?;
+                            }
+                            // Single flush for the whole batch
+                            self.conn.flush().await?;
                         }
                         None => return Ok(()), // server shutting down
                     }
@@ -159,7 +172,7 @@ impl ClientConnection {
                 let subject_str = subject.to_string();
 
                 {
-                    let mut subs = self.state.subs.write().await;
+                    let mut subs = self.state.subs.write().unwrap();
                     subs.insert(sub);
                 }
 
@@ -177,7 +190,7 @@ impl ClientConnection {
             }
             ClientOp::Unsubscribe { sid, max: _ } => {
                 let removed = {
-                    let mut subs = self.state.subs.write().await;
+                    let mut subs = self.state.subs.write().unwrap();
                     subs.remove(self.id, sid)
                 };
 
@@ -196,40 +209,39 @@ impl ClientConnection {
                 headers,
             } => {
                 let subject_str = subject.to_string();
+                // Compute reply string once, share across local + upstream
+                let reply_str = respond.map(|r| r.to_string());
 
                 // Route to local subscribers
                 {
-                    let subs = self.state.subs.read().await;
+                    let subs = self.state.subs.read().unwrap();
                     let matches = subs.match_subject(&subject_str);
-                    let conns = self.state.conns.read().await;
+                    let conns = self.state.conns.read().unwrap();
                     for sub in &matches {
                         if let Some(handle) = conns.get(&sub.conn_id) {
                             let msg = ClientMsg {
                                 subject: subject_str.clone(),
                                 sid: sub.sid,
-                                reply: respond.as_ref().map(|r| r.to_string()),
+                                reply: reply_str.clone(),
                                 headers: headers.clone(),
                                 payload: payload.clone(),
                             };
                             // Non-blocking send; drop if the client is slow
-                            let _ = handle.msg_tx.try_send(msg);
+                            let _ = handle.msg_tx.send(msg);
                         }
                     }
                 }
 
-                // Forward to upstream hub
+                // Forward to upstream hub (lock-free path)
                 {
-                    let upstream = self.state.upstream.read().await;
-                    if let Some(ref up) = *upstream {
-                        if let Err(e) = up
-                            .publish(
-                                subject_str,
-                                respond.map(|r| r.to_string()),
-                                headers,
-                                payload,
-                            )
-                            .await
-                        {
+                    let tx = self.state.upstream_tx.read().unwrap().clone();
+                    if let Some(tx) = tx {
+                        if let Err(e) = tx.send(UpstreamCmd::Publish {
+                            subject: subject_str,
+                            reply: reply_str,
+                            headers,
+                            payload,
+                        }) {
                             warn!(error = %e, "failed to forward publish to upstream");
                         }
                     }
@@ -246,7 +258,7 @@ impl ClientConnection {
 async fn cleanup_conn(id: u64, state: &ServerState) {
     // Remove all subscriptions for this connection
     let removed = {
-        let mut subs = state.subs.write().await;
+        let mut subs = state.subs.write().unwrap();
         subs.remove_conn(id)
     };
 
@@ -262,7 +274,7 @@ async fn cleanup_conn(id: u64, state: &ServerState) {
 
     // Remove connection handle
     {
-        let mut conns = state.conns.write().await;
+        let mut conns = state.conns.write().unwrap();
         conns.remove(&id);
     }
 

@@ -9,7 +9,7 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct Subscription {
+pub struct Subscription {
     pub conn_id: u64,
     pub sid: u64,
     pub subject: String,
@@ -18,20 +18,20 @@ pub(crate) struct Subscription {
 
 /// Subscription list supporting NATS wildcard matching.
 #[derive(Debug, Default)]
-pub(crate) struct SubList {
+pub struct SubList {
     subs: Vec<Subscription>,
 }
 
 impl SubList {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn insert(&mut self, sub: Subscription) {
+    pub fn insert(&mut self, sub: Subscription) {
         self.subs.push(sub);
     }
 
-    pub(crate) fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
+    pub fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
         if let Some(pos) = self
             .subs
             .iter()
@@ -43,7 +43,7 @@ impl SubList {
         }
     }
 
-    pub(crate) fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
+    pub fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
         let mut removed = Vec::new();
         let mut i = 0;
         while i < self.subs.len() {
@@ -56,7 +56,7 @@ impl SubList {
         removed
     }
 
-    pub(crate) fn match_subject(&self, subject: &str) -> Vec<&Subscription> {
+    pub fn match_subject(&self, subject: &str) -> Vec<&Subscription> {
         self.subs
             .iter()
             .filter(|s| subject_matches(&s.subject, subject))
@@ -64,34 +64,32 @@ impl SubList {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn unique_subjects(&self) -> HashSet<&str> {
+    pub fn unique_subjects(&self) -> HashSet<&str> {
         self.subs.iter().map(|s| s.subject.as_str()).collect()
     }
 }
 
 /// NATS wildcard matching.
 /// `*` matches a single token, `>` matches one or more tokens (tail match).
-pub(crate) fn subject_matches(pattern: &str, subject: &str) -> bool {
-    let pattern_tokens: Vec<&str> = pattern.split('.').collect();
-    let subject_tokens: Vec<&str> = subject.split('.').collect();
+///
+/// This implementation is allocation-free — it iterates over `.split('.')`
+/// directly instead of collecting into Vecs.
+pub fn subject_matches(pattern: &str, subject: &str) -> bool {
+    let mut pat_iter = pattern.split('.');
+    let mut sub_iter = subject.split('.');
 
-    let mut pi = 0;
-    let mut si = 0;
-
-    while pi < pattern_tokens.len() && si < subject_tokens.len() {
-        let pt = pattern_tokens[pi];
-        if pt == ">" {
-            // `>` matches one or more remaining tokens
-            return true;
+    loop {
+        match (pat_iter.next(), sub_iter.next()) {
+            (Some(">"), Some(_)) => return true,
+            (Some(pt), Some(st)) => {
+                if pt != "*" && pt != st {
+                    return false;
+                }
+            }
+            (None, None) => return true,
+            _ => return false,
         }
-        if pt != "*" && pt != subject_tokens[si] {
-            return false;
-        }
-        pi += 1;
-        si += 1;
     }
-
-    pi == pattern_tokens.len() && si == subject_tokens.len()
 }
 
 #[cfg(test)]

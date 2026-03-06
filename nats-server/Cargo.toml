@@ -19,5 +19,10 @@ tokio-websockets = { version = "0.10", default-features = false, features = ["se
 tracing = "0.1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 futures-util = { version = "0.3.28", features = ["std"] }
 tokio = { version = "1.36", features = ["full"] }
+
+[[bench]]
+name = "throughput"
+harness = false

@@ -10,14 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use async_nats::ServerInfo;
 
 use crate::client_conn::{ClientConnection, ClientHandle};
 use crate::sub_list::SubList;
-use crate::upstream::Upstream;
+use crate::upstream::{Upstream, UpstreamCmd};
 
 /// Configuration for the leaf node server.
 #[derive(Debug, Clone)]
@@ -52,9 +52,12 @@ impl Default for LeafServerConfig {
 /// Shared server state accessible by all client connections.
 pub(crate) struct ServerState {
     pub info: ServerInfo,
-    pub conns: RwLock<HashMap<u64, ClientHandle>>,
-    pub subs: RwLock<SubList>,
-    pub upstream: RwLock<Option<Upstream>>,
+    pub conns: std::sync::RwLock<HashMap<u64, ClientHandle>>,
+    pub subs: std::sync::RwLock<SubList>,
+    pub upstream: tokio::sync::RwLock<Option<Upstream>>,
+    /// Lock-free sender for forwarding publishes to the upstream hub.
+    /// Set once after upstream connects; read without locking on every publish.
+    pub upstream_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<UpstreamCmd>>>,
     next_cid: AtomicU64,
 }
 
@@ -62,9 +65,10 @@ impl ServerState {
     fn new(info: ServerInfo) -> Self {
         Self {
             info,
-            conns: RwLock::new(HashMap::new()),
-            subs: RwLock::new(SubList::new()),
-            upstream: RwLock::new(None),
+            conns: std::sync::RwLock::new(HashMap::new()),
+            subs: std::sync::RwLock::new(SubList::new()),
+            upstream: tokio::sync::RwLock::new(None),
+            upstream_tx: std::sync::RwLock::new(None),
             next_cid: AtomicU64::new(1),
         }
     }
@@ -110,7 +114,9 @@ impl LeafServer {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
             match Upstream::connect(hub_url, Arc::clone(&self.state)).await {
                 Ok(upstream) => {
+                    let sender = upstream.sender();
                     *self.state.upstream.write().await = Some(upstream);
+                    *self.state.upstream_tx.write().unwrap() = Some(sender);
                     info!("connected to upstream hub");
                 }
                 Err(e) => {
@@ -137,7 +143,7 @@ impl LeafServer {
         let (client_conn, handle) = ClientConnection::new(cid, stream, state.clone());
 
         {
-            let mut conns = state.conns.write().await;
+            let mut conns = state.conns.write().unwrap();
             conns.insert(cid, handle);
         }
 
@@ -284,12 +290,13 @@ impl LeafServer {
 
         // Cleanup: drop all connection handles to signal clients
         {
-            let mut conns = self.state.conns.write().await;
+            let mut conns = self.state.conns.write().unwrap();
             conns.clear();
         }
 
         // Drop upstream
         {
+            *self.state.upstream_tx.write().unwrap() = None;
             let mut upstream = self.state.upstream.write().await;
             *upstream = None;
         }
