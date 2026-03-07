@@ -36,6 +36,7 @@ fn bench_sublist_match(c: &mut Criterion) {
             sl.insert(Subscription {
                 conn_id: i,
                 sid: 1,
+                sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
                 subject: format!("test.subject.{i}"),
                 queue: None,
             });
@@ -44,6 +45,7 @@ fn bench_sublist_match(c: &mut Criterion) {
         sl.insert(Subscription {
             conn_id: 9999,
             sid: 1,
+            sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
             subject: "test.subject.*".to_string(),
             queue: None,
         });
@@ -73,6 +75,7 @@ fn bench_publish_local(c: &mut Criterion) {
         sl.insert(Subscription {
             conn_id: 1,
             sid: 1,
+            sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
             subject: "test.>".to_string(),
             queue: None,
         });

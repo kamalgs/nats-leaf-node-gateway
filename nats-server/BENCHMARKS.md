@@ -5,6 +5,38 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — Zero-copy parse_pub hot path optimization
+
+**Optimizations applied:**
+10. Zero-copy `parse_pub`/`parse_hpub`/`parse_sub` — freeze header line from BytesMut, take
+    sub-slices (Arc refcount bump) instead of 3× `Bytes::copy_from_slice` heap allocs per PUB
+11. Split LMSG builder — `build_lmsg_header()` writes only protocol header; payload written
+    separately into BufWriter, eliminating one payload copy per upstream publish
+12. Cached `upstream_tx` on ClientConnection — sender cloned once after handshake instead of
+    RwLock read + Arc clone per publish
+13. Pre-computed `sid_bytes` on Subscription — `sid_to_bytes()` called once at subscribe time,
+    cheap `Bytes::clone` at delivery instead of heap alloc per message
+14. `for_each_match` iterator on SubList — avoids allocating `Vec<Subscription>` per publish
+
+| Scenario | Direct Hub | Go Leaf | Rust Leaf | Rust/Go % |
+|---|---|---|---|---|
+| Pub only | ~1,893K | ~1,814K | ~1,515K | **84%** |
+| Local pub/sub (sub) | ~853K | ~776K | ~827K | **107%** |
+| Fan-out x5 (per sub) | ~212K | ~220K | ~268K | **122%** |
+| Leaf → Hub (pub) | — | ~566K | ~1,367K | **243%** |
+| Leaf → Hub (sub on hub) | — | ~562K | ~709K | **126%** |
+| Hub → Leaf (sub) | — | ~565K | ~659K | **117%** |
+
+**Takeaways:**
+- Pub-only **84% of Go** (up from 69%) — zero-copy parsing eliminated ~6% allocator overhead
+- Local pub/sub now **exceeds Go** (107%) — Rust beats Go on local routing
+- Fan-out x5 **122% of Go** — significant win from for_each_match + pre-computed sid_bytes
+- Leaf→Hub pub rate **2.4x Go** — cached sender + split LMSG builder very effective
+- Hub→Leaf **117% of Go** — consistent cross-server advantage
+- Remaining pub-only gap (~16%): mpsc channel overhead (~6%), Tokio waker (~2.4%), residual allocs
+
+---
+
 ## 2026-03-06 — Zero-copy parser & message builder (nats_proto module)
 
 **Optimization applied:**

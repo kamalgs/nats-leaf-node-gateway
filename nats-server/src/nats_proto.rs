@@ -272,12 +272,24 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return Ok(None);
     }
 
-    // Grab size bytes before advancing
-    let size_bytes = Bytes::copy_from_slice(size_arg);
-    let subject = Bytes::copy_from_slice(subject);
-    let respond = respond.map(Bytes::copy_from_slice);
+    // Compute offsets relative to buf start for zero-copy slicing
+    let buf_ptr = buf.as_ptr() as usize;
+    let subj_off = subject.as_ptr() as usize - buf_ptr;
+    let subj_len = subject.len();
+    let size_off = size_arg.as_ptr() as usize - buf_ptr;
+    let size_len = size_arg.len();
+    let respond_range = respond.map(|r| {
+        let off = r.as_ptr() as usize - buf_ptr;
+        off..off + r.len()
+    });
 
-    buf.advance(nl + 1);
+    // Freeze the header line — zero-copy from the read buffer
+    let header_line = buf.split_to(nl + 1).freeze();
+    // Sub-slice: just Arc refcount bumps, no heap alloc
+    let subject = header_line.slice(subj_off..subj_off + subj_len);
+    let size_bytes = header_line.slice(size_off..size_off + size_len);
+    let respond = respond_range.map(|r| header_line.slice(r));
+
     let payload = buf.split_to(payload_len).freeze();
     buf.advance(2); // trailing \r\n
 
@@ -322,11 +334,23 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return Ok(None);
     }
 
-    let size_bytes = Bytes::copy_from_slice(total_size_arg);
-    let subject = Bytes::copy_from_slice(subject);
-    let respond = respond.map(Bytes::copy_from_slice);
+    // Compute offsets for zero-copy slicing
+    let buf_ptr = buf.as_ptr() as usize;
+    let subj_off = subject.as_ptr() as usize - buf_ptr;
+    let subj_len = subject.len();
+    let size_off = total_size_arg.as_ptr() as usize - buf_ptr;
+    let size_len = total_size_arg.len();
+    let respond_range = respond.map(|r| {
+        let off = r.as_ptr() as usize - buf_ptr;
+        off..off + r.len()
+    });
 
-    buf.advance(nl + 1);
+    // Freeze the header line — zero-copy
+    let header_line = buf.split_to(nl + 1).freeze();
+    let subject = header_line.slice(subj_off..subj_off + subj_len);
+    let size_bytes = header_line.slice(size_off..size_off + size_len);
+    let respond = respond_range.map(|r| header_line.slice(r));
+
     let hdr_data = buf.split_to(hdr_len);
     let payload = buf.split_to(total_len - hdr_len).freeze();
     buf.advance(2);
@@ -355,26 +379,35 @@ fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     let args_bytes = &buf[4..line_end];
     let (args, argc) = split_args::<3>(args_bytes);
 
+    let buf_ptr = buf.as_ptr() as usize;
+
     let op = match argc {
         2 => {
             let sid = parse_u64(args[1])?;
+            let subj_off = args[0].as_ptr() as usize - buf_ptr;
+            let subj_len = args[0].len();
+            let header_line = buf.split_to(nl + 1).freeze();
             ClientOp::Subscribe {
                 sid,
-                subject: Bytes::copy_from_slice(args[0]),
+                subject: header_line.slice(subj_off..subj_off + subj_len),
                 queue_group: None,
             }
         }
         3 => {
             let sid = parse_u64(args[2])?;
+            let subj_off = args[0].as_ptr() as usize - buf_ptr;
+            let subj_len = args[0].len();
+            let queue_off = args[1].as_ptr() as usize - buf_ptr;
+            let queue_len = args[1].len();
+            let header_line = buf.split_to(nl + 1).freeze();
             ClientOp::Subscribe {
                 sid,
-                subject: Bytes::copy_from_slice(args[0]),
-                queue_group: Some(Bytes::copy_from_slice(args[1])),
+                subject: header_line.slice(subj_off..subj_off + subj_len),
+                queue_group: Some(header_line.slice(queue_off..queue_off + queue_len)),
             }
         }
         _ => return proto_err(buf, "invalid SUB arguments"),
     };
-    buf.advance(nl + 1);
     Ok(Some(op))
 }
 
@@ -861,6 +894,54 @@ impl MsgBuilder {
                     .extend_from_slice(usize_to_buf(payload.len(), &mut tmp));
                 self.buf.extend_from_slice(b"\r\n");
                 self.buf.extend_from_slice(payload);
+                self.buf.extend_from_slice(b"\r\n");
+            }
+        }
+        &self.buf
+    }
+
+    /// Build `LMSG` header only (no payload copy).
+    /// Returns the protocol header line ending with `\r\n`, plus any serialized
+    /// headers. Caller writes payload + `\r\n` separately.
+    pub fn build_lmsg_header(
+        &mut self,
+        subject: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload_len: usize,
+    ) -> &[u8] {
+        self.buf.clear();
+        let mut tmp = [0u8; 20];
+        match headers {
+            Some(hdrs) if !hdrs.is_empty() => {
+                let hdr_bytes = hdrs.to_bytes();
+                let hdr_len = hdr_bytes.len();
+                let total_len = hdr_len + payload_len;
+
+                self.buf.extend_from_slice(b"LMSG ");
+                self.buf.extend_from_slice(subject);
+                self.buf.push(b' ');
+                if let Some(r) = reply {
+                    self.buf.extend_from_slice(r);
+                    self.buf.push(b' ');
+                }
+                self.buf.extend_from_slice(usize_to_buf(hdr_len, &mut tmp));
+                self.buf.push(b' ');
+                self.buf
+                    .extend_from_slice(usize_to_buf(total_len, &mut tmp));
+                self.buf.extend_from_slice(b"\r\n");
+                self.buf.extend_from_slice(&hdr_bytes);
+            }
+            _ => {
+                self.buf.extend_from_slice(b"LMSG ");
+                self.buf.extend_from_slice(subject);
+                self.buf.push(b' ');
+                if let Some(r) = reply {
+                    self.buf.extend_from_slice(r);
+                    self.buf.push(b' ');
+                }
+                self.buf
+                    .extend_from_slice(usize_to_buf(payload_len, &mut tmp));
                 self.buf.extend_from_slice(b"\r\n");
             }
         }

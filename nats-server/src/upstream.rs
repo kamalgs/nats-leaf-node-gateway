@@ -17,7 +17,6 @@ use tracing::{debug, error, warn};
 use async_nats::header::HeaderMap;
 
 use crate::client_conn::ClientMsg;
-use crate::nats_proto;
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;
 
@@ -320,24 +319,19 @@ fn handle_hub_op(
             // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let subs = state.subs.read().unwrap();
-            let matches = subs.match_subject(subject_str);
-            if matches.is_empty() {
-                return Ok(());
-            }
-
             let conns = state.conns.read().unwrap();
-            for sub in &matches {
+            subs.for_each_match(subject_str, |sub| {
                 if let Some(handle) = conns.get(&sub.conn_id) {
                     let msg = ClientMsg {
                         subject: subject.clone(),
-                        sid_bytes: nats_proto::sid_to_bytes(sub.sid),
+                        sid_bytes: sub.sid_bytes.clone(),
                         reply: reply.clone(),
                         headers: headers.clone(),
                         payload: payload.clone(),
                     };
                     let _ = handle.msg_tx.send(msg);
                 }
-            }
+            });
         }
         LeafOp::Ping => {
             // Send PONG via the writer task

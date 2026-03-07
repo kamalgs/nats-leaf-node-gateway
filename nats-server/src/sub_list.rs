@@ -7,11 +7,16 @@
 
 use std::collections::HashSet;
 
+use bytes::Bytes;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Subscription {
     pub conn_id: u64,
     pub sid: u64,
+    /// Pre-computed ASCII bytes of the SID (e.g. `b"42"`), cloned (atomic inc)
+    /// at delivery time instead of heap-allocating via `sid_to_bytes()` per message.
+    pub sid_bytes: Bytes,
     pub subject: String,
     pub queue: Option<String>,
 }
@@ -61,6 +66,19 @@ impl SubList {
             .iter()
             .filter(|s| subject_matches(&s.subject, subject))
             .collect()
+    }
+
+    /// Iterate over matching subscriptions without allocating a Vec.
+    /// Returns the total number of matches.
+    pub fn for_each_match(&self, subject: &str, mut f: impl FnMut(&Subscription)) -> usize {
+        let mut count = 0;
+        for sub in &self.subs {
+            if subject_matches(&sub.subject, subject) {
+                f(sub);
+                count += 1;
+            }
+        }
+        count
     }
 
     #[allow(dead_code)]
@@ -137,18 +155,21 @@ mod tests {
         sl.insert(Subscription {
             conn_id: 1,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo.bar".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 1,
             sid: 2,
+            sid_bytes: Bytes::from_static(b"2"),
             subject: "foo.*".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 2,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "baz.>".to_string(),
             queue: None,
         });
@@ -171,12 +192,14 @@ mod tests {
         sl.insert(Subscription {
             conn_id: 1,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 1,
             sid: 2,
+            sid_bytes: Bytes::from_static(b"2"),
             subject: "bar".to_string(),
             queue: None,
         });
@@ -195,18 +218,21 @@ mod tests {
         sl.insert(Subscription {
             conn_id: 1,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 1,
             sid: 2,
+            sid_bytes: Bytes::from_static(b"2"),
             subject: "bar".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 2,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo".to_string(),
             queue: None,
         });
@@ -225,18 +251,21 @@ mod tests {
         sl.insert(Subscription {
             conn_id: 1,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 2,
             sid: 1,
+            sid_bytes: Bytes::from_static(b"1"),
             subject: "foo".to_string(),
             queue: None,
         });
         sl.insert(Subscription {
             conn_id: 1,
             sid: 2,
+            sid_bytes: Bytes::from_static(b"2"),
             subject: "bar".to_string(),
             queue: None,
         });

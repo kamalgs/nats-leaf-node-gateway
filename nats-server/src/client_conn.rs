@@ -31,6 +31,9 @@ pub(crate) struct ClientConnection {
     conn: ServerConn,
     state: Arc<ServerState>,
     msg_rx: mpsc::UnboundedReceiver<ClientMsg>,
+    /// Cached upstream sender — populated once after handshake to avoid
+    /// RwLock read + Arc clone on every publish.
+    upstream_tx: Option<mpsc::UnboundedSender<UpstreamCmd>>,
 }
 
 impl ClientConnection {
@@ -47,6 +50,7 @@ impl ClientConnection {
             conn,
             state,
             msg_rx,
+            upstream_tx: None,
         };
         (client, handle)
     }
@@ -65,6 +69,9 @@ impl ClientConnection {
         }
 
         info!(id = self.id, "client connected");
+
+        // Cache the upstream sender once — avoids RwLock read per publish
+        self.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
 
         let result = self.message_loop().await;
         if let Err(e) = &result {
@@ -162,6 +169,7 @@ impl ClientConnection {
                 let sub = Subscription {
                     conn_id: self.id,
                     sid,
+                    sid_bytes: nats_proto::sid_to_bytes(sid),
                     subject: subject_str.to_string(),
                     queue: queue_str,
                 };
@@ -208,13 +216,12 @@ impl ClientConnection {
                 {
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
-                    let matches = subs.match_subject(subject_str);
                     let conns = self.state.conns.read().unwrap();
-                    for sub in &matches {
+                    subs.for_each_match(subject_str, |sub| {
                         if let Some(handle) = conns.get(&sub.conn_id) {
                             let msg = ClientMsg {
                                 subject: subject.clone(),
-                                sid_bytes: nats_proto::sid_to_bytes(sub.sid),
+                                sid_bytes: sub.sid_bytes.clone(),
                                 reply: respond.clone(),
                                 headers: headers.clone(),
                                 payload: payload.clone(),
@@ -222,21 +229,18 @@ impl ClientConnection {
                             // Non-blocking send; drop if the client is slow
                             let _ = handle.msg_tx.send(msg);
                         }
-                    }
+                    });
                 }
 
-                // Forward to upstream hub (lock-free path)
-                {
-                    let tx = self.state.upstream_tx.read().unwrap().clone();
-                    if let Some(tx) = tx {
-                        if let Err(e) = tx.send(UpstreamCmd::Publish {
-                            subject,
-                            reply: respond,
-                            headers,
-                            payload,
-                        }) {
-                            warn!(error = %e, "failed to forward publish to upstream");
-                        }
+                // Forward to upstream hub (cached sender, no lock)
+                if let Some(ref tx) = self.upstream_tx {
+                    if let Err(e) = tx.send(UpstreamCmd::Publish {
+                        subject,
+                        reply: respond,
+                        headers,
+                        payload,
+                    }) {
+                        warn!(error = %e, "failed to forward publish to upstream");
                     }
                 }
             }

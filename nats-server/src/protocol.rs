@@ -284,6 +284,8 @@ impl LeafWriter {
     }
 
     /// Send LMSG to the hub.
+    /// Writes header and payload separately to avoid copying the payload
+    /// into the MsgBuilder scratch buffer. The BufWriter coalesces them.
     pub(crate) async fn send_leaf_msg(
         &mut self,
         subject: &[u8],
@@ -291,10 +293,12 @@ impl LeafWriter {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) -> io::Result<()> {
-        let data = self
+        let hdr = self
             .msg_builder
-            .build_lmsg(subject, reply, headers, payload);
-        self.writer.write_all(data).await
+            .build_lmsg_header(subject, reply, headers, payload.len());
+        self.writer.write_all(hdr).await?;
+        self.writer.write_all(payload).await?;
+        self.writer.write_all(b"\r\n").await
     }
 
     /// Flush buffered writes to the wire.
