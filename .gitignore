@@ -7,6 +7,9 @@ Cargo.lock
 # nixago: ignore-linked-files
 /treefmt.toml
 
+# Claude Code local config
+.claude/
+
 # Local build config
 .cargo/config.toml
 mise.toml

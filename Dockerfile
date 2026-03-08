@@ -3,12 +3,13 @@ FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 
-# Copy manifests first for dependency caching
+# Copy manifests first for dependency caching.
+# async-nats manifest is needed because Cargo.toml declares it as a workspace member.
 COPY Cargo.toml Cargo.lock ./
 COPY async-nats/Cargo.toml async-nats/Cargo.toml
 COPY open-wire/Cargo.toml open-wire/Cargo.toml
 
-# Create dummy source files so cargo can resolve dependencies
+# Create dummy source files so cargo can resolve the workspace
 RUN mkdir -p async-nats/src open-wire/src && \
     echo "fn main() {}" > async-nats/src/lib.rs && \
     echo "fn main() {}" > open-wire/src/lib.rs && \
@@ -16,16 +17,16 @@ RUN mkdir -p async-nats/src open-wire/src && \
     echo "fn main() {}" > open-wire/examples/leaf_server.rs
 
 # Build dependencies only (cached layer)
-RUN cargo build --release -p open-wire --features websockets --example leaf_server 2>/dev/null || true
+RUN cargo build --release -p open-wire --example leaf_server 2>/dev/null || true
 
 # Copy actual source
 COPY . .
 
 # Touch sources to invalidate the dummy builds
-RUN touch async-nats/src/lib.rs open-wire/src/lib.rs open-wire/examples/leaf_server.rs
+RUN touch open-wire/src/lib.rs open-wire/examples/leaf_server.rs
 
 # Build the real binary
-RUN cargo build --release -p open-wire --features websockets --example leaf_server
+RUN cargo build --release -p open-wire --example leaf_server
 
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim
