@@ -1,119 +1,103 @@
-# AGENTS.md — AI Agent Instructions for nats.rs
+# CLAUDE.md — AI Agent Instructions for open-wire
 
 ## Project Overview
 
-This is the official Rust client for [NATS.io](https://nats.io), a high-performance messaging system.
-The active crate is **`async-nats`** — a fully async, Tokio-based client.
+**open-wire** is a high-performance NATS-compatible message relay (leaf node server) written in Rust.
+It speaks the standard NATS client and leaf node protocols, routes messages between local clients,
+and optionally bridges traffic to an upstream NATS hub server.
 
-> **The `nats` crate (synchronous client) is deprecated.** It receives security fixes only. All new
-> work happens in `async-nats`. Do not modify the `nats/` directory unless explicitly asked.
+Built with raw epoll, zero-copy parsing, and no async runtime.
+
+> **`async-nats`** is the upstream NATS Rust client kept as a workspace member. It is used only as a
+> dev-dependency for open-wire's integration tests. Do not modify `async-nats/` unless explicitly asked.
 
 ## Repository Structure
 
 ```
-nats.rs/
-├── async-nats/          # Primary crate — async NATS client (this is where you work)
-│   ├── src/
-│   │   ├── lib.rs       # Entry point, core types (Command, ServerOp, ClientOp, connect())
-│   │   ├── client.rs    # Client handle — publish, subscribe, request, flush
-│   │   ├── connection.rs# Low-level I/O — protocol parsing, read/write buffers
-│   │   ├── connector.rs # Connection establishment, reconnection, auth handshake
-│   │   ├── options.rs   # ConnectOptions builder
-│   │   ├── error.rs     # Generic Error<Kind> pattern
-│   │   ├── header.rs    # HeaderMap — NATS message headers
-│   │   ├── subject.rs   # Subject type, ToSubject trait
-│   │   ├── status.rs    # StatusCode (100-999 NATS protocol codes)
-│   │   ├── message.rs   # Message types
-│   │   ├── tls.rs       # TLS configuration
-│   │   ├── auth.rs      # Auth trait definitions
-│   │   ├── auth_utils.rs# Credential file parsing
-│   │   ├── crypto.rs    # Crypto feature support
-│   │   ├── id_generator.rs
-│   │   ├── jetstream/   # JetStream API (feature-gated)
-│   │   │   ├── context.rs    # JetStream context — streams, publishing
-│   │   │   ├── stream.rs     # Stream management, consumer creation
-│   │   │   ├── consumer/     # Pull, Push, Ordered consumers
-│   │   │   ├── kv/           # Key-Value store (feature: "kv")
-│   │   │   ├── object_store/ # Object store (feature: "object-store")
-│   │   │   ├── errors.rs     # JetStream error codes
-│   │   │   ├── message.rs    # JetStream message types
-│   │   │   ├── publish.rs    # PublishAck
-│   │   │   └── response.rs   # Response wrapper
-│   │   └── service/     # Service API (feature: "service")
-│   │       ├── mod.rs        # Service, ServiceBuilder
-│   │       ├── endpoint.rs   # Endpoint handling
-│   │       └── error.rs      # Service errors
-│   ├── tests/           # Integration tests (require running nats-server)
-│   │   ├── configs/     # NATS server config files for tests
-│   │   ├── client_tests.rs
-│   │   ├── jetstream_tests.rs
-│   │   ├── kv_tests.rs
-│   │   ├── object_store.rs
-│   │   ├── service_tests.rs
-│   │   └── ...
-│   ├── examples/        # Runnable examples
-│   └── benches/         # Criterion benchmarks
-├── open-wire/           # NATS-compatible message relay (leaf node server)
-├── nats/                # DEPRECATED sync client — do not modify
-└── nats-core/           # Experimental embedded/no_std client (separate)
+open-wire/
+├── src/
+│   ├── lib.rs           # Public API: LeafServer, LeafServerConfig
+│   ├── server.rs        # Accept loop, worker spawning, shutdown
+│   ├── worker.rs        # Per-thread epoll event loop, connection state machine
+│   ├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
+│   ├── sub_list.rs      # SubList (exact + wildcard), DirectWriter fan-out
+│   ├── upstream.rs      # Hub connection via leaf node protocol
+│   ├── protocol.rs      # Connection I/O wrappers, AdaptiveBuf
+│   ├── websocket.rs     # HTTP upgrade handshake, WS frame codec
+│   └── types.rs         # ServerInfo, ConnectInfo, HeaderMap
+├── examples/
+│   ├── leaf_server.rs   # CLI example (--port, --hub, --ws-port, --workers)
+│   └── chat/            # Sample chat app (HTML + README)
+├── tests/
+│   └── e2e.rs           # Integration tests (requires nats-server + async-nats)
+├── bench/
+│   ├── throughput.sh    # Main Rust vs Go leaf benchmark
+│   ├── smoke_test.sh    # Quick functional smoke test
+│   ├── profile.sh       # Perf profiling (pub-only, pubsub, fanout)
+│   ├── profile_run.sh   # Ad-hoc perf: pub-only + pubsub
+│   ├── profile_pubsub.sh   # Ad-hoc perf: pubsub with frame pointers
+│   ├── profile_pubonly.sh   # Ad-hoc perf: pub-only with frame pointers
+│   ├── profile_hubleaf.sh   # Ad-hoc perf: hub→leaf with frame pointers
+│   ├── memory.sh        # Idle-connection memory comparison (Go vs Rust)
+│   ├── clients/         # Go helper binary for memory bench
+│   └── configs/         # nats-server configs for benchmarks
+├── benches/
+│   └── throughput.rs    # Criterion benchmarks
+├── docs/
+│   ├── architecture.md  # Detailed message flow diagrams
+│   ├── goals.md         # Project goals
+│   ├── backlog.md       # Feature backlog
+│   ├── portability.md   # Portability notes
+│   └── adr/             # Architecture decision records
+├── Cargo.toml
+└── BENCHMARKS.md        # Full benchmark results log
+```
+
+Top-level repo files:
+```
+Cargo.toml               # Workspace: [open-wire, async-nats]
+Cargo.lock
+Dockerfile  .dockerignore
+.gitignore  .rustfmt.toml
+CLAUDE.md  LICENSE  NOTICE  README.md  deny.toml
+.cargo/  .claude/  .config/  .github/
+async-nats/              # Upstream NATS client (workspace member, dev-dep only)
 ```
 
 ## Build & Test Commands
 
 ```bash
+# Check
+cargo check -p open-wire
+cargo check -p open-wire --example leaf_server
+
+# Test (unit — no external deps)
+cargo test -p open-wire --lib
+
+# Test (all — requires nats-server in PATH)
+cargo test -p open-wire
+
 # Format (required: nightly toolchain)
 cargo +nightly fmt
 
-# Lint — CI denies all clippy warnings
-cargo clippy --benches --tests --examples --all-features -- --deny clippy::all
+# Lint
+cargo clippy -p open-wire --all-targets -- --deny clippy::all
 
-# Build
-cargo build --all-targets
+# Build release
+cargo build --release -p open-wire --example leaf_server
 
-# Test (standard — requires nats-server binary in PATH)
-cargo test --features slow_tests,websockets -- --nocapture
+# Build release with frame pointers (for perf profiling)
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --example leaf_server -p open-wire
 
-# Test specific TLS backend
-cargo test tls --no-default-features \
-  --features jetstream,kv,object-store,service,nkeys,nuid,crypto,websockets,ring
-
-# Test feature combinations (thorough)
-bash .cargo-hack-check.sh
-
-# Build docs
-cargo doc --no-deps --all-features
-
-# Check MSRV (1.88.0)
-cargo +1.88.0 check
-
-# Check licenses
-cargo deny check licenses
+# Benchmarks
+cd open-wire/bench && ./throughput.sh
+cd open-wire/bench && ./smoke_test.sh
 ```
 
-**nats-server**: Tests require the `nats-server` binary. Install via Go:
+**nats-server**: Integration tests and benchmarks require the `nats-server` binary:
 ```bash
 go install github.com/nats-io/nats-server/v2@main
 ```
-
-## CI Requirements
-
-All of these must pass before a PR is merged:
-
-| Check | Command |
-|-------|---------|
-| Format | `cargo +nightly fmt -- --check` |
-| Clippy | `cargo clippy --benches --tests --examples --all-features -- --deny clippy::all` |
-| Tests | `cargo test --features slow_tests,websockets` |
-| Docs | `cargo doc --no-deps --all-features` |
-| MSRV | Build with Rust 1.88.0 |
-| Licenses | `cargo deny check licenses` |
-| Spelling | `cargo spellcheck --code 1` |
-| Examples | `cargo check --examples` |
-| Min versions | `cargo check --locked --all-features --all-targets` (with `-Zminimal-versions`) |
-| TLS backends | Tests run separately with `ring`, `aws-lc-rs`, and `fips` |
-| Platforms | Ubuntu, macOS, Windows |
-
-**Environment**: CI sets `RUSTFLAGS="-D warnings"` — all warnings are errors.
 
 ## Formatting Rules
 
@@ -127,226 +111,90 @@ Always run `cargo +nightly fmt` before committing.
 
 ## Architecture
 
-### Internal Communication
-
 ```
-Client (cloneable handle)
-  │  sends Command variants via mpsc channel
-  ▼
-ConnectionHandler (single task)
-  │  manages subscriptions, multiplexer, ping/pong
-  │  drives reconnection via Connector
-  ▼
-Connection (protocol I/O)
-  │  read_buf (BytesMut) / write_buf (VecDeque<Bytes>)
-  │  parses ServerOp, serializes ClientOp
-  ▼
-NATS Server (TCP / TLS / WebSocket)
+                        ┌────────────────────────┐
+                        │     Upstream Hub        │
+                        │  (standard nats-server) │
+                        └───────────┬────────────┘
+                                    │ leaf node protocol
+                        ┌───────────┴────────────┐
+                        │    Upstream Module      │
+                        │  reader + writer thread │
+                        └───────────┬────────────┘
+                                    │
+    ┌───────────────────────────────┼───────────────────────────────┐
+    │  ┌──────────┐  round  ┌──────┴─────┐  round  ┌──────────┐   │
+    │  │ Worker 0 │◄─robin─►│  Acceptor  │◄─robin─►│ Worker N │   │
+    │  └────┬─────┘         └────────────┘         └────┬─────┘   │
+    │       │ epoll                                      │ epoll   │
+    │  ┌────┴──────────┐                          ┌─────┴───────┐ │
+    │  │ C0  C1  C2 .. │                          │ Cm .. Cn    │ │
+    │  └───────────────┘                          └─────────────┘ │
+    └─────────────────────────────────────────────────────────────┘
 ```
 
-- `Client` is a lightweight, cloneable handle. All protocol work happens in `ConnectionHandler`.
-- Commands: `Publish`, `Request`, `Subscribe`, `Unsubscribe`, `Flush`, `Drain`, `Reconnect`.
-- Request-reply uses a multiplexer: one subscription handles all requests via inbox tokens.
+### Key Design Points
+
+- **N-worker epoll model**: N worker threads, each with one epoll instance multiplexing many connections.
+- **DirectWriter**: Cross-worker message delivery via shared buffers + eventfd notifications.
+  Fan-out to N conns on same worker = 1 eventfd write. Batched notifications reduce syscalls.
+- **Zero-copy parsing**: Protocol parsed directly from read buffers via `nats_proto.rs`.
+- **No async runtime**: Pure `std::thread` + `epoll` + `std::sync::mpsc`.
+- **Connection state machine**: `SendInfo → WaitConnect → Active` phases in worker.
+- **AdaptiveBuf**: Go-style dynamic buffer sizing (512B → 64KB).
 
 ### Key Types
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `Client` | `client.rs` | User-facing handle — publish, subscribe, request |
-| `Connection` | `connection.rs` | Protocol I/O — reads `ServerOp`, writes `ClientOp` |
-| `Connector` | `connector.rs` | Establishes connections, handles reconnection |
-| `ConnectOptions` | `options.rs` | Builder for connection configuration |
-| `Subject` | `subject.rs` | Validated subject string backed by `Bytes` |
-| `HeaderMap` | `header.rs` | NATS message headers (`HashMap<HeaderName, Vec<HeaderValue>>`) |
-| `StatusCode` | `status.rs` | Protocol status codes (100, 200, 404, 408, 409, 503) |
-| `jetstream::Context` | `jetstream/context.rs` | JetStream API entry point |
-| `jetstream::stream::Stream` | `jetstream/stream.rs` | Stream management |
-| `Consumer<T>` | `jetstream/consumer/` | Pull/Push/Ordered consumers |
-| `kv::Store` | `jetstream/kv/` | Key-Value store API |
-| `object_store::ObjectStore` | `jetstream/object_store/` | Object store API |
-| `service::Service` | `service/mod.rs` | Service API |
+| `LeafServer` | `lib.rs` | Public API entry point |
+| `LeafServerConfig` | `lib.rs` | Server configuration |
+| `Worker` | `worker.rs` | Per-thread epoll event loop |
+| `NatsProto` / `MsgBuilder` | `nats_proto.rs` | Protocol parser + message builder |
+| `SubList` / `DirectWriter` | `sub_list.rs` | Subscription storage + fan-out delivery |
+| `ServerConn` / `LeafConn` | `protocol.rs` | Connection I/O wrappers |
+| `AdaptiveBuf` | `protocol.rs` | Dynamic read buffer |
+| `Upstream` | `upstream.rs` | Hub connection management |
 
-## Feature Flags
+## Dependencies
 
 ```toml
-# Default: everything enabled
-default = ["server_2_10", "server_2_11", "server_2_12", "service", "ring",
-           "jetstream", "nkeys", "crypto", "object-store", "kv", "websockets", "nuid"]
-
-# Subsystems (each gates a module)
-jetstream       # JetStream API — pulls in time, serde_nanos, tryhard, base64
-kv              # Key-Value store (requires jetstream)
-object-store    # Object store (requires jetstream + crypto)
-service         # Service API — pulls in time, serde_nanos
-
-# Crypto backends (pick one)
-ring            # Default crypto backend
-aws-lc-rs       # Alternative backend
-fips            # FIPS mode (requires aws-lc-rs)
-
-# Other
-nkeys           # NKey authentication
-nuid            # NUID-based ID generation (falls back to rand if disabled)
-crypto          # Encryption support
-websockets      # WebSocket transport
-experimental    # Experimental features
-
-# Server version markers (no code, just enable version-specific fields/methods)
-server_2_10
-server_2_11
-server_2_12
-
-# Test-only
-slow_tests              # Long-running, time-sensitive tests
-compatibility_tests     # Cross-client compatibility tests
+[dependencies]
+bytes = "1.4.0"
+libc = "0.2"
+memchr = "2.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.104"
+tracing = "0.1"
 ```
 
-**When adding new code gated by a feature**, follow this pattern:
-```rust
-#[cfg(feature = "jetstream")]
-#[cfg_attr(docsrs, doc(cfg(feature = "jetstream")))]
-pub mod jetstream;
-```
+Minimal dependency footprint. No async runtime, no TLS library.
 
-Always add the `docsrs` annotation so docs.rs shows feature requirements.
+New dependencies must have licenses allowed in `deny.toml`: MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause.
 
-## Error Handling Pattern
+## Build Environment
 
-The crate uses a generic `Error<Kind>` type. Every subsystem defines its own `ErrorKind` enum:
-
-```rust
-// 1. Define the kind enum
-#[derive(Clone, Debug, PartialEq)]
-pub enum FooErrorKind {
-    NotFound,
-    TimedOut,
-    Other,
-}
-
-impl Display for FooErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "not found"),
-            Self::TimedOut => write!(f, "timed out"),
-            Self::Other => write!(f, "unknown error"),
-        }
-    }
-}
-
-// 2. Define the error type alias
-pub type FooError = Error<FooErrorKind>;
-
-// 3. Construct errors
-FooError::new(FooErrorKind::NotFound)
-FooError::with_source(FooErrorKind::TimedOut, source_error)
-
-// 4. Match on errors
-match result {
-    Err(err) if err.kind() == FooErrorKind::NotFound => { /* handle */ }
-    Err(err) => return Err(err.into()),
-    Ok(val) => val,
-}
-```
-
-Rules:
-- Never `unwrap()` or `expect()` in library code.
-- Chain error sources with `.with_source(kind, source)`.
-- Tests assert on `.kind()`, not string messages.
-- The top-level `Error` type is `Box<dyn std::error::Error + Send + Sync + 'static>`.
-
-## Testing Patterns
-
-### Server Setup
-
-Tests use the `nats-server` crate to launch real server instances:
-
-```rust
-use nats_server;
-
-#[tokio::test]
-async fn my_test() {
-    // Basic server
-    let server = nats_server::run_server("tests/configs/jetstream.conf");
-    let client = async_nats::connect(server.client_url()).await.unwrap();
-
-    // With options
-    let client = async_nats::ConnectOptions::new()
-        .event_callback(|event| async move { println!("{event:?}") })
-        .connect(server.client_url())
-        .await
-        .unwrap();
-
-    // Cluster (3 nodes)
-    let cluster = nats_server::run_cluster("tests/configs/jetstream.conf");
-}
-```
-
-- Server configs live in `tests/configs/`.
-- Servers clean up JetStream storage on drop.
-- Use `server.restart()` to test reconnection.
-
-### Feature-Gated Tests
-
-```rust
-#[cfg(feature = "kv")]
-mod kv_tests {
-    #[tokio::test]
-    async fn create_bucket() { /* ... */ }
-}
-```
-
-### Error Assertions
-
-```rust
-let err = client.publish("bad subject", "".into()).await.unwrap_err();
-assert_eq!(err.kind(), PublishErrorKind::BadSubject);
-```
+- Using zig as C compiler/linker (no system gcc). Config in `.cargo/config.toml`.
+- Dev dependencies in `async-nats/Cargo.toml` (ring, reqwest, criterion, etc.) are disabled
+  because they require system gcc/openssl.
+- `[profile.release] debug = 1, strip = false` for perf symbol resolution.
 
 ## Code Conventions
 
-### API Design
-- **Builder pattern** for complex configurations (`ConnectOptions`, `ServiceBuilder`).
-- **`ToSubject` trait** — methods accepting subjects are generic: `fn publish(&self, subject: impl ToSubject, ...)`.
-- **Async everywhere** — all I/O methods are async, using Tokio.
-- **`Stream` trait** — subscribers and consumers implement `futures::Stream`.
-- **`Clone`-friendly** — `Client` is cheap to clone (Arc internals).
-
-### Naming
-- Error types: `FooError` (type alias for `Error<FooErrorKind>`).
-- Error kinds: `FooErrorKind` enum.
-- Feature-gated modules match feature names (`jetstream`, `kv`, `service`).
-- Config structs are named `Config` within their module.
-
-### Imports
-- Group: std → external crates → crate-internal.
-- `use crate::error::Error;` for the generic error type.
-- `use super::*` is used sparingly (mainly in tests).
-
-### Dependencies
-- New dependencies must have licenses allowed in `deny.toml`: MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause.
-- Consider MSRV (1.88.0) when adding dependencies.
-- Feature-gate optional dependencies with `dep:` syntax: `dep:time`, `dep:serde_nanos`.
-
-### Docs
-- All public items must have doc comments.
-- Use `/// # Examples` with code blocks.
-- Use `no_run` for examples that need a server: ` ```no_run `.
-- Feature-gated items get `#[cfg_attr(docsrs, doc(cfg(feature = "...")))]`.
+- **No `unwrap()` or `expect()`** in library code.
+- **Imports**: Group std → external crates → crate-internal.
+- All public items should have doc comments.
+- Tests go in `#[cfg(test)] mod tests` within each source file (106 unit tests currently).
+- Integration tests in `tests/e2e.rs` use `async-nats` client against a real `nats-server`.
 
 ## Commit & PR Standards
 
 - Linear history — rebase, no merge commits.
 - Atomic, reasonably-sized commits.
-- Well-formed commit messages ([reference](https://tbaggery.com/2008/04/19/a-note-about-git-commit-messages.html)).
-- Discuss changes via issues before starting work.
-- Raise PRs early for visibility.
+- Well-formed commit messages.
 
 ## License
 
-Apache-2.0. All source files carry the license header:
-```
-// Copyright 2020-2023 The NATS Authors
-// Licensed under the Apache License, Version 2.0
-```
-
-Do not remove or modify license headers. New files should include them.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for attribution.
+This project is a fork of [nats-io/nats.rs](https://github.com/nats-io/nats.rs).
