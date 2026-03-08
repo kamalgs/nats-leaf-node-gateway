@@ -3,14 +3,17 @@
 #   1. Publish only (fire-and-forget)
 #   2. Local pub/sub (1 pub + 1 sub)
 #
-# Produces perf report text files in open-wire/profile_results/
+# Produces perf report text files in profile_results/
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 MSGS=2000000
 SIZE=128
 RUST_PORT=15223
-OUTDIR="open-wire/profile_results"
-BIN="./target/release/examples/leaf_server"
+OUTDIR="$SCRIPT_DIR/profile_results"
+BIN="$REPO_ROOT/target/release/examples/leaf_server"
 
 mkdir -p "$OUTDIR"
 

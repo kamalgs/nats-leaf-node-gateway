@@ -17,13 +17,13 @@
 #   - cargo (Rust toolchain)
 #
 # Usage:
-#   cd open-wire && ./bench.sh
-#   ./bench.sh --msgs 500000 --size 256 --runs 2
+#   cd open-wire/bench && ./throughput.sh
+#   ./throughput.sh --msgs 500000 --size 256 --runs 2
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Defaults (overridable via CLI args)
 MSGS=500000

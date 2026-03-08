@@ -11,3 +11,9 @@ Cargo.lock
 .cargo/config.toml
 mise.toml
 .mise.toml
+
+# Compiled benchmark binary
+bench_clients_bin
+
+# Profiling output
+**/profile_results/

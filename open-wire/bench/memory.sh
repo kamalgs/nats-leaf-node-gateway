@@ -2,10 +2,13 @@
 # Benchmark: compare idle-connection memory between Go nats-server and Rust leaf server.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 NUM_CLIENTS=${1:-1000}
 GO_PORT=24222
 RUST_PORT=24223
-CLIENT_BIN="./bench_clients_bin"
+CLIENT_BIN="$SCRIPT_DIR/clients/bench_clients_bin"
 
 rss_kb() {
     ps -o rss= -p "$1" 2>/dev/null | tr -d ' '
@@ -63,7 +66,7 @@ sleep 2
 # ===================== RUST LEAF SERVER =====================
 echo
 echo "--- Rust leaf server (adaptive bufs) ---"
-./target/release/examples/leaf_server --port $RUST_PORT &>/dev/null &
+"$REPO_ROOT/target/release/examples/leaf_server" --port $RUST_PORT &>/dev/null &
 RUST_PID=$!
 wait_for_port $RUST_PORT
 sleep 1

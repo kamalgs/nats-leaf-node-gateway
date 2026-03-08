@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN="./target/release/examples/leaf_server"
-OUTDIR="open-wire/profile_results"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+BIN="$REPO_ROOT/target/release/examples/leaf_server"
+OUTDIR="$SCRIPT_DIR/profile_results"
 RUST_PORT=15229
 HUB_PORT=14333
 LEAF_PORT=17422
