@@ -122,6 +122,8 @@ struct ClientState {
     upstream_tx: Option<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
     epoll_has_out: bool,
+    /// When false, suppress delivery of the client's own published messages.
+    echo: bool,
 }
 
 // --- Worker ---
@@ -337,6 +339,7 @@ impl Worker {
             conn_id: id,
             upstream_tx: None,
             epoll_has_out: false,
+            echo: true,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -774,6 +777,7 @@ impl Worker {
                         }
                         let client = self.conns.get_mut(&conn_id).unwrap();
                         client.phase = ConnPhase::Active;
+                        client.echo = connect_info.echo;
                         client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
                         info!(conn_id, "client connected");
                     }
@@ -917,10 +921,16 @@ impl Worker {
                     let my_event_fd = self.event_fd.as_raw_fd();
                     let pending_notify = &mut self.pending_notify;
                     let pending_count = &mut self.pending_notify_count;
+                    let pub_echo = self.conns.get(&conn_id).map(|c| c.echo).unwrap_or(true);
 
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
                     subs.for_each_match(subject_str, |sub| {
+                        // Suppress echo: don't deliver to the publisher itself
+                        // when the client set echo: false in CONNECT.
+                        if !pub_echo && sub.conn_id == conn_id {
+                            return;
+                        }
                         sub.writer.write_msg(
                             &subject,
                             &sub.sid_bytes,
