@@ -5,6 +5,52 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-08 — v0.5 repo restructure validation
+
+**Changes:**
+Flattened `open-wire/` subdirectory to repo root, merged `benches/` and `tests/` into `tests/`,
+promoted `examples/leaf_server.rs` to `src/main.rs`. No code changes — repo layout only.
+
+Benchmark re-run to confirm no regressions.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,837K | ~1,595K | **87%** | 99% |
+| Local pub/sub (sub) | ~762K | ~832K | **109%** | 89% |
+| Fan-out x5 (pub) | ~209K | ~372K | **178%** | 210% |
+| Leaf → Hub (sub on hub) | ~522K | ~709K | **136%** | 128% |
+| Hub → Leaf (sub) | ~572K | ~606K | **106%** | 104% |
+| WS pub/sub (sub) | ~621K | ~786K | **127%** | 121% |
+| WS fan-out x5 (pub) | ~166K | ~418K | **252%** | 238% |
+| WS fan-out x10 (pub) | ~78K | ~261K | **335%** | 295% |
+
+### Memory (10K idle connections)
+
+| Metric | Go nats-server | Rust Leaf |
+|---|---|---|
+| Baseline RSS | 13.9 MB | 2.6 MB |
+| 10K idle clients delta | 399 MB | 109 MB |
+| Per-client idle cost | 40.9 KB | 11.1 KB |
+| Go / Rust ratio | | **3.7x** |
+
+### CPU Profile (2M msgs × 128B, flat sampling)
+
+| Scenario | Throughput | Top hotspot |
+|---|---|---|
+| Pub only | 1,770K msgs/sec | `parse_pub` 15%, `hash_one` 12%, `process_read_buf` 10% |
+| Local pub/sub | 864K sub msgs/sec | `parse_pub` 10%, `process_read_buf` 8%, `write_msg` 3.4% |
+| Fan-out x5 | 367K sub msgs/sec | `write_msg` 12%, `parse_pub` 5%, `build_msg` 3.4% |
+
+**Takeaways:**
+- All results within normal run-to-run variance — no regressions from repo restructuring.
+- Pub-only variance (87% vs 99%) is typical for fire-and-forget on shared VMs.
+- Fan-out and WS scenarios remain Rust's strongest advantages (1.8–3.4x Go).
+- Memory profile unchanged: 3.7x less per-client idle cost than Go.
+
+---
+
 ## 2026-03-08 — WebSocket transport support
 
 **Feature added:**

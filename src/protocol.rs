@@ -387,7 +387,7 @@ impl LeafConn {
             "headers": headers,
             "no_responders": true,
             "name": name,
-            "version": "0.1.0",
+            "version": "0.5.0",
             "protocol": 1,
         });
         let line = format!("CONNECT {json}\r\n");

@@ -110,7 +110,7 @@ impl LeafServer {
         let info = ServerInfo {
             server_id: format!("LEAF_{}", rand::random::<u32>()),
             server_name: config.server_name.clone(),
-            version: "0.1.0".to_string(),
+            version: "0.5.0".to_string(),
             proto: 1,
             max_payload: 1024 * 1024, // 1MB
             headers: true,
