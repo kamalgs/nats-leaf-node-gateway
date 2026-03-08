@@ -18,6 +18,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, info, warn};
@@ -124,6 +125,10 @@ struct ClientState {
     epoll_has_out: bool,
     /// When false, suppress delivery of the client's own published messages.
     echo: bool,
+    /// Last time activity was seen on this connection.
+    last_activity: Instant,
+    /// Number of server-initiated PINGs sent without a PONG response.
+    pings_outstanding: u32,
 }
 
 // --- Worker ---
@@ -201,13 +206,23 @@ impl Worker {
     fn run(&mut self) {
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
 
+        // Compute epoll timeout for periodic keepalive checks.
+        // Use half the ping interval (capped at 30s) so we check reasonably often.
+        // -1 if keepalive is disabled.
+        let epoll_timeout_ms = if self.state.ping_interval.is_zero() {
+            -1i32
+        } else {
+            let half = self.state.ping_interval.as_millis() / 2;
+            half.min(30_000) as i32
+        };
+
         loop {
             let n = unsafe {
                 libc::epoll_wait(
                     self.epoll_fd.as_raw_fd(),
                     events.as_mut_ptr(),
                     events.len() as i32,
-                    -1,
+                    epoll_timeout_ms,
                 )
             };
             if n < 0 {
@@ -244,6 +259,11 @@ impl Worker {
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
             self.flush_pending();
+
+            // Check for idle connections and send keepalive PINGs.
+            if epoll_timeout_ms > 0 {
+                self.check_pings();
+            }
 
             if self.shutdown {
                 break;
@@ -340,6 +360,8 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -493,6 +515,42 @@ impl Worker {
         self.pending_notify_count = 0;
     }
 
+    /// Send keepalive PINGs to idle connections and close unresponsive ones.
+    fn check_pings(&mut self) {
+        let now = Instant::now();
+        let interval = self.state.ping_interval;
+        let max_pings = self.state.max_pings_outstanding;
+        let epoll_fd = self.epoll_fd.as_raw_fd();
+        let mut to_remove: Vec<u64> = Vec::new();
+
+        for (conn_id, client) in &mut self.conns {
+            if !matches!(client.phase, ConnPhase::Active) {
+                continue;
+            }
+            let elapsed = now.duration_since(client.last_activity);
+            if elapsed < interval {
+                continue;
+            }
+            if client.pings_outstanding >= max_pings {
+                warn!(conn_id = *conn_id, "connection stale, closing");
+                to_remove.push(*conn_id);
+                continue;
+            }
+            // Send PING and register EPOLLOUT
+            client.write_buf.extend_from_slice(b"PING\r\n");
+            client.pings_outstanding += 1;
+            client.last_activity = now;
+            if !client.epoll_has_out {
+                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                client.epoll_has_out = true;
+            }
+        }
+
+        for conn_id in to_remove {
+            self.remove_conn(conn_id);
+        }
+    }
+
     /// Try to flush write_buf to the socket. Registers/removes EPOLLOUT as needed.
     /// For WebSocket connections, write_buf is encoded into ws_out first.
     fn try_flush_conn(&mut self, conn_id: u64) {
@@ -597,6 +655,9 @@ impl Worker {
             }
         }
 
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            client.last_activity = Instant::now();
+        }
         self.process_read_buf(conn_id);
         self.flush_notifications();
     }
@@ -709,6 +770,9 @@ impl Worker {
             return;
         }
 
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            client.last_activity = Instant::now();
+        }
         self.process_read_buf(conn_id);
         self.flush_notifications();
     }
@@ -872,7 +936,12 @@ impl Worker {
                 }
                 self.try_flush_conn(conn_id);
             }
-            ClientOp::Pong => {}
+            ClientOp::Pong => {
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client.pings_outstanding = 0;
+                    client.last_activity = Instant::now();
+                }
+            }
             ClientOp::Subscribe {
                 sid,
                 subject,

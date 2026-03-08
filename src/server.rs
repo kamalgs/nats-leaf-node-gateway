@@ -130,6 +130,11 @@ pub struct LeafServerConfig {
     /// Maximum pending write bytes per connection before disconnecting as a
     /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
     pub max_pending: usize,
+    /// Interval between server-initiated PING keepalives (default: 2 minutes).
+    /// Set to `Duration::ZERO` to disable keepalive.
+    pub ping_interval: std::time::Duration,
+    /// Maximum outstanding PINGs before closing a connection (default: 2).
+    pub max_pings_outstanding: u32,
     /// Client authentication configuration.
     pub client_auth: ClientAuth,
     /// Credentials for connecting to the upstream hub.
@@ -151,6 +156,8 @@ impl Default for LeafServerConfig {
             workers,
             ws_port: None,
             max_pending: 64 * 1024 * 1024,
+            ping_interval: std::time::Duration::from_secs(120),
+            max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
             hub_credentials: None,
         }
@@ -161,6 +168,8 @@ impl Default for LeafServerConfig {
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
+    pub ping_interval: std::time::Duration,
+    pub max_pings_outstanding: u32,
     pub subs: std::sync::RwLock<SubList>,
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
@@ -175,10 +184,18 @@ pub(crate) struct ServerState {
 }
 
 impl ServerState {
-    fn new(info: ServerInfo, auth: ClientAuth, buf_config: BufConfig) -> Self {
+    fn new(
+        info: ServerInfo,
+        auth: ClientAuth,
+        ping_interval: std::time::Duration,
+        max_pings_outstanding: u32,
+        buf_config: BufConfig,
+    ) -> Self {
         Self {
             info,
             auth,
+            ping_interval,
+            max_pings_outstanding,
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: std::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
@@ -233,8 +250,14 @@ impl LeafServer {
 
         let auth = config.client_auth.clone();
         Self {
-            config,
-            state: Arc::new(ServerState::new(info, auth, buf_config)),
+            config: config.clone(),
+            state: Arc::new(ServerState::new(
+                info,
+                auth,
+                config.ping_interval,
+                config.max_pings_outstanding,
+                buf_config,
+            )),
         }
     }
 
