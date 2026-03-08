@@ -17,13 +17,13 @@
 #   - cargo (Rust toolchain)
 #
 # Usage:
-#   cd open-wire/bench && ./throughput.sh
+#   cd bench && ./throughput.sh
 #   ./throughput.sh --msgs 500000 --size 256 --runs 2
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Defaults (overridable via CLI args)
 MSGS=500000
@@ -89,7 +89,7 @@ echo ""
 # --- Build Rust leaf server ---
 echo "Building Rust leaf server (release)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p open-wire --release --example leaf_server 2>&1 | tail -1
+  --release --example leaf_server 2>&1 | tail -1
 RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
 echo ""
 

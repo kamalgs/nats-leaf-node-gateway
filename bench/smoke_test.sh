@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 HUB_CLIENT_PORT=4333
 HUB_LEAF_PORT=7422
@@ -29,7 +29,7 @@ fail() { echo "  FAIL: $1"; exit 1; }
 # Build
 echo "Building Rust leaf (release)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p open-wire --release --example leaf_server 2>&1 | tail -1
+  --release --example leaf_server 2>&1 | tail -1
 RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
 
 # Start servers

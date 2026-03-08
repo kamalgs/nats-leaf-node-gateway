@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/profile_results"
 LEAF_PORT=14222
 HUB_PORT=14223
@@ -36,8 +36,8 @@ trap cleanup EXIT
 # Build release binary with debug symbols (touch to force rebuild)
 echo "=== Building release binary ==="
 cd "$ROOT_DIR"
-touch open-wire/src/lib.rs
-cargo build --release -p open-wire --example leaf_server 2>&1 | tail -5
+touch src/lib.rs
+cargo build --release --example leaf_server 2>&1 | tail -5
 LEAF_BIN="$ROOT_DIR/target/release/examples/leaf_server"
 
 # Verify binary has symbols (match "not stripped" explicitly)

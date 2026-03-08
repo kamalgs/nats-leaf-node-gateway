@@ -5,25 +5,24 @@ WORKDIR /build
 
 # Copy manifests first for dependency caching.
 COPY Cargo.toml Cargo.lock ./
-COPY open-wire/Cargo.toml open-wire/Cargo.toml
 
-# Create dummy source files so cargo can resolve the workspace
-RUN mkdir -p open-wire/src && \
-    echo "fn main() {}" > open-wire/src/lib.rs && \
-    mkdir -p open-wire/examples && \
-    echo "fn main() {}" > open-wire/examples/leaf_server.rs
+# Create dummy source files so cargo can resolve the package
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/lib.rs && \
+    mkdir -p examples && \
+    echo "fn main() {}" > examples/leaf_server.rs
 
 # Build dependencies only (cached layer)
-RUN cargo build --release -p open-wire --example leaf_server 2>/dev/null || true
+RUN cargo build --release --example leaf_server 2>/dev/null || true
 
 # Copy actual source
 COPY . .
 
 # Touch sources to invalidate the dummy builds
-RUN touch open-wire/src/lib.rs open-wire/examples/leaf_server.rs
+RUN touch src/lib.rs examples/leaf_server.rs
 
 # Build the real binary
-RUN cargo build --release -p open-wire --example leaf_server
+RUN cargo build --release --example leaf_server
 
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim

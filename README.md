@@ -22,7 +22,7 @@ Benchmarked against Go nats-server v2.14.0-dev leaf node, 128B messages, 3-run a
 
 Memory: 3.3 MB idle vs Go's 12.6 MB. At 10K idle connections: 1.3 KB/conn vs Go's 41.4 KB/conn.
 
-See [BENCHMARKS.md](open-wire/BENCHMARKS.md) for the full results log.
+See [BENCHMARKS.md](BENCHMARKS.md) for the full results log.
 
 ## Features
 
@@ -40,7 +40,7 @@ See [BENCHMARKS.md](open-wire/BENCHMARKS.md) for the full results log.
 
 ```bash
 # Build
-cargo build --release -p open-wire --example leaf_server
+cargo build --release --example leaf_server
 
 # Run standalone
 ./target/release/examples/leaf_server --port 4222
@@ -156,13 +156,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `websocket.rs` | HTTP upgrade handshake, WS frame codec |
 | `types.rs` | ServerInfo, ConnectInfo, HeaderMap |
 
-See [architecture.md](open-wire/docs/architecture.md) for detailed message flow diagrams.
+See [architecture.md](docs/architecture.md) for detailed message flow diagrams.
 
 ## Tests
 
 ```bash
-cargo test -p open-wire --lib       # 106 unit tests
-cargo test -p open-wire             # unit + integration (requires nats-server in PATH)
+cargo test --lib                    # 106 unit tests
+cargo test                          # unit + integration (requires nats-server in PATH)
 ```
 
 ## License

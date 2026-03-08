@@ -11,49 +11,43 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 ## Repository Structure
 
 ```
-open-wire/
-├── src/
-│   ├── lib.rs           # Public API: LeafServer, LeafServerConfig
-│   ├── server.rs        # Accept loop, worker spawning, shutdown
-│   ├── worker.rs        # Per-thread epoll event loop, connection state machine
-│   ├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
-│   ├── sub_list.rs      # SubList (exact + wildcard), DirectWriter fan-out
-│   ├── upstream.rs      # Hub connection via leaf node protocol
-│   ├── protocol.rs      # Connection I/O wrappers, AdaptiveBuf
-│   ├── websocket.rs     # HTTP upgrade handshake, WS frame codec
-│   └── types.rs         # ServerInfo, ConnectInfo, HeaderMap
-├── examples/
-│   ├── leaf_server.rs   # CLI example (--port, --hub, --ws-port, --workers)
-│   └── chat/            # Sample chat app (HTML + README)
-├── tests/
-│   └── e2e.rs           # Integration tests (requires nats-server + async-nats)
-├── bench/
-│   ├── throughput.sh    # Main Rust vs Go leaf benchmark
-│   ├── smoke_test.sh    # Quick functional smoke test
-│   ├── profile.sh       # Perf profiling (pub-only, pubsub, fanout)
-│   ├── profile_run.sh   # Ad-hoc perf: pub-only + pubsub
-│   ├── profile_pubsub.sh   # Ad-hoc perf: pubsub with frame pointers
-│   ├── profile_pubonly.sh   # Ad-hoc perf: pub-only with frame pointers
-│   ├── profile_hubleaf.sh   # Ad-hoc perf: hub→leaf with frame pointers
-│   ├── memory.sh        # Idle-connection memory comparison (Go vs Rust)
-│   ├── clients/         # Go helper binary for memory bench
-│   └── configs/         # nats-server configs for benchmarks
-├── benches/
-│   └── throughput.rs    # Criterion benchmarks
-├── docs/
-│   ├── architecture.md  # Detailed message flow diagrams
-│   ├── goals.md         # Project goals
-│   ├── backlog.md       # Feature backlog
-│   ├── portability.md   # Portability notes
-│   └── adr/             # Architecture decision records
-├── Cargo.toml
-└── BENCHMARKS.md        # Full benchmark results log
-```
-
-Top-level repo files:
-```
-Cargo.toml               # Workspace: [open-wire]
+src/
+├── lib.rs           # Public API: LeafServer, LeafServerConfig
+├── server.rs        # Accept loop, worker spawning, shutdown
+├── worker.rs        # Per-thread epoll event loop, connection state machine
+├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
+├── sub_list.rs      # SubList (exact + wildcard), DirectWriter fan-out
+├── upstream.rs      # Hub connection via leaf node protocol
+├── protocol.rs      # Connection I/O wrappers, AdaptiveBuf
+├── websocket.rs     # HTTP upgrade handshake, WS frame codec
+└── types.rs         # ServerInfo, ConnectInfo, HeaderMap
+examples/
+├── leaf_server.rs   # CLI example (--port, --hub, --ws-port, --workers)
+└── chat/            # Sample chat app (HTML + README)
+tests/
+└── e2e.rs           # Integration tests (requires nats-server + async-nats)
+bench/
+├── throughput.sh    # Main Rust vs Go leaf benchmark
+├── smoke_test.sh    # Quick functional smoke test
+├── profile.sh       # Perf profiling (pub-only, pubsub, fanout)
+├── profile_run.sh   # Ad-hoc perf: pub-only + pubsub
+├── profile_pubsub.sh   # Ad-hoc perf: pubsub with frame pointers
+├── profile_pubonly.sh   # Ad-hoc perf: pub-only with frame pointers
+├── profile_hubleaf.sh   # Ad-hoc perf: hub→leaf with frame pointers
+├── memory.sh        # Idle-connection memory comparison (Go vs Rust)
+├── clients/         # Go helper binary for memory bench
+└── configs/         # nats-server configs for benchmarks
+benches/
+└── throughput.rs    # Criterion benchmarks
+docs/
+├── architecture.md  # Detailed message flow diagrams
+├── goals.md         # Project goals
+├── backlog.md       # Feature backlog
+├── portability.md   # Portability notes
+└── adr/             # Architecture decision records
+Cargo.toml               # Package manifest
 Cargo.lock
+BENCHMARKS.md            # Full benchmark results log
 Dockerfile  .dockerignore
 .gitignore  .rustfmt.toml
 CLAUDE.md  LICENSE  NOTICE  README.md  deny.toml
@@ -64,30 +58,30 @@ CLAUDE.md  LICENSE  NOTICE  README.md  deny.toml
 
 ```bash
 # Check
-cargo check -p open-wire
-cargo check -p open-wire --example leaf_server
+cargo check
+cargo check --example leaf_server
 
 # Test (unit — no external deps)
-cargo test -p open-wire --lib
+cargo test --lib
 
 # Test (all — requires nats-server in PATH)
-cargo test -p open-wire
+cargo test
 
 # Format (required: nightly toolchain)
 cargo +nightly fmt
 
 # Lint
-cargo clippy -p open-wire --all-targets -- --deny clippy::all
+cargo clippy --all-targets -- --deny clippy::all
 
 # Build release
-cargo build --release -p open-wire --example leaf_server
+cargo build --release --example leaf_server
 
 # Build release with frame pointers (for perf profiling)
-RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --example leaf_server -p open-wire
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --example leaf_server
 
 # Benchmarks
-cd open-wire/bench && ./throughput.sh
-cd open-wire/bench && ./smoke_test.sh
+cd bench && ./throughput.sh
+cd bench && ./smoke_test.sh
 ```
 
 **nats-server**: Integration tests and benchmarks require the `nats-server` binary:
