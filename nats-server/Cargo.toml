@@ -4,24 +4,17 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
-[features]
-default = []
-websockets = ["async-nats/websockets", "dep:tokio-websockets"]
-
 [dependencies]
 async-nats = { path = "../async-nats", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12"] }
 bytes = "1.4.0"
+libc = "0.2"
 memchr = "2.4"
 rand = "0.8"
 serde_json = "1.0.104"
-tokio = { version = "1.36", features = ["macros", "rt", "rt-multi-thread", "net", "sync", "io-util"] }
-tokio-websockets = { version = "0.10", default-features = false, features = ["server", "sha1_smol"], optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
-futures-util = { version = "0.3.28", features = ["std"] }
-tokio = { version = "1.36", features = ["full"] }
+criterion = "0.5"
 
 [[bench]]
 name = "throughput"

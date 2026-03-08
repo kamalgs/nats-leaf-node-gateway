@@ -16,11 +16,11 @@
 //! Provides a lightweight NATS server that accepts local client connections
 //! and optionally forwards traffic to an upstream NATS hub server.
 
-pub(crate) mod client_conn;
 pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
 pub(crate) mod upstream;
+pub(crate) mod worker;
 
 pub use server::{LeafServer, LeafServerConfig};

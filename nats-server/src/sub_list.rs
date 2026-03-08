@@ -6,40 +6,67 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::Notify;
 
 use async_nats::header::HeaderMap;
 
 use crate::nats_proto::MsgBuilder;
 
-/// A shared write buffer + notify pair for zero-channel message delivery.
+/// Create a Linux eventfd for notification.
+pub(crate) fn create_eventfd() -> OwnedFd {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    assert!(fd >= 0, "eventfd creation failed: {}", std::io::Error::last_os_error());
+    unsafe { OwnedFd::from_raw_fd(fd) }
+}
+
+/// A shared write buffer + eventfd pair for zero-channel message delivery.
 ///
 /// Instead of sending `ClientMsg` structs through an mpsc channel (which costs
 /// atomic ops + linked-list push + task wake per message), the upstream reader
-/// formats MSG/HMSG wire bytes directly into this shared buffer. The client
-/// writer task is notified once per batch to flush the buffer to TCP.
+/// formats MSG/HMSG wire bytes directly into this shared buffer. The worker
+/// thread is notified via a shared eventfd to flush the buffer to TCP.
+///
+/// Multiple DirectWriters on the same worker share one eventfd, so fan-out
+/// to N connections on one worker costs only 1 eventfd write.
 #[derive(Clone)]
 pub(crate) struct DirectWriter {
     buf: Arc<Mutex<BytesMut>>,
-    notify: Arc<Notify>,
+    event_fd: Arc<OwnedFd>,
+    has_pending: Arc<AtomicBool>,
     /// Pre-built MsgBuilder for formatting — kept per-writer to avoid allocation.
     msg_builder: Arc<Mutex<MsgBuilder>>,
 }
 
 impl DirectWriter {
-    pub(crate) fn new() -> (Self, WriterHandle) {
-        let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
-        let notify = Arc::new(Notify::new());
-        let writer = Self {
-            buf: Arc::clone(&buf),
-            notify: Arc::clone(&notify),
+    /// Create a DirectWriter with an externally-owned eventfd (shared by worker).
+    pub(crate) fn new(
+        buf: Arc<Mutex<BytesMut>>,
+        has_pending: Arc<AtomicBool>,
+        event_fd: Arc<OwnedFd>,
+    ) -> Self {
+        Self {
+            buf,
+            has_pending,
+            event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-        };
-        let handle = WriterHandle { buf, notify };
-        (writer, handle)
+        }
+    }
+
+    /// Create a standalone DirectWriter with its own eventfd (for tests/benchmarks).
+    pub(crate) fn new_dummy() -> Self {
+        let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let event_fd = Arc::new(create_eventfd());
+        Self {
+            buf,
+            has_pending,
+            event_fd,
+            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+        }
     }
 
     /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
@@ -55,33 +82,26 @@ impl DirectWriter {
         let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
     }
 
-    /// Notify the client writer task that there is data to flush.
+    /// Notify the worker thread that there is data to flush.
+    /// Writes 1 to the eventfd — wakes epoll_wait() on the worker thread.
+    /// Multiple writers sharing one eventfd collapse into a single wake.
     pub(crate) fn notify(&self) {
-        self.notify.notify_one();
-    }
-}
-
-impl std::fmt::Debug for DirectWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectWriter").finish()
-    }
-}
-
-/// Handle held by the client writer task to drain the shared buffer.
-pub(crate) struct WriterHandle {
-    buf: Arc<Mutex<BytesMut>>,
-    notify: Arc<Notify>,
-}
-
-impl WriterHandle {
-    /// Wait until notified that data is available.
-    pub(crate) async fn notified(&self) {
-        self.notify.notified().await;
+        let val: u64 = 1;
+        unsafe {
+            libc::write(
+                self.event_fd.as_raw_fd(),
+                &val as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
     }
 
     /// Drain all buffered data. Returns `None` if buffer was empty.
+    #[cfg(test)]
     pub(crate) fn drain(&self) -> Option<BytesMut> {
         let mut buf = self.buf.lock().unwrap();
         if buf.is_empty() {
@@ -89,6 +109,30 @@ impl WriterHandle {
         } else {
             Some(buf.split())
         }
+    }
+
+    /// Get the raw fd of the eventfd.
+    pub(crate) fn event_raw_fd(&self) -> std::os::fd::RawFd {
+        self.event_fd.as_raw_fd()
+    }
+
+    /// Read the eventfd to reset it after poll() returns POLLIN.
+    #[cfg(test)]
+    pub(crate) fn consume_notify(&self) {
+        let mut val: u64 = 0;
+        unsafe {
+            libc::read(
+                self.event_fd.as_raw_fd(),
+                &mut val as *mut u64 as *mut libc::c_void,
+                8,
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for DirectWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectWriter").finish()
     }
 }
 
@@ -105,6 +149,22 @@ pub struct Subscription {
     /// Direct writer to the client's shared write buffer.
     /// Formats MSG bytes synchronously, bypassing mpsc channel overhead.
     pub(crate) writer: DirectWriter,
+}
+
+impl Subscription {
+    /// Create a subscription without a real DirectWriter (for benchmarks/tests).
+    /// Messages written to this subscription's writer are discarded.
+    pub fn new_dummy(conn_id: u64, sid: u64, subject: String, queue: Option<String>) -> Self {
+        let writer = DirectWriter::new_dummy();
+        Self {
+            conn_id,
+            sid,
+            sid_bytes: Bytes::from(sid.to_string().into_bytes()),
+            subject,
+            queue,
+            writer,
+        }
+    }
 }
 
 /// Returns true if the subject pattern contains wildcard characters (`*` or `>`).
@@ -301,7 +361,7 @@ mod tests {
 
     /// Create a test subscription with a dummy DirectWriter.
     fn test_sub(conn_id: u64, sid: u64, subject: &str) -> Subscription {
-        let (writer, _handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
         Subscription {
             conn_id,
             sid,
@@ -435,22 +495,22 @@ mod tests {
 
     #[test]
     fn test_direct_writer_formats_msg() {
-        let (writer, handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
 
         writer.write_msg(b"test.sub", b"1", None, None, b"hello");
 
-        let data = handle.drain().expect("should have data");
+        let data = writer.drain().expect("should have data");
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "MSG test.sub 1 5\r\nhello\r\n");
     }
 
     #[test]
     fn test_direct_writer_formats_msg_with_reply() {
-        let (writer, handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
 
         writer.write_msg(b"test.sub", b"42", Some(b"reply.to"), None, b"hi");
 
-        let data = handle.drain().unwrap();
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "MSG test.sub 42 reply.to 2\r\nhi\r\n");
     }
@@ -458,7 +518,7 @@ mod tests {
     #[test]
     fn test_direct_writer_formats_hmsg_with_headers() {
         use async_nats::header::{HeaderName, IntoHeaderValue};
-        let (writer, handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -468,7 +528,7 @@ mod tests {
 
         writer.write_msg(b"test.sub", b"1", None, Some(&headers), b"data");
 
-        let data = handle.drain().unwrap();
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert!(s.starts_with("HMSG test.sub 1 "));
         assert!(s.contains("X-Key: val"));
@@ -477,13 +537,13 @@ mod tests {
 
     #[test]
     fn test_direct_writer_batches_multiple_writes() {
-        let (writer, handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
 
         writer.write_msg(b"a", b"1", None, None, b"one");
         writer.write_msg(b"b", b"2", None, None, b"two");
         writer.write_msg(b"c", b"3", None, None, b"three");
 
-        let data = handle.drain().unwrap();
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(
             s,
@@ -493,74 +553,91 @@ mod tests {
 
     #[test]
     fn test_direct_writer_drain_empty() {
-        let (_writer, handle) = DirectWriter::new();
-        assert!(handle.drain().is_none());
+        let writer = DirectWriter::new_dummy();
+        assert!(writer.drain().is_none());
     }
 
     #[test]
     fn test_direct_writer_drain_resets_buffer() {
-        let (writer, handle) = DirectWriter::new();
+        let writer = DirectWriter::new_dummy();
 
         writer.write_msg(b"a", b"1", None, None, b"x");
-        let _ = handle.drain().unwrap();
+        let _ = writer.drain().unwrap();
 
         // Second drain should be empty
-        assert!(handle.drain().is_none());
+        assert!(writer.drain().is_none());
 
         // Write again — should work
         writer.write_msg(b"b", b"2", None, None, b"y");
-        let data = handle.drain().unwrap();
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "MSG b 2 1\r\ny\r\n");
     }
 
     #[test]
     fn test_direct_writer_clone_shares_buffer() {
-        let (writer1, handle) = DirectWriter::new();
+        let writer1 = DirectWriter::new_dummy();
         let writer2 = writer1.clone();
 
         writer1.write_msg(b"a", b"1", None, None, b"x");
         writer2.write_msg(b"b", b"2", None, None, b"y");
 
-        let data = handle.drain().unwrap();
+        let data = writer1.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         // Both messages should be in the same buffer
         assert!(s.contains("MSG a 1 1\r\nx\r\n"));
         assert!(s.contains("MSG b 2 1\r\ny\r\n"));
     }
 
-    #[tokio::test]
-    async fn test_direct_writer_notify_wakes_handle() {
-        let (writer, handle) = DirectWriter::new();
+    #[test]
+    fn test_direct_writer_notify_wakes() {
+        let writer = DirectWriter::new_dummy();
+        let writer2 = writer.clone();
 
-        // Spawn a task that writes and notifies after a short delay
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            writer.write_msg(b"test", b"1", None, None, b"hello");
-            writer.notify();
+        // Spawn a thread that writes and notifies after a short delay
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            writer2.write_msg(b"test", b"1", None, None, b"hello");
+            writer2.notify();
         });
 
-        // This should wake up when notified
-        handle.notified().await;
-        let data = handle.drain().unwrap();
+        // Wait for notification using poll
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
+        assert!(ret > 0, "poll should have returned ready");
+        writer.consume_notify();
+
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "MSG test 1 5\r\nhello\r\n");
     }
 
-    #[tokio::test]
-    async fn test_direct_writer_notify_stores_permit() {
-        let (writer, handle) = DirectWriter::new();
+    #[test]
+    fn test_direct_writer_notify_stores_permit() {
+        let writer = DirectWriter::new_dummy();
 
-        // Notify BEFORE waiting — the permit should be stored
+        // Notify BEFORE waiting — the eventfd counter should be stored
         writer.write_msg(b"test", b"1", None, None, b"early");
         writer.notify();
 
-        // Small delay to ensure we're calling notified() after notify()
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Small delay to ensure eventfd is written
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // Should return immediately because permit was stored
-        handle.notified().await;
-        let data = handle.drain().unwrap();
+        // poll should return immediately because eventfd is ready
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 0) };
+        assert!(ret > 0, "poll should return immediately for stored notify");
+        writer.consume_notify();
+
+        let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "MSG test 1 5\r\nearly\r\n");
     }
@@ -568,44 +645,51 @@ mod tests {
     /// Simulate the producer/consumer pattern used in the server:
     /// a fast producer writes many messages, consumer must receive all of them.
     /// Uses the correct drain-before-wait pattern that avoids the lost-notify race.
-    #[tokio::test]
-    async fn test_direct_writer_fast_producer_slow_consumer() {
-        let (writer, handle) = DirectWriter::new();
+    #[test]
+    fn test_direct_writer_fast_producer_slow_consumer() {
+        let writer = DirectWriter::new_dummy();
+        let producer_writer = writer.clone();
         let total_msgs = 10_000;
 
         // Producer: write all messages rapidly (all at once, simulating burst)
-        let producer = tokio::spawn(async move {
+        let producer = std::thread::spawn(move || {
             for i in 0..total_msgs {
                 let payload = format!("msg{i}");
-                writer.write_msg(b"test", b"1", None, None, payload.as_bytes());
-                writer.notify();
+                producer_writer.write_msg(b"test", b"1", None, None, payload.as_bytes());
+                producer_writer.notify();
             }
         });
 
-        // Consumer: drain-before-wait pattern (matches client_conn message_loop)
+        // Consumer: drain-before-wait pattern (matches worker event loop)
         let mut total_msgs_seen = 0usize;
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
         loop {
             // Always check buffer first before blocking
-            while let Some(data) = handle.drain() {
+            while let Some(data) = writer.drain() {
                 let s = std::str::from_utf8(&data).unwrap();
                 total_msgs_seen += s.matches("MSG test 1").count();
             }
             if total_msgs_seen >= total_msgs {
                 break;
             }
-            handle.notified().await;
+            unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
+            writer.consume_notify();
         }
 
-        producer.await.unwrap();
+        producer.join().unwrap();
         assert_eq!(total_msgs_seen, total_msgs);
     }
 
     /// Test the race where producer finishes before consumer starts draining.
     /// This catches the lost-notify bug: all notify() calls collapse into one
-    /// permit, consumer must drain without relying on future notifications.
-    #[tokio::test]
-    async fn test_direct_writer_producer_finishes_before_consumer() {
-        let (writer, handle) = DirectWriter::new();
+    /// eventfd counter, consumer must drain without relying on future notifications.
+    #[test]
+    fn test_direct_writer_producer_finishes_before_consumer() {
+        let writer = DirectWriter::new_dummy();
         let total_msgs = 1_000;
 
         // Producer writes everything synchronously (no yield points)
@@ -618,8 +702,13 @@ mod tests {
         // Consumer: must get all messages even though notify was called once
         // The drain-before-wait pattern handles this.
         let mut total_msgs_seen = 0usize;
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
         loop {
-            while let Some(data) = handle.drain() {
+            while let Some(data) = writer.drain() {
                 let s = std::str::from_utf8(&data).unwrap();
                 total_msgs_seen += s.matches("MSG x 1").count();
             }
@@ -627,13 +716,13 @@ mod tests {
                 break;
             }
             // Use timeout to detect hang (would fail without drain-before-wait)
-            tokio::select! {
-                _ = handle.notified() => {}
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                    panic!(
-                        "consumer hung! only received {total_msgs_seen}/{total_msgs} messages"
-                    );
-                }
+            let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 1000) };
+            if ret > 0 {
+                writer.consume_notify();
+            } else {
+                panic!(
+                    "consumer hung! only received {total_msgs_seen}/{total_msgs} messages"
+                );
             }
         }
         assert_eq!(total_msgs_seen, total_msgs);

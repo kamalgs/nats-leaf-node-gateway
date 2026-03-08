@@ -6,21 +6,20 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use std::collections::HashMap;
+use std::net::{Shutdown, TcpStream};
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use async_nats::header::HeaderMap;
 
-use crate::sub_list::DirectWriter;
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;
+use crate::sub_list::DirectWriter;
 
-/// Commands sent from the Upstream handle to the background writer task.
+/// Commands sent from the Upstream handle to the background writer thread.
 pub(crate) enum UpstreamCmd {
     Subscribe(String),
     Unsubscribe(String),
@@ -32,35 +31,41 @@ pub(crate) enum UpstreamCmd {
     },
     #[allow(dead_code)]
     Pong,
+    /// Signals the writer thread to shut down.
+    Shutdown,
 }
 
 /// Manages connection to an upstream NATS hub server using the leaf node protocol.
 /// Sends LS+/LS- for subscription interest and LMSG for messages.
 pub(crate) struct Upstream {
-    cmd_tx: mpsc::UnboundedSender<UpstreamCmd>,
+    cmd_tx: mpsc::Sender<UpstreamCmd>,
     /// subject → refcount
     interests: HashMap<String, u32>,
-    task: JoinHandle<()>,
+    /// Kept for shutdown: closing this breaks the reader thread's blocking read.
+    stream_shutdown: TcpStream,
 }
 
 impl Upstream {
     /// Connect to the hub using the leaf node protocol.
     ///
-    /// Performs the INFO/CONNECT/PING/PONG handshake, then spawns a background
-    /// task that reads from the hub and writes commands batched together.
-    pub(crate) async fn connect(
+    /// Performs the INFO/CONNECT/PING/PONG handshake, then spawns background
+    /// threads that read from the hub and write commands batched together.
+    pub(crate) fn connect(
         hub_url: &str,
         state: Arc<ServerState>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let addr = parse_hub_addr(hub_url)?;
-        let tcp = TcpStream::connect(&addr).await?;
+        let tcp = TcpStream::connect(&addr)?;
         tcp.set_nodelay(true)?;
 
-        let mut leaf = LeafConn::new(Box::new(tcp), state.buf_config);
+        // Keep a clone for shutdown
+        let stream_shutdown = tcp.try_clone()?;
+
+        let mut leaf = LeafConn::new(tcp, state.buf_config);
 
         // --- Handshake ---
         // 1. Read INFO from hub
-        match leaf.read_leaf_op().await? {
+        match leaf.read_leaf_op()? {
             Some(LeafOp::Info(_info)) => {
                 debug!("received INFO from hub");
             }
@@ -72,21 +77,21 @@ impl Upstream {
             }
         }
 
-        // 2. Send CONNECT (leaf-style, no `lang` field) + PING
-        leaf.send_leaf_connect("rust-leaf", true).await?;
-        leaf.send_ping().await?;
-        leaf.flush().await?;
+        // 2. Send CONNECT (leaf-style) + PING
+        leaf.send_leaf_connect("rust-leaf", true)?;
+        leaf.send_ping()?;
+        leaf.flush()?;
 
         // 3. Read until PONG (hub may send LS+ before PONG)
         loop {
-            match leaf.read_leaf_op().await? {
+            match leaf.read_leaf_op()? {
                 Some(LeafOp::Pong) => {
                     debug!("handshake complete");
                     break;
                 }
                 Some(LeafOp::Ping) => {
-                    leaf.send_pong().await?;
-                    leaf.flush().await?;
+                    leaf.send_pong()?;
+                    leaf.flush()?;
                 }
                 Some(LeafOp::LeafSub { .. }) | Some(LeafOp::LeafUnsub { .. }) => {
                     // Hub sending its interests; ignored for now
@@ -101,9 +106,7 @@ impl Upstream {
                     // Hub may re-send INFO after CONNECT
                 }
                 Some(other) => {
-                    return Err(
-                        format!("unexpected op during handshake: {other:?}").into()
-                    );
+                    return Err(format!("unexpected op during handshake: {other:?}").into());
                 }
                 None => {
                     return Err("hub closed connection during handshake".into());
@@ -115,48 +118,51 @@ impl Upstream {
         {
             let subjects: Vec<String> = {
                 let subs = state.subs.read().unwrap();
-                subs.unique_subjects().into_iter().map(|s| s.to_string()).collect()
+                subs.unique_subjects()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect()
             };
             for subject in &subjects {
-                leaf.send_leaf_sub(subject).await?;
+                leaf.send_leaf_sub(subject)?;
             }
-            leaf.flush().await?;
+            leaf.flush()?;
         }
 
-        // 5. Split into independent reader/writer and spawn two tasks
-        let (leaf_reader, leaf_writer) = leaf.split();
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // 5. Split into independent reader/writer and spawn two threads
+        let (leaf_reader, leaf_writer) = leaf.split()?;
+        let (cmd_tx, cmd_rx) = mpsc::channel();
 
-        // The reader sends Pong commands through the cmd channel
+        // The reader sends Pong/Shutdown commands through the cmd channel
         let reader_cmd_tx = cmd_tx.clone();
         let reader_state = Arc::clone(&state);
-        let reader_task = tokio::spawn(run_leaf_reader(leaf_reader, reader_cmd_tx, reader_state));
-        let writer_task = tokio::spawn(run_leaf_writer(leaf_writer, cmd_rx));
+        std::thread::Builder::new()
+            .name("leaf-reader".into())
+            .spawn(move || {
+                run_leaf_reader(leaf_reader, reader_cmd_tx, reader_state);
+            })
+            .expect("failed to spawn leaf reader thread");
 
-        let task = tokio::spawn(async move {
-            tokio::select! {
-                _ = reader_task => {
-                    debug!("leaf reader task finished");
-                }
-                _ = writer_task => {
-                    debug!("leaf writer task finished");
-                }
-            }
-        });
+        std::thread::Builder::new()
+            .name("leaf-writer".into())
+            .spawn(move || {
+                run_leaf_writer(leaf_writer, cmd_rx);
+            })
+            .expect("failed to spawn leaf writer thread");
 
         Ok(Self {
             cmd_tx,
             interests: HashMap::new(),
-            task,
+            stream_shutdown,
         })
     }
 
     /// Add a subscription interest for the given subject.
     /// If this is the first interest, sends LS+ to the hub.
-    pub(crate) async fn add_interest(
+    pub(crate) fn add_interest(
         &mut self,
         subject: String,
-    ) -> Result<(), async_nats::Error> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let count = self.interests.entry(subject.clone()).or_insert(0);
         *count += 1;
         if *count == 1 {
@@ -165,8 +171,8 @@ impl Upstream {
                 .map_err(|_| {
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
-                        "upstream task gone",
-                    )) as async_nats::Error
+                        "upstream thread gone",
+                    )) as Box<dyn std::error::Error + Send + Sync>
                 })?;
         }
         Ok(())
@@ -186,53 +192,32 @@ impl Upstream {
     }
 
     /// Get a clone of the command sender for lock-free publish forwarding.
-    pub(crate) fn sender(&self) -> mpsc::UnboundedSender<UpstreamCmd> {
+    pub(crate) fn sender(&self) -> mpsc::Sender<UpstreamCmd> {
         self.cmd_tx.clone()
-    }
-
-    /// Forward a publish from a local client to the hub as LMSG.
-    #[allow(dead_code)]
-    pub(crate) async fn publish(
-        &self,
-        subject: Bytes,
-        reply: Option<Bytes>,
-        headers: Option<HeaderMap>,
-        payload: Bytes,
-    ) -> Result<(), async_nats::Error> {
-        self.cmd_tx
-            .send(UpstreamCmd::Publish {
-                subject,
-                reply,
-                headers,
-                payload,
-            })
-            .map_err(|_| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "upstream task gone",
-                )) as async_nats::Error
-            })?;
-        Ok(())
     }
 }
 
 impl Drop for Upstream {
     fn drop(&mut self) {
-        self.task.abort();
+        // Shut down the TCP stream — breaks the reader thread's blocking read.
+        self.stream_shutdown.shutdown(Shutdown::Both).ok();
+        // Send shutdown to the writer thread (if channel still open).
+        let _ = self.cmd_tx.send(UpstreamCmd::Shutdown);
+        // Threads are detached — they'll exit on their own.
     }
 }
 
-/// Background reader task: reads ops from the hub and dispatches them.
+/// Background reader: reads ops from the hub and dispatches them.
 /// Runs independently from the writer, so hub PINGs are always answered
 /// promptly even during write floods.
-async fn run_leaf_reader(
+fn run_leaf_reader(
     mut reader: LeafReader,
-    cmd_tx: mpsc::UnboundedSender<UpstreamCmd>,
+    cmd_tx: mpsc::Sender<UpstreamCmd>,
     state: Arc<ServerState>,
 ) {
     let mut dirty_writers: Vec<DirectWriter> = Vec::new();
     loop {
-        match reader.read_leaf_op().await {
+        match reader.read_leaf_op() {
             Ok(Some(op)) => {
                 if let Err(e) = handle_hub_op(op, &cmd_tx, &state, &mut dirty_writers) {
                     error!(error = %e, "error handling hub op");
@@ -244,11 +229,13 @@ async fn run_leaf_reader(
                     Ok(op) => op,
                     Err(e) => {
                         error!(error = %e, "upstream parse error");
+                        let _ = cmd_tx.send(UpstreamCmd::Shutdown);
                         return;
                     }
                 } {
                     if let Err(e) = handle_hub_op(op, &cmd_tx, &state, &mut dirty_writers) {
                         error!(error = %e, "error handling hub op");
+                        let _ = cmd_tx.send(UpstreamCmd::Shutdown);
                         return;
                     }
                 }
@@ -267,27 +254,34 @@ async fn run_leaf_reader(
             }
         }
     }
+    // Signal writer to shut down
+    let _ = cmd_tx.send(UpstreamCmd::Shutdown);
 }
 
-/// Background writer task: drains the command channel and writes to the hub.
+/// Background writer: drains the command channel and writes to the hub.
 /// Batches multiple commands before flushing for efficiency.
-async fn run_leaf_writer(
-    mut writer: LeafWriter,
-    mut cmd_rx: mpsc::UnboundedReceiver<UpstreamCmd>,
-) {
-    while let Some(cmd) = cmd_rx.recv().await {
-        if let Err(e) = process_cmd(&mut writer, &cmd).await {
+fn run_leaf_writer(mut writer: LeafWriter, cmd_rx: mpsc::Receiver<UpstreamCmd>) {
+    while let Ok(cmd) = cmd_rx.recv() {
+        if matches!(cmd, UpstreamCmd::Shutdown) {
+            break;
+        }
+        if let Err(e) = process_cmd(&mut writer, &cmd) {
             error!(error = %e, "upstream write error");
             break;
         }
         // Batch: drain any remaining commands without blocking
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if let Err(e) = process_cmd(&mut writer, &cmd).await {
+            if matches!(cmd, UpstreamCmd::Shutdown) {
+                debug!("upstream writer received shutdown");
+                let _ = writer.flush();
+                return;
+            }
+            if let Err(e) = process_cmd(&mut writer, &cmd) {
                 error!(error = %e, "upstream write error");
                 return;
             }
         }
-        if let Err(e) = writer.flush().await {
+        if let Err(e) = writer.flush() {
             error!(error = %e, "upstream flush error");
             break;
         }
@@ -296,13 +290,13 @@ async fn run_leaf_writer(
 }
 
 /// Process a single upstream command (write to hub, no flush).
-async fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Result<()> {
+fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Result<()> {
     match cmd {
         UpstreamCmd::Subscribe(subject) => {
-            writer.send_leaf_sub(subject.as_bytes()).await?;
+            writer.send_leaf_sub(subject.as_bytes())?;
         }
         UpstreamCmd::Unsubscribe(subject) => {
-            writer.send_leaf_unsub(subject.as_bytes()).await?;
+            writer.send_leaf_unsub(subject.as_bytes())?;
         }
         UpstreamCmd::Publish {
             subject,
@@ -310,23 +304,24 @@ async fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Res
             headers,
             payload,
         } => {
-            writer
-                .send_leaf_msg(subject, reply.as_deref(), headers.as_ref(), payload)
-                .await?;
+            writer.send_leaf_msg(subject, reply.as_deref(), headers.as_ref(), payload)?;
         }
         UpstreamCmd::Pong => {
-            writer.send_pong().await?;
+            writer.send_pong()?;
+        }
+        UpstreamCmd::Shutdown => {
+            // Handled by caller
         }
     }
     Ok(())
 }
 
 /// Handle an operation received from the hub (reader side).
-/// PING responses are sent via the command channel to the writer task.
+/// PING responses are sent via the command channel to the writer thread.
 /// Dirty writers (that had data written) are collected for batch notification.
 fn handle_hub_op(
     op: LeafOp,
-    cmd_tx: &mpsc::UnboundedSender<UpstreamCmd>,
+    cmd_tx: &mpsc::Sender<UpstreamCmd>,
     state: &ServerState,
     dirty_writers: &mut Vec<DirectWriter>,
 ) -> std::io::Result<()> {
@@ -352,7 +347,7 @@ fn handle_hub_op(
             });
         }
         LeafOp::Ping => {
-            // Send PONG via the writer task
+            // Send PONG via the writer thread
             let _ = cmd_tx.send(UpstreamCmd::Pong);
         }
         LeafOp::Pong | LeafOp::Ok => {

@@ -3,7 +3,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-use nats_server::sub_list::{subject_matches, SubList, Subscription};
+use nats_server::sub_list::{subject_matches, SubList};
 
 fn bench_subject_matches(c: &mut Criterion) {
     let mut group = c.benchmark_group("subject_matches");
@@ -28,27 +28,27 @@ fn bench_subject_matches(c: &mut Criterion) {
 }
 
 fn bench_sublist_match(c: &mut Criterion) {
+    use nats_server::sub_list::Subscription;
+
     let mut group = c.benchmark_group("sublist_match");
 
     for count in [10, 100, 1000] {
         let mut sl = SubList::new();
         for i in 0..count {
-            sl.insert(Subscription {
-                conn_id: i,
-                sid: 1,
-                sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
-                subject: format!("test.subject.{i}"),
-                queue: None,
-            });
+            sl.insert(Subscription::new_dummy(
+                i,
+                1,
+                format!("test.subject.{i}"),
+                None,
+            ));
         }
         // Add a wildcard that matches
-        sl.insert(Subscription {
-            conn_id: 9999,
-            sid: 1,
-            sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
-            subject: "test.subject.*".to_string(),
-            queue: None,
-        });
+        sl.insert(Subscription::new_dummy(
+            9999,
+            1,
+            "test.subject.*".to_string(),
+            None,
+        ));
 
         group.throughput(Throughput::Elements(1));
         group.bench_function(format!("{count}_subs"), |b| {
@@ -60,35 +60,24 @@ fn bench_sublist_match(c: &mut Criterion) {
 }
 
 fn bench_publish_local(c: &mut Criterion) {
-    use std::sync::Arc;
-    use tokio::runtime::Runtime;
-    use tokio::sync::RwLock;
-
-    let rt = Runtime::new().unwrap();
+    use nats_server::sub_list::Subscription;
+    use std::sync::{Arc, RwLock};
 
     let mut group = c.benchmark_group("publish_local");
     group.throughput(Throughput::Elements(1));
 
-    // Simulate the publish hot path: lock subs, match, lock conns, send
+    // Simulate the publish hot path: lock subs, match
     let subs = Arc::new(RwLock::new({
         let mut sl = SubList::new();
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 1,
-            sid_bytes: nats_server::nats_proto::sid_to_bytes(1),
-            subject: "test.>".to_string(),
-            queue: None,
-        });
+        sl.insert(Subscription::new_dummy(1, 1, "test.>".to_string(), None));
         sl
     }));
 
     group.bench_function("lock_and_match", |b| {
-        b.to_async(&rt).iter(|| {
-            let subs = subs.clone();
-            async move {
-                let subs = subs.read().await;
-                let _matches = subs.match_subject("test.subject.foo");
-            }
+        let subs = subs.clone();
+        b.iter(|| {
+            let subs = subs.read().unwrap();
+            let _matches = subs.match_subject("test.subject.foo");
         });
     });
 

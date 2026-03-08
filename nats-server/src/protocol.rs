@@ -5,12 +5,13 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::io::{self, BufWriter, Read, Write};
+use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::RawFd;
 
-use bytes::BytesMut;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
+use bytes::{BufMut, BytesMut};
 
-use async_nats::connection::AsyncReadWrite;
 use async_nats::header::HeaderMap;
 use async_nats::ServerInfo;
 
@@ -54,7 +55,7 @@ pub(crate) struct AdaptiveBuf {
 }
 
 impl AdaptiveBuf {
-    fn new(max_cap: usize) -> Self {
+    pub(crate) fn new(max_cap: usize) -> Self {
         let start = DEFAULT_START_BUF.min(max_cap);
         Self {
             buf: BytesMut::with_capacity(start),
@@ -66,7 +67,7 @@ impl AdaptiveBuf {
 
     /// Called after each successful socket read with the number of bytes read.
     /// Adjusts the target capacity and reallocates if appropriate.
-    fn after_read(&mut self, n: usize) {
+    pub(crate) fn after_read(&mut self, n: usize) {
         if n >= self.target_cap && self.target_cap < self.max_cap {
             // Buffer was fully utilized — grow
             self.target_cap = (self.target_cap * 2).min(self.max_cap);
@@ -93,10 +94,43 @@ impl AdaptiveBuf {
 
     /// Try to shrink the buffer if it is empty and oversized.
     /// Call this after parsing has consumed all data.
-    fn try_shrink(&mut self) {
+    pub(crate) fn try_shrink(&mut self) {
         if self.buf.is_empty() && self.buf.capacity() > self.target_cap * 2 {
             self.buf = BytesMut::with_capacity(self.target_cap);
         }
+    }
+
+    /// Read from a raw fd into the buffer's spare capacity (non-blocking).
+    /// Uses libc::read directly for non-blocking socket I/O.
+    pub(crate) fn read_from_fd(&mut self, fd: RawFd) -> io::Result<usize> {
+        if self.buf.remaining_mut() == 0 {
+            self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
+        }
+        let chunk = self.buf.chunk_mut();
+        let n = unsafe {
+            libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        unsafe { self.buf.advance_mut(n) };
+        Ok(n)
+    }
+
+    /// Read from a reader into the buffer's spare capacity.
+    /// Ensures spare capacity exists before reading.
+    fn read_from(&mut self, reader: &mut impl Read) -> io::Result<usize> {
+        if self.buf.remaining_mut() == 0 {
+            self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
+        }
+        let chunk = self.buf.chunk_mut();
+        let n = unsafe {
+            let raw = std::slice::from_raw_parts_mut(chunk.as_mut_ptr(), chunk.len());
+            reader.read(raw)?
+        };
+        unsafe { self.buf.advance_mut(n) };
+        Ok(n)
     }
 }
 
@@ -114,38 +148,47 @@ impl DerefMut for AdaptiveBuf {
 }
 
 /// Server-side connection wrapper.
-/// Uses split read/write halves so the writer is wrapped in a BufWriter.
+/// Uses cloned TcpStream halves so the writer is wrapped in a BufWriter.
 /// This ensures `write_msg` calls go into a memory buffer and only hit the
 /// socket on `flush()`, dramatically reducing syscalls when batching.
+#[allow(dead_code)]
 pub(crate) struct ServerConn {
-    reader: ReadHalf<Box<dyn AsyncReadWrite>>,
-    writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
+    reader: TcpStream,
+    writer: BufWriter<TcpStream>,
     read_buf: AdaptiveBuf,
     msg_builder: MsgBuilder,
 }
 
+#[allow(dead_code)]
 impl ServerConn {
-    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>, buf_config: BufConfig) -> Self {
-        let (reader, writer) = io::split(stream);
-        Self {
-            reader,
-            writer: BufWriter::with_capacity(buf_config.write_buf, writer),
+    pub(crate) fn from_tcp(stream: TcpStream, buf_config: BufConfig) -> io::Result<Self> {
+        let writer_stream = stream.try_clone()?;
+        Ok(Self {
+            reader: stream,
+            writer: BufWriter::with_capacity(buf_config.write_buf, writer_stream),
             read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
             msg_builder: MsgBuilder::new(),
-        }
+        })
+    }
+
+    /// Get the raw fd of the reader socket for use with poll().
+    #[cfg(unix)]
+    pub(crate) fn reader_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.reader.as_raw_fd()
     }
 
     /// Send INFO to connected client.
-    pub(crate) async fn send_info(&mut self, info: &ServerInfo) -> io::Result<()> {
+    pub(crate) fn send_info(&mut self, info: &ServerInfo) -> io::Result<()> {
         let json = serde_json::to_string(info)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let line = format!("INFO {json}\r\n");
-        self.write_flush(line.as_bytes()).await
+        self.write_flush(line.as_bytes())
     }
 
     /// Send MSG to connected client (write + flush).
     #[cfg(test)]
-    pub(crate) async fn send_msg(
+    pub(crate) fn send_msg(
         &mut self,
         subject: &str,
         sid: u64,
@@ -153,15 +196,14 @@ impl ServerConn {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) -> io::Result<()> {
-        self.write_msg(subject.as_bytes(), sid, reply.map(|r| r.as_bytes()), headers, payload)
-            .await?;
-        self.flush().await
+        self.write_msg(subject.as_bytes(), sid, reply.map(|r| r.as_bytes()), headers, payload)?;
+        self.flush()
     }
 
     /// Write a MSG to the client without flushing.
     /// Uses direct byte assembly — no `write!()` formatting.
     #[allow(dead_code)]
-    pub(crate) async fn write_msg(
+    pub(crate) fn write_msg(
         &mut self,
         subject: &[u8],
         sid: u64,
@@ -173,44 +215,44 @@ impl ServerConn {
         let data = self
             .msg_builder
             .build_msg(subject, &sid_bytes, reply, headers, payload);
-        self.writer.write_all(data).await
+        self.writer.write_all(data)
     }
 
     /// Write pre-formatted raw bytes to the client (no flush).
-    pub(crate) async fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data).await
+    pub(crate) fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
+        self.writer.write_all(data)
     }
 
     /// Flush buffered writes to the wire.
-    pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn send_ping(&mut self) -> io::Result<()> {
-        self.write_flush(b"PING\r\n").await
+    pub(crate) fn send_ping(&mut self) -> io::Result<()> {
+        self.write_flush(b"PING\r\n")
     }
 
-    pub(crate) async fn send_pong(&mut self) -> io::Result<()> {
-        self.write_flush(b"PONG\r\n").await
+    pub(crate) fn send_pong(&mut self) -> io::Result<()> {
+        self.write_flush(b"PONG\r\n")
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn send_ok(&mut self) -> io::Result<()> {
-        self.write_flush(b"+OK\r\n").await
+    pub(crate) fn send_ok(&mut self) -> io::Result<()> {
+        self.write_flush(b"+OK\r\n")
     }
 
-    pub(crate) async fn send_err(&mut self, msg: &str) -> io::Result<()> {
+    pub(crate) fn send_err(&mut self, msg: &str) -> io::Result<()> {
         let line = format!("-ERR '{msg}'\r\n");
-        self.write_flush(line.as_bytes()).await
+        self.write_flush(line.as_bytes())
     }
 
     /// Read the next client operation from the wire.
-    pub(crate) async fn read_client_op(&mut self) -> io::Result<Option<ClientOp>> {
-        self.read_client_op_inner(false).await
+    pub(crate) fn read_client_op(&mut self) -> io::Result<Option<ClientOp>> {
+        self.read_client_op_inner(false)
     }
 
-    pub(crate) async fn read_client_op_inner(
+    pub(crate) fn read_client_op_inner(
         &mut self,
         skip_pub: bool,
     ) -> io::Result<Option<ClientOp>> {
@@ -223,7 +265,33 @@ impl ServerConn {
             if let Some(op) = parsed {
                 return Ok(Some(op));
             }
-            let n = self.reader.read_buf(&mut *self.read_buf).await?;
+            let n = self.read_buf.read_from(&mut self.reader)?;
+            if n == 0 {
+                if self.read_buf.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::ErrorKind::ConnectionReset.into());
+            }
+            self.read_buf.after_read(n);
+        }
+    }
+
+    /// Read the next non-PUB/HPUB client operation, skipping all publishes
+    /// in a tight loop. Used when there are no subscribers and no upstream,
+    /// avoiding poll/Notify overhead entirely.
+    pub(crate) fn read_next_non_pub(&mut self) -> io::Result<Option<ClientOp>> {
+        loop {
+            // Skip all buffered PUBs, return on first non-PUB op
+            loop {
+                match nats_proto::try_skip_or_parse_client_op(&mut self.read_buf)? {
+                    Some(ClientOp::Pong) => continue, // skipped PUB/HPUB
+                    Some(op) => return Ok(Some(op)),
+                    None => break, // need more data
+                }
+            }
+            self.read_buf.try_shrink();
+            // Read more data from socket
+            let n = self.read_buf.read_from(&mut self.reader)?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
@@ -248,9 +316,9 @@ impl ServerConn {
         result
     }
 
-    async fn write_flush(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data).await?;
-        self.writer.flush().await?;
+    fn write_flush(&mut self, data: &[u8]) -> io::Result<()> {
+        self.writer.write_all(data)?;
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -260,13 +328,13 @@ impl ServerConn {
 /// Used during the handshake phase; call `split()` to get independent
 /// reader/writer halves for the I/O loop.
 pub(crate) struct LeafConn {
-    stream: Box<dyn AsyncReadWrite>,
+    stream: TcpStream,
     read_buf: AdaptiveBuf,
     buf_config: BufConfig,
 }
 
 impl LeafConn {
-    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>, buf_config: BufConfig) -> Self {
+    pub(crate) fn new(stream: TcpStream, buf_config: BufConfig) -> Self {
         Self {
             stream,
             read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
@@ -276,28 +344,28 @@ impl LeafConn {
 
     /// Split into independent reader and writer halves.
     /// The writer is wrapped in a BufWriter for batched I/O.
-    pub(crate) fn split(self) -> (LeafReader, LeafWriter) {
-        let (reader, writer) = io::split(self.stream);
-        (
+    pub(crate) fn split(self) -> io::Result<(LeafReader, LeafWriter)> {
+        let writer_stream = self.stream.try_clone()?;
+        Ok((
             LeafReader {
-                reader,
+                reader: self.stream,
                 read_buf: self.read_buf,
             },
             LeafWriter {
-                writer: BufWriter::with_capacity(self.buf_config.write_buf, writer),
+                writer: BufWriter::with_capacity(self.buf_config.write_buf, writer_stream),
                 msg_builder: MsgBuilder::new(),
             },
-        )
+        ))
     }
 
     /// Read the next leaf operation from the hub.
-    pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
+    pub(crate) fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
             if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
                 self.read_buf.try_shrink();
                 return Ok(Some(op));
             }
-            let n = self.stream.read_buf(&mut *self.read_buf).await?;
+            let n = self.read_buf.read_from(&mut self.stream)?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
@@ -309,7 +377,7 @@ impl LeafConn {
     }
 
     /// Send a leaf node CONNECT to the hub.
-    pub(crate) async fn send_leaf_connect(
+    pub(crate) fn send_leaf_connect(
         &mut self,
         name: &str,
         headers: bool,
@@ -324,44 +392,44 @@ impl LeafConn {
             "protocol": 1,
         });
         let line = format!("CONNECT {json}\r\n");
-        self.stream.write_all(line.as_bytes()).await
+        self.stream.write_all(line.as_bytes())
     }
 
-    pub(crate) async fn send_ping(&mut self) -> io::Result<()> {
-        self.stream.write_all(b"PING\r\n").await
+    pub(crate) fn send_ping(&mut self) -> io::Result<()> {
+        self.stream.write_all(b"PING\r\n")
     }
 
-    pub(crate) async fn send_pong(&mut self) -> io::Result<()> {
-        self.stream.write_all(b"PONG\r\n").await
+    pub(crate) fn send_pong(&mut self) -> io::Result<()> {
+        self.stream.write_all(b"PONG\r\n")
     }
 
     /// Send LS+ subscription interest to the hub.
-    pub(crate) async fn send_leaf_sub(&mut self, subject: &str) -> io::Result<()> {
+    pub(crate) fn send_leaf_sub(&mut self, subject: &str) -> io::Result<()> {
         let line = format!("LS+ {subject}\r\n");
-        self.stream.write_all(line.as_bytes()).await
+        self.stream.write_all(line.as_bytes())
     }
 
     /// Flush buffered writes to the wire.
-    pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush().await
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
 /// Read half of a leaf connection.
 pub(crate) struct LeafReader {
-    reader: ReadHalf<Box<dyn AsyncReadWrite>>,
+    reader: TcpStream,
     read_buf: AdaptiveBuf,
 }
 
 impl LeafReader {
     /// Read the next leaf operation from the hub.
     /// Performs I/O if the buffer doesn't contain a complete op.
-    pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
+    pub(crate) fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
             if let Some(op) = self.try_parse_leaf_op()? {
                 return Ok(Some(op));
             }
-            let n = self.reader.read_buf(&mut *self.read_buf).await?;
+            let n = self.read_buf.read_from(&mut self.reader)?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
@@ -382,32 +450,32 @@ impl LeafReader {
 
 /// Write half of a leaf connection, wrapped in BufWriter.
 pub(crate) struct LeafWriter {
-    writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
+    writer: BufWriter<TcpStream>,
     msg_builder: MsgBuilder,
 }
 
 impl LeafWriter {
     /// Send LS+ subscription interest to the hub.
-    pub(crate) async fn send_leaf_sub(&mut self, subject: &[u8]) -> io::Result<()> {
+    pub(crate) fn send_leaf_sub(&mut self, subject: &[u8]) -> io::Result<()> {
         let data = self.msg_builder.build_leaf_sub(subject);
-        self.writer.write_all(data).await
+        self.writer.write_all(data)
     }
 
     /// Send LS- unsubscribe to the hub.
-    pub(crate) async fn send_leaf_unsub(&mut self, subject: &[u8]) -> io::Result<()> {
+    pub(crate) fn send_leaf_unsub(&mut self, subject: &[u8]) -> io::Result<()> {
         let data = self.msg_builder.build_leaf_unsub(subject);
-        self.writer.write_all(data).await
+        self.writer.write_all(data)
     }
 
     /// Send PONG to the hub.
-    pub(crate) async fn send_pong(&mut self) -> io::Result<()> {
-        self.writer.write_all(b"PONG\r\n").await
+    pub(crate) fn send_pong(&mut self) -> io::Result<()> {
+        self.writer.write_all(b"PONG\r\n")
     }
 
     /// Send LMSG to the hub.
     /// Writes header and payload separately to avoid copying the payload
     /// into the MsgBuilder scratch buffer. The BufWriter coalesces them.
-    pub(crate) async fn send_leaf_msg(
+    pub(crate) fn send_leaf_msg(
         &mut self,
         subject: &[u8],
         reply: Option<&[u8]>,
@@ -417,32 +485,40 @@ impl LeafWriter {
         let hdr = self
             .msg_builder
             .build_lmsg_header(subject, reply, headers, payload.len());
-        self.writer.write_all(hdr).await?;
-        self.writer.write_all(payload).await?;
-        self.writer.write_all(b"\r\n").await
+        self.writer.write_all(hdr)?;
+        self.writer.write_all(payload)?;
+        self.writer.write_all(b"\r\n")
     }
 
     /// Flush buffered writes to the wire.
-    pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
-    use tokio::io::duplex;
+    use std::io::{Read, Write};
 
-    async fn make_pair() -> (ServerConn, tokio::io::DuplexStream) {
-        let (client_side, server_side) = duplex(8192);
-        let conn = ServerConn::new(Box::new(server_side), BufConfig::default());
-        (conn, client_side)
+    /// Create a TCP loopback pair for testing.
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
     }
 
-    #[tokio::test]
-    async fn test_send_info() {
-        let (mut conn, mut client) = make_pair().await;
+    fn make_pair() -> (ServerConn, TcpStream) {
+        let (server, client) = tcp_pair();
+        let conn = ServerConn::from_tcp(server, BufConfig::default()).unwrap();
+        (conn, client)
+    }
+
+    #[test]
+    fn test_send_info() {
+        let (mut conn, mut client) = make_pair();
         let info = ServerInfo {
             server_id: "test".to_string(),
             max_payload: 1024 * 1024,
@@ -450,41 +526,38 @@ mod tests {
             headers: true,
             ..Default::default()
         };
-        conn.send_info(&info).await.unwrap();
+        conn.send_info(&info).unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        client.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(s.starts_with("INFO "));
         assert!(s.ends_with("\r\n"));
         assert!(s.contains("\"server_id\":\"test\""));
     }
 
-    #[tokio::test]
-    async fn test_parse_ping_pong() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
-        client.write_all(b"PING\r\nPONG\r\n").await.unwrap();
-        client.flush().await.unwrap();
+    #[test]
+    fn test_parse_ping_pong() {
+        let (mut conn, mut client) = make_pair();
+        client.write_all(b"PING\r\nPONG\r\n").unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         assert!(matches!(op, ClientOp::Ping));
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         assert!(matches!(op, ClientOp::Pong));
     }
 
-    #[tokio::test]
-    async fn test_parse_sub() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
-        client.write_all(b"SUB test.subject 1\r\n").await.unwrap();
+    #[test]
+    fn test_parse_sub() {
+        let (mut conn, mut client) = make_pair();
+        client.write_all(b"SUB test.subject 1\r\n").unwrap();
         client
             .write_all(b"SUB test.queue myqueue 2\r\n")
-            .await
             .unwrap();
-        client.flush().await.unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         match op {
             ClientOp::Subscribe {
                 sid,
@@ -498,7 +571,7 @@ mod tests {
             _ => panic!("expected Subscribe"),
         }
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         match op {
             ClientOp::Subscribe {
                 sid,
@@ -513,17 +586,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_pub() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_parse_pub() {
+        let (mut conn, mut client) = make_pair();
         client
             .write_all(b"PUB test.subject 5\r\nhello\r\n")
-            .await
             .unwrap();
-        client.flush().await.unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         match op {
             ClientOp::Publish {
                 subject,
@@ -541,17 +612,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_pub_with_reply() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_parse_pub_with_reply() {
+        let (mut conn, mut client) = make_pair();
         client
             .write_all(b"PUB test.subject reply.to 5\r\nhello\r\n")
-            .await
             .unwrap();
-        client.flush().await.unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         match op {
             ClientOp::Publish {
                 subject,
@@ -567,19 +636,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_connect() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_parse_connect() {
+        let (mut conn, mut client) = make_pair();
         client
             .write_all(
                 b"CONNECT {\"verbose\":false,\"pedantic\":false,\"lang\":\"rust\",\"version\":\"0.1\",\"protocol\":1,\"echo\":true,\"headers\":true,\"no_responders\":true,\"tls_required\":false}\r\n",
             )
-            .await
             .unwrap();
-        client.flush().await.unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         match op {
             ClientOp::Connect(info) => {
                 assert_eq!(info.lang, "rust");
@@ -589,18 +656,17 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_parse_unsub() {
-        let (mut conn, mut client) = make_pair().await;
-        use tokio::io::AsyncWriteExt;
-        client.write_all(b"UNSUB 1\r\n").await.unwrap();
-        client.write_all(b"UNSUB 2 5\r\n").await.unwrap();
-        client.flush().await.unwrap();
+    #[test]
+    fn test_parse_unsub() {
+        let (mut conn, mut client) = make_pair();
+        client.write_all(b"UNSUB 1\r\n").unwrap();
+        client.write_all(b"UNSUB 2 5\r\n").unwrap();
+        client.flush().unwrap();
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         assert!(matches!(op, ClientOp::Unsubscribe { sid: 1, max: None }));
 
-        let op = conn.read_client_op().await.unwrap().unwrap();
+        let op = conn.read_client_op().unwrap().unwrap();
         assert!(matches!(
             op,
             ClientOp::Unsubscribe {
@@ -610,58 +676,53 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_send_msg() {
-        let (mut conn, mut client) = make_pair().await;
-        conn.send_msg("test.sub", 1, None, None, b"hello")
-            .await
-            .unwrap();
+    #[test]
+    fn test_send_msg() {
+        let (mut conn, mut client) = make_pair();
+        conn.send_msg("test.sub", 1, None, None, b"hello").unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        client.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(s, "MSG test.sub 1 5\r\nhello\r\n");
     }
 
-    #[tokio::test]
-    async fn test_send_msg_with_reply() {
-        let (mut conn, mut client) = make_pair().await;
+    #[test]
+    fn test_send_msg_with_reply() {
+        let (mut conn, mut client) = make_pair();
         conn.send_msg("test.sub", 1, Some("reply.to"), None, b"hi")
-            .await
             .unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        client.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(s, "MSG test.sub 1 reply.to 2\r\nhi\r\n");
     }
 
-    #[tokio::test]
-    async fn test_eof_returns_none() {
-        let (mut conn, client) = make_pair().await;
+    #[test]
+    fn test_eof_returns_none() {
+        let (mut conn, client) = make_pair();
         drop(client);
-        let result = conn.read_client_op().await.unwrap();
+        let result = conn.read_client_op().unwrap();
         assert!(result.is_none());
     }
 
     // --- LeafConn tests ---
 
-    async fn make_leaf_pair() -> (LeafConn, tokio::io::DuplexStream) {
-        let (hub_side, leaf_side) = duplex(8192);
-        let conn = LeafConn::new(Box::new(leaf_side), BufConfig::default());
-        (conn, hub_side)
+    fn make_leaf_pair() -> (LeafConn, TcpStream) {
+        let (server, client) = tcp_pair();
+        let conn = LeafConn::new(server, BufConfig::default());
+        (conn, client)
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_info() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_info() {
+        let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n")
-            .await
             .unwrap();
-        hub.flush().await.unwrap();
+        hub.flush().unwrap();
 
-        let op = conn.read_leaf_op().await.unwrap().unwrap();
+        let op = conn.read_leaf_op().unwrap().unwrap();
         match op {
             LeafOp::Info(info) => {
                 assert_eq!(info.server_id, "hub1");
@@ -671,57 +732,53 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_ping_pong_ok_err() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_ping_pong_ok_err() {
+        let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"PING\r\nPONG\r\n+OK\r\n-ERR 'test error'\r\n")
-            .await
             .unwrap();
-        hub.flush().await.unwrap();
+        hub.flush().unwrap();
 
         assert!(matches!(
-            conn.read_leaf_op().await.unwrap().unwrap(),
+            conn.read_leaf_op().unwrap().unwrap(),
             LeafOp::Ping
         ));
         assert!(matches!(
-            conn.read_leaf_op().await.unwrap().unwrap(),
+            conn.read_leaf_op().unwrap().unwrap(),
             LeafOp::Pong
         ));
         assert!(matches!(
-            conn.read_leaf_op().await.unwrap().unwrap(),
+            conn.read_leaf_op().unwrap().unwrap(),
             LeafOp::Ok
         ));
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::Err(msg) => assert_eq!(msg, "test error"),
             _ => panic!("expected Err"),
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_ls_sub_unsub() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_ls_sub_unsub() {
+        let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LS+ foo.bar\r\nLS+ baz.* myqueue\r\nLS- foo.bar\r\n")
-            .await
             .unwrap();
-        hub.flush().await.unwrap();
+        hub.flush().unwrap();
 
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafSub { subject, queue } => {
                 assert_eq!(&subject[..], b"foo.bar");
                 assert!(queue.is_none());
             }
             _ => panic!("expected LeafSub"),
         }
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafSub { subject, queue } => {
                 assert_eq!(&subject[..], b"baz.*");
                 assert_eq!(&queue.unwrap()[..], b"myqueue");
             }
             _ => panic!("expected LeafSub"),
         }
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafUnsub { subject, queue } => {
                 assert_eq!(&subject[..], b"foo.bar");
                 assert!(queue.is_none());
@@ -730,16 +787,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_lmsg_no_reply_no_headers() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_lmsg_no_reply_no_headers() {
+        let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LMSG test.subject 5\r\nhello\r\n")
-            .await
             .unwrap();
-        hub.flush().await.unwrap();
+        hub.flush().unwrap();
 
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafMsg {
                 subject,
                 reply,
@@ -755,16 +810,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_lmsg_with_reply() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_lmsg_with_reply() {
+        let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LMSG test.subject reply.to 5\r\nhello\r\n")
-            .await
             .unwrap();
-        hub.flush().await.unwrap();
+        hub.flush().unwrap();
 
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafMsg {
                 subject,
                 reply,
@@ -780,22 +833,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_lmsg_with_headers() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_lmsg_with_headers() {
+        let (mut conn, mut hub) = make_leaf_pair();
         let hdr = b"NATS/1.0\r\nX-Key: val\r\n\r\n";
         let payload = b"data";
         let hdr_len = hdr.len();
         let total_len = hdr_len + payload.len();
         let line = format!("LMSG test.subject {hdr_len} {total_len}\r\n");
-        hub.write_all(line.as_bytes()).await.unwrap();
-        hub.write_all(hdr).await.unwrap();
-        hub.write_all(payload).await.unwrap();
-        hub.write_all(b"\r\n").await.unwrap();
-        hub.flush().await.unwrap();
+        hub.write_all(line.as_bytes()).unwrap();
+        hub.write_all(hdr).unwrap();
+        hub.write_all(payload).unwrap();
+        hub.write_all(b"\r\n").unwrap();
+        hub.flush().unwrap();
 
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafMsg {
                 subject,
                 reply,
@@ -815,22 +867,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_parse_lmsg_with_reply_and_headers() {
-        let (mut conn, mut hub) = make_leaf_pair().await;
-        use tokio::io::AsyncWriteExt;
+    #[test]
+    fn test_leaf_parse_lmsg_with_reply_and_headers() {
+        let (mut conn, mut hub) = make_leaf_pair();
         let hdr = b"NATS/1.0\r\nFoo: bar\r\n\r\n";
         let payload = b"body";
         let hdr_len = hdr.len();
         let total_len = hdr_len + payload.len();
         let line = format!("LMSG test.subject reply.inbox {hdr_len} {total_len}\r\n");
-        hub.write_all(line.as_bytes()).await.unwrap();
-        hub.write_all(hdr).await.unwrap();
-        hub.write_all(payload).await.unwrap();
-        hub.write_all(b"\r\n").await.unwrap();
-        hub.flush().await.unwrap();
+        hub.write_all(line.as_bytes()).unwrap();
+        hub.write_all(hdr).unwrap();
+        hub.write_all(payload).unwrap();
+        hub.write_all(b"\r\n").unwrap();
+        hub.flush().unwrap();
 
-        match conn.read_leaf_op().await.unwrap().unwrap() {
+        match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::LeafMsg {
                 subject,
                 reply,
@@ -850,57 +901,55 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_leaf_send_leaf_sub_unsub() {
-        let (conn, mut hub) = make_leaf_pair().await;
-        let (_reader, mut writer) = conn.split();
-        writer.send_leaf_sub(b"foo.>").await.unwrap();
-        writer.send_leaf_unsub(b"foo.>").await.unwrap();
-        writer.flush().await.unwrap();
+    #[test]
+    fn test_leaf_send_leaf_sub_unsub() {
+        let (conn, mut hub) = make_leaf_pair();
+        let (_reader, mut writer) = conn.split().unwrap();
+        writer.send_leaf_sub(b"foo.>").unwrap();
+        writer.send_leaf_unsub(b"foo.>").unwrap();
+        writer.flush().unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        hub.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(s, "LS+ foo.>\r\nLS- foo.>\r\n");
     }
 
-    #[tokio::test]
-    async fn test_leaf_send_lmsg_no_headers() {
-        let (conn, mut hub) = make_leaf_pair().await;
-        let (_reader, mut writer) = conn.split();
+    #[test]
+    fn test_leaf_send_lmsg_no_headers() {
+        let (conn, mut hub) = make_leaf_pair();
+        let (_reader, mut writer) = conn.split().unwrap();
         writer
             .send_leaf_msg(b"test.sub", None, None, b"hello")
-            .await
             .unwrap();
-        writer.flush().await.unwrap();
+        writer.flush().unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        hub.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(s, "LMSG test.sub 5\r\nhello\r\n");
     }
 
-    #[tokio::test]
-    async fn test_leaf_send_lmsg_with_reply() {
-        let (conn, mut hub) = make_leaf_pair().await;
-        let (_reader, mut writer) = conn.split();
+    #[test]
+    fn test_leaf_send_lmsg_with_reply() {
+        let (conn, mut hub) = make_leaf_pair();
+        let (_reader, mut writer) = conn.split().unwrap();
         writer
             .send_leaf_msg(b"test.sub", Some(b"reply.to"), None, b"hi")
-            .await
             .unwrap();
-        writer.flush().await.unwrap();
+        writer.flush().unwrap();
 
-        let mut buf = BytesMut::with_capacity(4096);
-        hub.read_buf(&mut buf).await.unwrap();
-        let s = std::str::from_utf8(&buf).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
         assert_eq!(s, "LMSG test.sub reply.to 2\r\nhi\r\n");
     }
 
-    #[tokio::test]
-    async fn test_leaf_eof_returns_none() {
-        let (mut conn, hub) = make_leaf_pair().await;
+    #[test]
+    fn test_leaf_eof_returns_none() {
+        let (mut conn, hub) = make_leaf_pair();
         drop(hub);
-        let result = conn.read_leaf_op().await.unwrap();
+        let result = conn.read_leaf_op().unwrap();
         assert!(result.is_none());
     }
 }

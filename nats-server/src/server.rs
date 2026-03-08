@@ -5,19 +5,20 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use async_nats::ServerInfo;
 
-use crate::client_conn::ClientConnection;
 use crate::protocol::BufConfig;
 use crate::sub_list::SubList;
 use crate::upstream::{Upstream, UpstreamCmd};
+use crate::worker::{Worker, WorkerHandle};
 
 /// Configuration for the leaf node server.
 #[derive(Debug, Clone)]
@@ -26,10 +27,6 @@ pub struct LeafServerConfig {
     pub host: String,
     /// Port to listen on.
     pub port: u16,
-    /// Optional WebSocket port. When set, a second listener accepts
-    /// WebSocket connections on this port.
-    #[cfg(feature = "websockets")]
-    pub ws_port: Option<u16>,
     /// Optional upstream hub URL (e.g., "nats://hub:4222").
     pub hub_url: Option<String>,
     /// Server name.
@@ -39,19 +36,23 @@ pub struct LeafServerConfig {
     pub max_read_buf_capacity: usize,
     /// Per-client write buffer capacity in bytes (default: 64 KB).
     pub write_buf_capacity: usize,
+    /// Number of worker threads (default: available parallelism or 4).
+    pub workers: usize,
 }
 
 impl Default for LeafServerConfig {
     fn default() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         Self {
             host: "0.0.0.0".to_string(),
             port: 4222,
-            #[cfg(feature = "websockets")]
-            ws_port: None,
             hub_url: None,
             server_name: "leaf-node".to_string(),
             max_read_buf_capacity: 65536,
             write_buf_capacity: 65536,
+            workers,
         }
     }
 }
@@ -60,10 +61,10 @@ impl Default for LeafServerConfig {
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub subs: std::sync::RwLock<SubList>,
-    pub upstream: tokio::sync::RwLock<Option<Upstream>>,
+    pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
     /// Set once after upstream connects; read without locking on every publish.
-    pub upstream_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<UpstreamCmd>>>,
+    pub upstream_tx: std::sync::RwLock<Option<mpsc::Sender<UpstreamCmd>>>,
     /// Lock-free flag: true when at least one subscription exists.
     /// Updated on subscribe/unsubscribe. Avoids taking subs lock on every publish
     /// just to check emptiness.
@@ -77,7 +78,7 @@ impl ServerState {
         Self {
             info,
             subs: std::sync::RwLock::new(SubList::new()),
-            upstream: tokio::sync::RwLock::new(None),
+            upstream: std::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
             has_subs: AtomicBool::new(false),
             buf_config,
@@ -126,13 +127,13 @@ impl LeafServer {
     }
 
     /// Connect to the upstream hub if configured, using the leaf node protocol.
-    async fn connect_upstream(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn connect_upstream(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref hub_url) = self.config.hub_url {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
-            match Upstream::connect(hub_url, Arc::clone(&self.state)).await {
+            match Upstream::connect(hub_url, Arc::clone(&self.state)) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
-                    *self.state.upstream.write().await = Some(upstream);
+                    *self.state.upstream.write().unwrap() = Some(upstream);
                     *self.state.upstream_tx.write().unwrap() = Some(sender);
                     info!("connected to upstream hub");
                 }
@@ -145,159 +146,105 @@ impl LeafServer {
         Ok(())
     }
 
-    /// Register a new client connection and spawn its handler task.
-    async fn spawn_client(
+    /// Spawn N worker threads and return their handles.
+    fn spawn_workers(&self) -> Vec<WorkerHandle> {
+        let n = self.config.workers.max(1);
+        info!(workers = n, "spawning worker threads");
+        (0..n)
+            .map(|i| Worker::spawn(i, Arc::clone(&self.state)))
+            .collect()
+    }
+
+    /// Distribute a new TCP connection to the next worker (round-robin).
+    fn accept_tcp(
         &self,
-        stream: Box<dyn async_nats::connection::AsyncReadWrite>,
+        tcp_stream: TcpStream,
         addr: std::net::SocketAddr,
-        transport: &str,
+        workers: &[WorkerHandle],
+        next_worker: &mut usize,
     ) {
         let cid = self.state.next_client_id();
-        let state = Arc::clone(&self.state);
-
-        info!(cid, addr = %addr, transport, "accepted connection");
-
-        let client_conn = ClientConnection::new(cid, stream, state);
-
-        tokio::spawn(async move {
-            client_conn.run().await;
-        });
-    }
-
-    /// Accept a TCP connection and register it.
-    async fn accept_tcp(&self, tcp_stream: TcpStream, addr: std::net::SocketAddr) {
-        tcp_stream.set_nodelay(true).ok();
-        self.spawn_client(Box::new(tcp_stream), addr, "tcp").await;
-    }
-
-    /// Accept a WebSocket connection (upgrade from TCP) and register it.
-    #[cfg(feature = "websockets")]
-    async fn accept_ws(&self, tcp_stream: TcpStream, addr: std::net::SocketAddr) {
-        tcp_stream.set_nodelay(true).ok();
-        match tokio_websockets::ServerBuilder::new()
-            .accept(tcp_stream)
-            .await
-        {
-            Ok(ws_stream) => {
-                let adapter = async_nats::connection::WebSocketAdapter::new(ws_stream);
-                self.spawn_client(Box::new(adapter), addr, "websocket")
-                    .await;
-            }
-            Err(e) => {
-                error!(addr = %addr, error = %e, "websocket upgrade failed");
-            }
-        }
+        let idx = *next_worker % workers.len();
+        *next_worker = idx + 1;
+        workers[idx].send_conn(cid, tcp_stream, addr);
     }
 
     /// Run the leaf server. Listens for connections and optionally
-    /// connects to the upstream hub.
-    pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.connect_upstream().await?;
+    /// connects to the upstream hub. Blocks forever.
+    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.connect_upstream()?;
+
+        let workers = self.spawn_workers();
+        let mut next_worker = 0usize;
 
         let bind_addr = format!("{}:{}", self.config.host, self.config.port);
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(&bind_addr)?;
         info!(addr = %bind_addr, "leaf server listening (tcp)");
 
-        #[cfg(feature = "websockets")]
-        let ws_listener = if let Some(ws_port) = self.config.ws_port {
-            let ws_addr = format!("{}:{}", self.config.host, ws_port);
-            let l = TcpListener::bind(&ws_addr).await?;
-            info!(addr = %ws_addr, "leaf server listening (websocket)");
-            Some(l)
-        } else {
-            None
-        };
-
         loop {
-            #[cfg(feature = "websockets")]
-            {
-                if let Some(ref ws_l) = ws_listener {
-                    tokio::select! {
-                        result = listener.accept() => {
-                            match result {
-                                Ok((tcp_stream, addr)) => self.accept_tcp(tcp_stream, addr).await,
-                                Err(e) => error!(error = %e, "failed to accept tcp connection"),
-                            }
-                        }
-                        result = ws_l.accept() => {
-                            match result {
-                                Ok((tcp_stream, addr)) => self.accept_ws(tcp_stream, addr).await,
-                                Err(e) => error!(error = %e, "failed to accept websocket connection"),
-                            }
-                        }
-                    }
-                    continue;
+            match listener.accept() {
+                Ok((tcp_stream, addr)) => {
+                    self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker);
                 }
-            }
-
-            // TCP-only path (no WS listener or websockets feature disabled)
-            match listener.accept().await {
-                Ok((tcp_stream, addr)) => self.accept_tcp(tcp_stream, addr).await,
                 Err(e) => error!(error = %e, "failed to accept connection"),
             }
         }
     }
 
     /// Run the leaf server with graceful shutdown support.
-    pub async fn run_until_shutdown(
+    ///
+    /// Uses `poll()` on the listener fd with a timeout so we can periodically
+    /// check the shutdown flag without spinning.
+    pub fn run_until_shutdown(
         &self,
-        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+        shutdown: Arc<AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.connect_upstream().await?;
+        self.connect_upstream()?;
+
+        let workers = self.spawn_workers();
+        let mut next_worker = 0usize;
 
         let bind_addr = format!("{}:{}", self.config.host, self.config.port);
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(&bind_addr)?;
         info!(addr = %bind_addr, "leaf server listening (tcp)");
 
-        #[cfg(feature = "websockets")]
-        let ws_listener = if let Some(ws_port) = self.config.ws_port {
-            let ws_addr = format!("{}:{}", self.config.host, ws_port);
-            let l = TcpListener::bind(&ws_addr).await?;
-            info!(addr = %ws_addr, "leaf server listening (websocket)");
-            Some(l)
-        } else {
-            None
-        };
+        let listener_fd = listener.as_raw_fd();
+        let mut pfd = [libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
 
         loop {
-            #[cfg(feature = "websockets")]
-            {
-                if let Some(ref ws_l) = ws_listener {
-                    tokio::select! {
-                        result = listener.accept() => {
-                            match result {
-                                Ok((tcp_stream, addr)) => self.accept_tcp(tcp_stream, addr).await,
-                                Err(e) => error!(error = %e, "failed to accept tcp connection"),
-                            }
-                        }
-                        result = ws_l.accept() => {
-                            match result {
-                                Ok((tcp_stream, addr)) => self.accept_ws(tcp_stream, addr).await,
-                                Err(e) => error!(error = %e, "failed to accept websocket connection"),
-                            }
-                        }
-                        _ = shutdown.recv() => {
-                            info!("shutting down leaf server");
-                            break;
-                        }
-                    }
-                    continue;
-                }
+            if shutdown.load(Ordering::Relaxed) {
+                info!("shutting down leaf server");
+                break;
             }
 
-            // TCP-only path
-            tokio::select! {
-                result = listener.accept() => {
-                    match result {
-                        Ok((tcp_stream, addr)) => self.accept_tcp(tcp_stream, addr).await,
-                        Err(e) => error!(error = %e, "failed to accept connection"),
-                    }
+            pfd[0].revents = 0;
+            let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 1000) }; // 1s timeout
+
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                _ = shutdown.recv() => {
-                    info!("shutting down leaf server");
-                    break;
+                return Err(err.into());
+            }
+
+            if ret > 0 && pfd[0].revents & libc::POLLIN != 0 {
+                match listener.accept() {
+                    Ok((tcp_stream, addr)) => {
+                        self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker);
+                    }
+                    Err(e) => error!(error = %e, "failed to accept connection"),
                 }
             }
+        }
+
+        // Shutdown workers
+        for w in &workers {
+            w.shutdown();
         }
 
         // Cleanup: clear all subscriptions.
@@ -309,7 +256,7 @@ impl LeafServer {
         // Drop upstream
         {
             *self.state.upstream_tx.write().unwrap() = None;
-            let mut upstream = self.state.upstream.write().await;
+            let mut upstream = self.state.upstream.write().unwrap();
             *upstream = None;
         }
 

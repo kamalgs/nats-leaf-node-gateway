@@ -5,6 +5,103 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-08 — N-worker epoll event loop (replace Tokio)
+
+**Architecture change:**
+Replace Tokio async runtime + thread-per-connection model with N worker threads, each owning
+one epoll instance multiplexing many client connections. DirectWriter notifies the worker's
+single eventfd (not per-connection), so fan-out to N connections on one worker costs 1 eventfd
+write, not N.
+
+**Key components:**
+- `worker.rs`: Core epoll event loop with connection state machine (SendInfo→WaitConnect→Active)
+- Non-blocking sockets with partial write buffering
+- `client_conn.rs` deleted — all logic absorbed into worker.rs
+- Round-robin connection distribution from acceptor to workers
+
+**Performance-critical optimizations:**
+1. **Batched eventfd notifications** — accumulate remote worker notifications across all PUBs
+   in a read buffer, then send deduplicated. Reduces N_pubs × N_workers eventfd writes to
+   just N_workers per batch. This was the single biggest win.
+2. **Skip same-worker notification** — flush_pending runs after each event loop iteration,
+   handling local delivery without any eventfd round-trip.
+3. **Read loop until WouldBlock** — drain kernel buffer in one epoll_wait return.
+4. **In-place flush_pending** — iterate conns directly without Vec allocation.
+
+### Results (3-run average, Go v2.14.0-dev, `compression: off`)
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,828K | ~1,830K | **100%** | 95% |
+| Local pub/sub (sub) | ~752K | ~822K | **109%** | 88% |
+| Fan-out x5 (pub) | ~206K | ~393K | **191%** | 155% |
+| Leaf → Hub (sub on hub) | ~581K | ~750K | **129%** | 112% |
+| Hub → Leaf (sub) | ~573K | ~603K | **105%** | 123% |
+
+**Takeaways:**
+- **Fan-out x5: 155% → 191% of Go** — batched eventfd + same-worker optimization dominate.
+  With 1 worker, fan-out reaches 310K (141% of Go), confirming cross-worker overhead was the
+  bottleneck. With 6 workers + batch notifications, multi-core parallelism pushes to 191%.
+- **Pub-only: 95% → 100% of Go** — eliminating Tokio async overhead (ReadHalf→PollEvented→
+  mio→epoll) finally closes the gap. Direct epoll_wait + non-blocking read matches Go's
+  netpoller performance.
+- **Local pub/sub: 88% → 109%** — consistent improvement from reduced syscall overhead.
+- **Leaf→Hub: 112% → 129%** — cleaner I/O path benefits upstream forwarding.
+- **Hub→Leaf: 123% → 105%** — slight regression (was previously benefiting from Tokio's
+  optimized TCP write path); now using raw non-blocking writes. Still beats Go.
+- **All 5 scenarios at or above 100% of Go** — first time achieving this milestone.
+
+---
+
+## 2026-03-07 — Tight skip loop + profiling-driven optimizations
+
+**Optimization applied:**
+When no subscribers and no upstream exist (`can_skip_publish()`), bypass `tokio::select!`
+entirely and use a tight read-skip loop. Eliminates per-iteration overhead of:
+- `Notify::poll_notified()` + `drop_notified()` (1.23% of CPU — pure waste in skip mode)
+- `WriterHandle::drain()` (0.46% — always returns None in skip mode)
+- `handle_client_op()` for skipped PUBs (1.07% — async future create/drop for no-op)
+- `select!` macro state machine overhead
+
+New `read_next_non_pub()` method on `ServerConn` skips PUB/HPUB in an inner loop and
+only returns for non-PUB ops (PING, SUB, UNSUB, CONNECT).
+
+**Profiling insight:** Rust spends only ~10% in application code vs Go's ~42%. The gap is
+not parsing speed (Rust parses 2-3x faster per message) but Tokio async machinery (~7%)
+and kernel/libc syscall overhead (~27% vs Go's ~6%). The tight skip loop eliminates the
+async machinery cost for the pub-only hot path.
+
+**RSS measurement (same session):**
+
+| State | Go nats-server | Rust leaf | Ratio |
+|---|---|---|---|
+| Idle (no connections) | 12.6 MB | 3.3 MB | **Rust 3.8x smaller** |
+| 1 connection | 13.4 MB | 3.6 MB | **Rust 3.7x smaller** |
+| 100 connections | 19.7 MB | 5.1 MB | **Rust 3.9x smaller** |
+| Under load (100 subs + pub) | 21.8 MB | 5.5 MB | **Rust 4.0x smaller** |
+| After load (conns closed) | 20.7 MB | 8.5 MB | **Rust 2.4x smaller** |
+
+### Results (same session, Go v2.14.0-dev, `compression: off`)
+
+| Scenario | Go | Rust | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | 1,633K | 1,560K | **95%** | 67% |
+| Local pub/sub (sub) | 832K | 730K | **88%** | 95% |
+| Fan-out x5 (per sub) | 205K | 318K | **155%** | 125% |
+| Leaf → Hub (sub on hub) | 613K | 687K | **112%** | 118% |
+| Hub → Leaf (sub) | 590K | 726K | **123%** | 117% |
+
+**Takeaways:**
+- **Pub-only: 67% → 95% of Go** — tight skip loop closes most of the gap. Remaining 5%
+  is Tokio I/O layers (ReadHalf → PollEvented → mio → epoll) vs Go's direct netpoller.
+- **Fan-out x5: 125% → 155% of Go** — cleaner message loop benefits all paths
+- **Hub→Leaf: 123% of Go** — consistent win
+- **Local pub/sub: 88%** — within normal variance (previous 95% was a high run)
+- **RSS: 3.3 MB idle vs 12.6 MB** — Rust uses 3.8x less memory at idle
+- All 5 scenarios now within 12% of Go or beating it. No scenario below 88%.
+
+---
+
 ## 2026-03-07 — DirectWriter + fair Go comparison (compression: off)
 
 **Optimization applied:**

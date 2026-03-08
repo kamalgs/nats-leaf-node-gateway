@@ -3,13 +3,12 @@
 // Usage:
 //   cargo run --example leaf_server -- --port 4222
 //   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:7422
-//   cargo run --example leaf_server -- --port 4222 --ws-port 4223
+//   cargo run --example leaf_server -- --workers 8
 //   cargo run --example leaf_server -- --read-buf-max 32768 --write-buf-size 32768
 
 use nats_server::{LeafServer, LeafServerConfig};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing if tracing-subscriber is available
     #[cfg(feature = "_example_tracing")]
     tracing_subscriber::fmt::init();
@@ -36,11 +35,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.server_name = args[i].clone();
             }
-            #[cfg(feature = "websockets")]
-            "--ws-port" => {
-                i += 1;
-                config.ws_port = Some(args[i].parse().expect("invalid ws-port"));
-            }
             "--read-buf-max" => {
                 i += 1;
                 config.max_read_buf_capacity =
@@ -51,11 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.write_buf_capacity =
                     args[i].parse().expect("invalid write-buf-size");
             }
+            "--workers" | "-w" => {
+                i += 1;
+                config.workers = args[i].parse().expect("invalid workers count");
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
                     "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
-                     [--ws-port PORT] [--read-buf-max BYTES] [--write-buf-size BYTES]"
+                     [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N]"
                 );
                 std::process::exit(1);
             }
@@ -64,17 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Starting leaf node server on {}:{}",
-        config.host, config.port
+        "Starting leaf node server on {}:{} ({} workers)",
+        config.host, config.port, config.workers
     );
     if let Some(ref hub) = config.hub_url {
         println!("Upstream hub: {hub}");
     }
-    #[cfg(feature = "websockets")]
-    if let Some(ws_port) = config.ws_port {
-        println!("WebSocket listener on port {ws_port}");
-    }
 
     let server = LeafServer::new(config);
-    server.run().await
+    server.run()
 }
