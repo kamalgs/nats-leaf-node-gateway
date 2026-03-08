@@ -25,4 +25,4 @@ pub(crate) mod upstream;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 
-pub use server::{LeafServer, LeafServerConfig};
+pub use server::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};

@@ -484,12 +484,15 @@ mod tests {
         let mut out = BytesMut::new();
         match codec.decode(&mut raw, &mut out) {
             Ok(DecodeStatus::Complete) => {}
-            other => panic!("expected Complete, got {}", match other {
-                Ok(DecodeStatus::NeedMore) => "NeedMore",
-                Ok(DecodeStatus::Close) => "Close",
-                Err(e) => e,
-                _ => "unknown",
-            }),
+            other => panic!(
+                "expected Complete, got {}",
+                match other {
+                    Ok(DecodeStatus::NeedMore) => "NeedMore",
+                    Ok(DecodeStatus::Close) => "Close",
+                    Err(e) => e,
+                    _ => "unknown",
+                }
+            ),
         }
         assert_eq!(&out[..], payload);
         assert!(raw.is_empty());
@@ -503,10 +506,7 @@ mod tests {
 
         assert_eq!(encoded[0], 0x82);
         assert_eq!(encoded[1], 126); // extended 16-bit length
-        assert_eq!(
-            u16::from_be_bytes([encoded[2], encoded[3]]),
-            300
-        );
+        assert_eq!(u16::from_be_bytes([encoded[2], encoded[3]]), 300);
         assert_eq!(&encoded[4..], &payload[..]);
     }
 
@@ -613,12 +613,15 @@ mod tests {
             match codec.decode(&mut encoded, &mut out) {
                 Ok(DecodeStatus::Complete) => {}
                 Ok(DecodeStatus::NeedMore) if size == 0 => continue, // 0-len frame
-                other => panic!("size={size}: unexpected result: {:?}", match other {
-                    Ok(DecodeStatus::NeedMore) => "NeedMore".to_string(),
-                    Ok(DecodeStatus::Close) => "Close".to_string(),
-                    Err(e) => e.to_string(),
-                    _ => "Complete".to_string(),
-                }),
+                other => panic!(
+                    "size={size}: unexpected result: {:?}",
+                    match other {
+                        Ok(DecodeStatus::NeedMore) => "NeedMore".to_string(),
+                        Ok(DecodeStatus::Close) => "Close".to_string(),
+                        Err(e) => e.to_string(),
+                        _ => "Complete".to_string(),
+                    }
+                ),
             }
             assert_eq!(out.len(), size, "size={size}: output length mismatch");
         }

@@ -89,10 +89,7 @@ impl Drop for NatsServer {
 
 /// Start a LeafServer on the given port with optional hub_url, returning the
 /// shutdown sender. The server runs in a background tokio task.
-fn spawn_leaf(
-    port: u16,
-    hub_url: Option<String>,
-) -> tokio::sync::broadcast::Sender<()> {
+fn spawn_leaf(port: u16, hub_url: Option<String>) -> tokio::sync::broadcast::Sender<()> {
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let shutdown_rx = shutdown_tx.subscribe();
 
@@ -170,7 +167,10 @@ async fn upstream_forward() {
 
     // Start leaf pointing at upstream
     let leaf_port = free_port();
-    let shutdown_tx = spawn_leaf(leaf_port, Some(format!("nats://127.0.0.1:{}", upstream_port)));
+    let shutdown_tx = spawn_leaf(
+        leaf_port,
+        Some(format!("nats://127.0.0.1:{}", upstream_port)),
+    );
     wait_for_leaf(leaf_port).await;
 
     // Connect clients
@@ -218,7 +218,10 @@ async fn leaf_to_upstream() {
 
     // Start leaf pointing at upstream
     let leaf_port = free_port();
-    let shutdown_tx = spawn_leaf(leaf_port, Some(format!("nats://127.0.0.1:{}", upstream_port)));
+    let shutdown_tx = spawn_leaf(
+        leaf_port,
+        Some(format!("nats://127.0.0.1:{}", upstream_port)),
+    );
     wait_for_leaf(leaf_port).await;
 
     // Connect clients

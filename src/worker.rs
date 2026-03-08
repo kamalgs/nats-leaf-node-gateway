@@ -52,13 +52,7 @@ pub(crate) struct WorkerHandle {
 
 impl WorkerHandle {
     /// Send a new connection to this worker and wake it.
-    pub fn send_conn(
-        &self,
-        id: u64,
-        stream: TcpStream,
-        addr: SocketAddr,
-        is_websocket: bool,
-    ) {
+    pub fn send_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr, is_websocket: bool) {
         let _ = self.tx.send(WorkerCmd::NewConn {
             id,
             stream,
@@ -149,10 +143,7 @@ pub(crate) struct Worker {
 
 impl Worker {
     /// Spawn a worker thread. Returns a handle for sending commands.
-    pub(crate) fn spawn(
-        index: usize,
-        state: Arc<ServerState>,
-    ) -> WorkerHandle {
+    pub(crate) fn spawn(index: usize, state: Arc<ServerState>) -> WorkerHandle {
         let (tx, rx) = mpsc::channel();
         let event_fd = Arc::new(create_eventfd());
         let handle = WorkerHandle {
@@ -160,8 +151,8 @@ impl Worker {
             event_fd: Arc::clone(&event_fd),
         };
 
-        let info_json = serde_json::to_string(&state.info)
-            .expect("failed to serialize server info");
+        let info_json =
+            serde_json::to_string(&state.info).expect("failed to serialize server info");
         let info_line = format!("INFO {info_json}\r\n").into_bytes();
 
         std::thread::Builder::new()
@@ -206,13 +197,7 @@ impl Worker {
     }
 
     fn run(&mut self) {
-        let mut events = vec![
-            libc::epoll_event {
-                events: 0,
-                u64: 0,
-            };
-            256
-        ];
+        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
 
         loop {
             let n = unsafe {
@@ -306,14 +291,8 @@ impl Worker {
             events: libc::EPOLLIN as u32,
             u64: id,
         };
-        let ret = unsafe {
-            libc::epoll_ctl(
-                self.epoll_fd.as_raw_fd(),
-                libc::EPOLL_CTL_ADD,
-                fd,
-                &mut ev,
-            )
-        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
         if ret != 0 {
             warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed");
             return;
@@ -409,9 +388,7 @@ impl Worker {
 
             // For WebSocket: encode write_buf into ws_out, then write ws_out
             let (write_ptr, write_len) = match &mut client.transport {
-                Transport::Raw => {
-                    (client.write_buf.as_ptr(), client.write_buf.len())
-                }
+                Transport::Raw => (client.write_buf.as_ptr(), client.write_buf.len()),
                 Transport::WebSocket { ws_out, .. } => {
                     if !client.write_buf.is_empty() {
                         WsCodec::encode(&client.write_buf, ws_out);
@@ -530,13 +507,8 @@ impl Worker {
         };
 
         while !buf.is_empty() {
-            let n = unsafe {
-                libc::write(
-                    client.fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                )
-            };
+            let n =
+                unsafe { libc::write(client.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
@@ -679,10 +651,7 @@ impl Worker {
         let mut close = false;
         let mut decode_err = false;
         if let Some(client) = self.conns.get_mut(&conn_id) {
-            if let Transport::WebSocket {
-                codec, raw_buf, ..
-            } = &mut client.transport
-            {
+            if let Transport::WebSocket { codec, raw_buf, .. } = &mut client.transport {
                 loop {
                     match codec.decode(raw_buf, &mut *client.read_buf) {
                         Ok(DecodeStatus::Complete) => continue,
@@ -744,9 +713,9 @@ impl Worker {
                     Some(Err(_)) => {
                         // Bad upgrade request
                         if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client.write_buf.extend_from_slice(
-                                b"HTTP/1.1 400 Bad Request\r\n\r\n",
-                            );
+                            client
+                                .write_buf
+                                .extend_from_slice(b"HTTP/1.1 400 Bad Request\r\n\r\n");
                         }
                         self.try_flush_conn(conn_id);
                         self.remove_conn(conn_id);
@@ -787,11 +756,25 @@ impl Worker {
                     }
                 };
                 match op {
-                    Some(ClientOp::Connect(_)) => {
+                    Some(ClientOp::Connect(connect_info)) => {
+                        if !self
+                            .state
+                            .auth
+                            .validate(&connect_info, &self.state.info.nonce)
+                        {
+                            warn!(conn_id, "authorization violation");
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client
+                                    .write_buf
+                                    .extend_from_slice(b"-ERR 'Authorization Violation'\r\n");
+                            }
+                            self.try_flush_conn(conn_id);
+                            self.remove_conn(conn_id);
+                            return;
+                        }
                         let client = self.conns.get_mut(&conn_id).unwrap();
                         client.phase = ConnPhase::Active;
-                        client.upstream_tx =
-                            self.state.upstream_tx.read().unwrap().clone();
+                        client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
                         info!(conn_id, "client connected");
                     }
                     Some(_) => {
@@ -811,8 +794,7 @@ impl Worker {
                 // Active: parse client ops
                 let can_skip = {
                     let client = self.conns.get(&conn_id).unwrap();
-                    client.upstream_tx.is_none()
-                        && !self.state.has_subs.load(Ordering::Relaxed)
+                    client.upstream_tx.is_none() && !self.state.has_subs.load(Ordering::Relaxed)
                 };
 
                 let op = {
@@ -873,8 +855,7 @@ impl Worker {
                 queue_group,
             } => {
                 let subject_str = bytes_to_str(&subject);
-                let queue_str =
-                    queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
+                let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
 
                 let direct_writer = match self.conns.get(&conn_id) {
                     Some(c) => c.direct_writer.clone(),
@@ -963,10 +944,7 @@ impl Worker {
                     });
                 }
 
-                let upstream_tx = self
-                    .conns
-                    .get(&conn_id)
-                    .and_then(|c| c.upstream_tx.clone());
+                let upstream_tx = self.conns.get(&conn_id).and_then(|c| c.upstream_tx.clone());
                 if let Some(ref tx) = upstream_tx {
                     if let Err(e) = tx.send(UpstreamCmd::Publish {
                         subject,
@@ -1014,9 +992,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
     let removed = {
         let mut subs = state.subs.write().unwrap();
         let r = subs.remove_conn(id);
-        state
-            .has_subs
-            .store(!subs.is_empty(), Ordering::Relaxed);
+        state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
         r
     };
 

@@ -19,7 +19,11 @@ use crate::nats_proto::MsgBuilder;
 /// Create a Linux eventfd for notification.
 pub(crate) fn create_eventfd() -> OwnedFd {
     let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
-    assert!(fd >= 0, "eventfd creation failed: {}", std::io::Error::last_os_error());
+    assert!(
+        fd >= 0,
+        "eventfd creation failed: {}",
+        std::io::Error::last_os_error()
+    );
     unsafe { OwnedFd::from_raw_fd(fd) }
 }
 
@@ -195,10 +199,7 @@ impl SubList {
         if is_wildcard(&sub.subject) {
             self.wild.push(sub);
         } else {
-            self.exact
-                .entry(sub.subject.clone())
-                .or_default()
-                .push(sub);
+            self.exact.entry(sub.subject.clone()).or_default().push(sub);
         }
     }
 
@@ -716,9 +717,7 @@ mod tests {
             if ret > 0 {
                 writer.consume_notify();
             } else {
-                panic!(
-                    "consumer hung! only received {total_msgs_seen}/{total_msgs} messages"
-                );
+                panic!("consumer hung! only received {total_msgs_seen}/{total_msgs} messages");
             }
         }
         assert_eq!(total_msgs_seen, total_msgs);

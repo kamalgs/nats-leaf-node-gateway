@@ -157,10 +157,7 @@ mod proto_bench {
         group.bench_function("pub_128b_batch10", |b| {
             b.iter(|| {
                 let mut buf = BytesMut::from(&batch_template[..]);
-                while nats_proto::try_parse_client_op(&mut buf)
-                    .unwrap()
-                    .is_some()
-                {}
+                while nats_proto::try_parse_client_op(&mut buf).unwrap().is_some() {}
             });
         });
 
