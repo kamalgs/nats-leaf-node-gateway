@@ -9,7 +9,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 HUB_CLIENT_PORT=4333
 HUB_LEAF_PORT=7422
 GO_LEAF_PORT=4225
+GO_LEAF_WS_PORT=4226
 RUST_LEAF_PORT=5223
+RUST_LEAF_WS_PORT=5224
 MSGS=100
 SIZE=64
 
@@ -34,10 +36,11 @@ RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
 nats-server -c "$SCRIPT_DIR/configs/bench_hub.conf" >/dev/null 2>&1 &
 PIDS+=($!); sleep 0.5
 
-nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf.conf" >/dev/null 2>&1 &
+nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf_ws.conf" >/dev/null 2>&1 &
 PIDS+=($!); sleep 0.5
 
-"$RUST_BIN" --port "$RUST_LEAF_PORT" --hub "nats://127.0.0.1:$HUB_LEAF_PORT" >/dev/null 2>&1 &
+"$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
+  --hub "nats://127.0.0.1:$HUB_LEAF_PORT" >/dev/null 2>&1 &
 PIDS+=($!); sleep 1
 
 echo ""
@@ -151,6 +154,74 @@ for label_port in "Hub:$HUB_CLIENT_PORT" "GoLeaf:$GO_LEAF_PORT" "RustLeaf:$RUST_
   timeout 3 tail --pid=$sub_pid -f /dev/null 2>/dev/null
   wait "$sub_pid" 2>/dev/null \
     && pass "$label req/reply" || fail "$label req/reply"
+done
+
+# --- 7. WebSocket pub/sub (1 pub + 1 sub over WS) ---
+echo ""
+echo "[7] WebSocket pub/sub (1 pub + 1 sub)"
+for label_url in "GoLeafWS:ws://127.0.0.1:$GO_LEAF_WS_PORT" \
+                 "RustLeafWS:ws://127.0.0.1:$RUST_LEAF_WS_PORT"; do
+  label="${label_url%%:*}"; url="${label_url#*:}"
+
+  nats bench sub smoke.ws --msgs $MSGS --size $SIZE --no-progress \
+    -s "$url" >/dev/null 2>&1 &
+  sub_pid=$!
+  sleep 0.3
+
+  nats bench pub smoke.ws --msgs $MSGS --size $SIZE --no-progress \
+    -s "$url" >/dev/null 2>&1
+
+  wait "$sub_pid" 2>/dev/null \
+    && pass "$label ws pub/sub" || fail "$label ws pub/sub"
+done
+
+# --- 8. WebSocket fan-out (1 pub + 3 subs over WS) ---
+echo ""
+echo "[8] WebSocket fan-out (1 pub + 3 subs)"
+for label_url in "GoLeafWS:ws://127.0.0.1:$GO_LEAF_WS_PORT" \
+                 "RustLeafWS:ws://127.0.0.1:$RUST_LEAF_WS_PORT"; do
+  label="${label_url%%:*}"; url="${label_url#*:}"
+  sub_pids=()
+
+  for s in 1 2 3; do
+    nats bench sub smoke.wsfan --msgs $MSGS --size $SIZE --no-progress \
+      -s "$url" >/dev/null 2>&1 &
+    sub_pids+=($!)
+  done
+  sleep 0.3
+
+  nats bench pub smoke.wsfan --msgs $MSGS --size $SIZE --no-progress \
+    -s "$url" >/dev/null 2>&1
+
+  all_ok=true
+  for pid in "${sub_pids[@]}"; do
+    wait "$pid" 2>/dev/null || all_ok=false
+  done
+  $all_ok && pass "$label ws fan-out x3" || fail "$label ws fan-out x3"
+done
+
+# --- 9. WebSocket mixed: WS pub → TCP sub (same server) ---
+echo ""
+echo "[9] Mixed: WS pub → TCP sub"
+for label in "GoLeaf" "RustLeaf"; do
+  if [ "$label" = "GoLeaf" ]; then
+    ws_url="ws://127.0.0.1:$GO_LEAF_WS_PORT"
+    tcp_url="nats://127.0.0.1:$GO_LEAF_PORT"
+  else
+    ws_url="ws://127.0.0.1:$RUST_LEAF_WS_PORT"
+    tcp_url="nats://127.0.0.1:$RUST_LEAF_PORT"
+  fi
+
+  nats bench sub smoke.mix --msgs $MSGS --size $SIZE --no-progress \
+    -s "$tcp_url" >/dev/null 2>&1 &
+  sub_pid=$!
+  sleep 0.3
+
+  nats bench pub smoke.mix --msgs $MSGS --size $SIZE --no-progress \
+    -s "$ws_url" >/dev/null 2>&1
+
+  wait "$sub_pid" 2>/dev/null \
+    && pass "$label ws→tcp" || fail "$label ws→tcp"
 done
 
 echo ""

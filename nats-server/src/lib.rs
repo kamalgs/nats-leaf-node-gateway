@@ -21,6 +21,7 @@ pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
 pub(crate) mod upstream;
+pub(crate) mod websocket;
 pub(crate) mod worker;
 
 pub use server::{LeafServer, LeafServerConfig};

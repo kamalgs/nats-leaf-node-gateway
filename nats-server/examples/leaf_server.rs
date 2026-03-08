@@ -5,6 +5,7 @@
 //   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:7422
 //   cargo run --example leaf_server -- --workers 8
 //   cargo run --example leaf_server -- --read-buf-max 32768 --write-buf-size 32768
+//   cargo run --example leaf_server -- --ws-port 8222
 
 use nats_server::{LeafServer, LeafServerConfig};
 
@@ -49,11 +50,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.workers = args[i].parse().expect("invalid workers count");
             }
+            "--ws-port" => {
+                i += 1;
+                config.ws_port =
+                    Some(args[i].parse().expect("invalid ws-port"));
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
                     "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
-                     [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N]"
+                     [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
+                     [--ws-port PORT]"
                 );
                 std::process::exit(1);
             }
@@ -67,6 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if let Some(ref hub) = config.hub_url {
         println!("Upstream hub: {hub}");
+    }
+    if let Some(ws_port) = config.ws_port {
+        println!("WebSocket port: {ws_port}");
     }
 
     let server = LeafServer::new(config);

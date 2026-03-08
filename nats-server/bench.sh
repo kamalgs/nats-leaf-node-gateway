@@ -7,7 +7,9 @@
 #   3. Local fan-out       — 1 pub + 5 subs on same server (fan-out delivery)
 #   4. Leaf→Hub pub/sub    — pub on leaf, sub on hub (upstream forwarding)
 #   5. Hub→Leaf pub/sub    — pub on hub, sub on leaf (downstream delivery)
-#   6. Request/Reply       — service request/reply latency
+#   6. WS pub/sub          — 1 pub + 1 sub over WebSocket
+#   7. WS fan-out x5       — 1 pub + 5 subs over WebSocket
+#   8. WS fan-out x10      — 1 pub + 10 subs over WebSocket (high fan-out)
 #
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
@@ -42,7 +44,9 @@ done
 HUB_CLIENT_PORT=4333
 HUB_LEAF_PORT=7422
 GO_LEAF_PORT=4225
+GO_LEAF_WS_PORT=4226
 RUST_LEAF_PORT=5223
+RUST_LEAF_WS_PORT=5224
 
 # PID tracking for cleanup
 PIDS=()
@@ -68,7 +72,8 @@ for cmd in nats-server nats cargo; do
 done
 
 # Check ports are free
-for port in $HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $RUST_LEAF_PORT; do
+for port in $HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $GO_LEAF_WS_PORT \
+            $RUST_LEAF_PORT $RUST_LEAF_WS_PORT; do
   if ss -tln 2>/dev/null | grep -q ":${port} "; then
     echo "ERROR: port $port already in use"
     exit 1
@@ -94,15 +99,16 @@ nats-server -c "$SCRIPT_DIR/configs/bench_hub.conf" &
 PIDS+=($!)
 sleep 1
 
-# --- Start Go native leaf ---
-echo "Starting Go native leaf (port=$GO_LEAF_PORT)..."
-nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf.conf" &
+# --- Start Go native leaf (with WebSocket) ---
+echo "Starting Go native leaf (tcp=$GO_LEAF_PORT, ws=$GO_LEAF_WS_PORT)..."
+nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf_ws.conf" &
 PIDS+=($!)
 sleep 1
 
-# --- Start Rust leaf ---
-echo "Starting Rust leaf (port=$RUST_LEAF_PORT)..."
-"$RUST_BIN" --port "$RUST_LEAF_PORT" --hub "nats://127.0.0.1:$HUB_LEAF_PORT" &
+# --- Start Rust leaf (with WebSocket) ---
+echo "Starting Rust leaf (tcp=$RUST_LEAF_PORT, ws=$RUST_LEAF_WS_PORT)..."
+"$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
+  --hub "nats://127.0.0.1:$HUB_LEAF_PORT" &
 PIDS+=($!)
 sleep 2
 
@@ -112,7 +118,9 @@ echo "Verifying connectivity..."
 nats pub _bench.ping pong -s "nats://127.0.0.1:$HUB_CLIENT_PORT" >/dev/null 2>&1 || { echo "FAIL: hub"; exit 1; }
 nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_PORT"    >/dev/null 2>&1 || { echo "FAIL: go leaf"; exit 1; }
 nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF_PORT"  >/dev/null 2>&1 || { echo "FAIL: rust leaf"; exit 1; }
-echo "All servers responding."
+nats pub _bench.ping pong -s "ws://127.0.0.1:$GO_LEAF_WS_PORT"   >/dev/null 2>&1 || { echo "FAIL: go leaf ws"; exit 1; }
+nats pub _bench.ping pong -s "ws://127.0.0.1:$RUST_LEAF_WS_PORT" >/dev/null 2>&1 || { echo "FAIL: rust leaf ws"; exit 1; }
+echo "All servers responding (TCP + WebSocket)."
 echo ""
 
 # Kill any lingering background bench processes
@@ -127,12 +135,12 @@ kill_bg() {
 # Scenario 1: Publish Only (fire-and-forget ingest)
 # ──────────────────────────────────────────────────────────────────────
 run_pub_only() {
-  local label="$1" port="$2"
+  local label="$1" url="$2"
   echo "--- $label ---"
   for i in $(seq 1 "$RUNS"); do
     nats bench pub bench.test \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$port" 2>&1 | grep -E "stats:"
+      -s "$url" 2>&1 | grep -E "stats:"
   done
   echo ""
 }
@@ -142,9 +150,9 @@ echo "  1. PUBLISH ONLY (fire-and-forget, no subscribers)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_pub_only "Direct Hub"       "$HUB_CLIENT_PORT"
-run_pub_only "Go Native Leaf"   "$GO_LEAF_PORT"
-run_pub_only "Rust Leaf"        "$RUST_LEAF_PORT"
+run_pub_only "Direct Hub"       "nats://127.0.0.1:$HUB_CLIENT_PORT"
+run_pub_only "Go Native Leaf"   "nats://127.0.0.1:$GO_LEAF_PORT"
+run_pub_only "Rust Leaf"        "nats://127.0.0.1:$RUST_LEAF_PORT"
 
 # ──────────────────────────────────────────────────────────────────────
 # Scenario 2: Local Pub/Sub (1 publisher + 1 subscriber, same server)
@@ -159,14 +167,15 @@ wait_or_kill() {
   fi
 }
 
-run_local_pubsub() {
-  local label="$1" port="$2" subs="$3"
-  local url="nats://127.0.0.1:$port"
+# Generic pub/sub benchmark using full URLs.
+# Pub and sub use the same URL. Supports nats:// and ws:// schemes.
+run_url_pubsub() {
+  local label="$1" url="$2" subs="$3" subject="${4:-bench.ps.test}"
   echo "--- $label ---"
   for i in $(seq 1 "$RUNS"); do
     # Start subscriber(s) in background
     for s in $(seq 1 "$subs"); do
-      nats bench sub "bench.ps.test" \
+      nats bench sub "$subject" \
         --msgs "$MSGS" --size "$SIZE" --no-progress \
         -s "$url" >"/tmp/bench_sub_${s}.out" 2>&1 &
       BG_PIDS+=($!)
@@ -174,7 +183,7 @@ run_local_pubsub() {
     sleep 0.5  # let subscribers connect and register
 
     # Run publisher (foreground) — its output has the pub stats
-    nats bench pub "bench.ps.test" \
+    nats bench pub "$subject" \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$url" 2>&1 | grep -E "stats:"
 
@@ -196,9 +205,9 @@ echo "  2. LOCAL PUB/SUB (1 pub + 1 sub, same server)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_local_pubsub "Direct Hub"       "$HUB_CLIENT_PORT" 1
-run_local_pubsub "Go Native Leaf"   "$GO_LEAF_PORT"    1
-run_local_pubsub "Rust Leaf"        "$RUST_LEAF_PORT"  1
+run_url_pubsub "Direct Hub"       "nats://127.0.0.1:$HUB_CLIENT_PORT" 1
+run_url_pubsub "Go Native Leaf"   "nats://127.0.0.1:$GO_LEAF_PORT"    1
+run_url_pubsub "Rust Leaf"        "nats://127.0.0.1:$RUST_LEAF_PORT"  1
 
 # ──────────────────────────────────────────────────────────────────────
 # Scenario 3: Fan-out (1 pub + 5 subs, same server)
@@ -208,17 +217,15 @@ echo "  3. FAN-OUT (1 pub + 5 subs, same server)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_local_pubsub "Direct Hub"       "$HUB_CLIENT_PORT" 5
-run_local_pubsub "Go Native Leaf"   "$GO_LEAF_PORT"    5
-run_local_pubsub "Rust Leaf"        "$RUST_LEAF_PORT"  5
+run_url_pubsub "Direct Hub"       "nats://127.0.0.1:$HUB_CLIENT_PORT" 5
+run_url_pubsub "Go Native Leaf"   "nats://127.0.0.1:$GO_LEAF_PORT"    5
+run_url_pubsub "Rust Leaf"        "nats://127.0.0.1:$RUST_LEAF_PORT"  5
 
 # ──────────────────────────────────────────────────────────────────────
 # Scenario 4: Leaf→Hub (pub on leaf, sub on hub)
 # ──────────────────────────────────────────────────────────────────────
 run_cross_pubsub() {
-  local label="$1" pub_port="$2" sub_port="$3"
-  local pub_url="nats://127.0.0.1:$pub_port"
-  local sub_url="nats://127.0.0.1:$sub_port"
+  local label="$1" pub_url="$2" sub_url="$3"
   echo "--- $label ---"
   for i in $(seq 1 "$RUNS"); do
     # Subscriber on destination server
@@ -249,8 +256,8 @@ echo "  4. LEAF → HUB (pub on leaf, sub on hub)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub "Go Leaf → Hub"    "$GO_LEAF_PORT"    "$HUB_CLIENT_PORT"
-run_cross_pubsub "Rust Leaf → Hub"  "$RUST_LEAF_PORT"  "$HUB_CLIENT_PORT"
+run_cross_pubsub "Go Leaf → Hub"    "nats://127.0.0.1:$GO_LEAF_PORT"   "nats://127.0.0.1:$HUB_CLIENT_PORT"
+run_cross_pubsub "Rust Leaf → Hub"  "nats://127.0.0.1:$RUST_LEAF_PORT" "nats://127.0.0.1:$HUB_CLIENT_PORT"
 
 # ──────────────────────────────────────────────────────────────────────
 # Scenario 5: Hub→Leaf (pub on hub, sub on leaf)
@@ -260,8 +267,41 @@ echo "  5. HUB → LEAF (pub on hub, sub on leaf)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub "Hub → Go Leaf"    "$HUB_CLIENT_PORT" "$GO_LEAF_PORT"
-run_cross_pubsub "Hub → Rust Leaf"  "$HUB_CLIENT_PORT" "$RUST_LEAF_PORT"
+run_cross_pubsub "Hub → Go Leaf"    "nats://127.0.0.1:$HUB_CLIENT_PORT" "nats://127.0.0.1:$GO_LEAF_PORT"
+run_cross_pubsub "Hub → Rust Leaf"  "nats://127.0.0.1:$HUB_CLIENT_PORT" "nats://127.0.0.1:$RUST_LEAF_PORT"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 6: WebSocket Pub/Sub (1 pub + 1 sub over WS)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  6. WEBSOCKET PUB/SUB (1 pub + 1 sub, same server, ws://)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_url_pubsub "Go Leaf WS"    "ws://127.0.0.1:$GO_LEAF_WS_PORT"   1 "bench.ws.test"
+run_url_pubsub "Rust Leaf WS"  "ws://127.0.0.1:$RUST_LEAF_WS_PORT" 1 "bench.ws.test"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 7: WebSocket Fan-out x5 (1 pub + 5 subs over WS)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  7. WEBSOCKET FAN-OUT x5 (1 pub + 5 subs, same server, ws://)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_url_pubsub "Go Leaf WS"    "ws://127.0.0.1:$GO_LEAF_WS_PORT"   5 "bench.ws.fan5"
+run_url_pubsub "Rust Leaf WS"  "ws://127.0.0.1:$RUST_LEAF_WS_PORT" 5 "bench.ws.fan5"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 8: WebSocket Fan-out x10 (1 pub + 10 subs over WS)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  8. WEBSOCKET FAN-OUT x10 (1 pub + 10 subs, same server, ws://)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_url_pubsub "Go Leaf WS"    "ws://127.0.0.1:$GO_LEAF_WS_PORT"   10 "bench.ws.fan10"
+run_url_pubsub "Rust Leaf WS"  "ws://127.0.0.1:$RUST_LEAF_WS_PORT" 10 "bench.ws.fan10"
 
 echo "================================================================"
 echo "  BENCHMARK COMPLETE"

@@ -27,6 +27,7 @@ use crate::protocol::{AdaptiveBuf, ClientOp};
 use crate::server::ServerState;
 use crate::sub_list::{create_eventfd, DirectWriter, Subscription};
 use crate::upstream::UpstreamCmd;
+use crate::websocket::{self, DecodeStatus, WsCodec};
 
 /// Sentinel key in epoll_event.u64 for the worker's eventfd.
 const EVENT_FD_KEY: u64 = 0;
@@ -38,6 +39,7 @@ pub(crate) enum WorkerCmd {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
+        is_websocket: bool,
     },
     Shutdown,
 }
@@ -50,8 +52,19 @@ pub(crate) struct WorkerHandle {
 
 impl WorkerHandle {
     /// Send a new connection to this worker and wake it.
-    pub fn send_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let _ = self.tx.send(WorkerCmd::NewConn { id, stream, addr });
+    pub fn send_conn(
+        &self,
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+        is_websocket: bool,
+    ) {
+        let _ = self.tx.send(WorkerCmd::NewConn {
+            id,
+            stream,
+            addr,
+            is_websocket,
+        });
         self.wake();
     }
 
@@ -76,12 +89,28 @@ impl WorkerHandle {
 // --- Connection state machine ---
 
 enum ConnPhase {
+    /// WebSocket: waiting for HTTP upgrade request.
+    WsHandshake,
     /// INFO queued in write_buf, waiting to be flushed.
     SendInfo,
     /// INFO sent, waiting for CONNECT from client.
     WaitConnect,
     /// Normal operation.
     Active,
+}
+
+/// Transport layer for a client connection.
+enum Transport {
+    /// Raw TCP — NATS protocol bytes directly on the socket.
+    Raw,
+    /// WebSocket — NATS protocol inside WebSocket binary frames.
+    WebSocket {
+        codec: WsCodec,
+        /// Raw bytes read from the socket (WebSocket-framed).
+        raw_buf: BytesMut,
+        /// Encoded WebSocket frames ready to write to the socket.
+        ws_out: BytesMut,
+    },
 }
 
 struct ClientState {
@@ -93,6 +122,7 @@ struct ClientState {
     direct_buf: Arc<Mutex<BytesMut>>,
     has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
+    transport: Transport,
     #[allow(dead_code)]
     conn_id: u64,
     upstream_tx: Option<mpsc::Sender<UpstreamCmd>>,
@@ -248,8 +278,13 @@ impl Worker {
         // Check for new connections / shutdown
         while let Ok(cmd) = self.rx.try_recv() {
             match cmd {
-                WorkerCmd::NewConn { id, stream, addr } => {
-                    self.add_conn(id, stream, addr);
+                WorkerCmd::NewConn {
+                    id,
+                    stream,
+                    addr,
+                    is_websocket,
+                } => {
+                    self.add_conn(id, stream, addr, is_websocket);
                 }
                 WorkerCmd::Shutdown => {
                     self.shutdown = true;
@@ -261,7 +296,7 @@ impl Worker {
         // so we don't need to call it here.
     }
 
-    fn add_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+    fn add_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr, is_websocket: bool) {
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
@@ -292,8 +327,23 @@ impl Worker {
             Arc::clone(&self.event_fd),
         );
 
-        let mut write_buf = BytesMut::with_capacity(4096);
-        write_buf.extend_from_slice(&self.info_line);
+        let (phase, transport, write_buf) = if is_websocket {
+            // WS: wait for HTTP upgrade before sending INFO
+            (
+                ConnPhase::WsHandshake,
+                Transport::WebSocket {
+                    codec: WsCodec::new(),
+                    raw_buf: BytesMut::with_capacity(4096),
+                    ws_out: BytesMut::with_capacity(4096),
+                },
+                BytesMut::with_capacity(4096),
+            )
+        } else {
+            // Raw TCP: send INFO immediately
+            let mut wb = BytesMut::with_capacity(4096);
+            wb.extend_from_slice(&self.info_line);
+            (ConnPhase::SendInfo, Transport::Raw, wb)
+        };
 
         let client = ClientState {
             fd,
@@ -303,7 +353,8 @@ impl Worker {
             direct_writer,
             direct_buf,
             has_pending,
-            phase: ConnPhase::SendInfo,
+            phase,
+            transport,
             conn_id: id,
             upstream_tx: None,
             epoll_has_out: false,
@@ -312,10 +363,13 @@ impl Worker {
         self.fd_to_conn.insert(fd, id);
         self.conns.insert(id, client);
 
-        debug!(id, addr = %addr, "accepted connection on worker");
-
-        // Try to flush INFO immediately
-        self.try_flush_conn(id);
+        if is_websocket {
+            debug!(id, addr = %addr, "accepted websocket connection on worker");
+        } else {
+            debug!(id, addr = %addr, "accepted connection on worker");
+            // Try to flush INFO immediately
+            self.try_flush_conn(id);
+        }
     }
 
     fn remove_conn(&mut self, conn_id: u64) {
@@ -353,14 +407,30 @@ impl Worker {
                 }
             }
 
-            // Inline flush to avoid borrow issues with self.try_flush_conn
+            // For WebSocket: encode write_buf into ws_out, then write ws_out
+            let (write_ptr, write_len) = match &mut client.transport {
+                Transport::Raw => {
+                    (client.write_buf.as_ptr(), client.write_buf.len())
+                }
+                Transport::WebSocket { ws_out, .. } => {
+                    if !client.write_buf.is_empty() {
+                        WsCodec::encode(&client.write_buf, ws_out);
+                        client.write_buf.clear();
+                    }
+                    (ws_out.as_ptr(), ws_out.len())
+                }
+            };
+
+            // Inline flush
             let mut error = false;
-            while !client.write_buf.is_empty() {
+            let mut written_total = 0usize;
+            let total = write_len;
+            while written_total < total {
                 let n = unsafe {
                     libc::write(
                         client.fd,
-                        client.write_buf.as_ptr() as *const libc::c_void,
-                        client.write_buf.len(),
+                        write_ptr.add(written_total) as *const libc::c_void,
+                        total - written_total,
                     )
                 };
                 if n < 0 {
@@ -375,7 +445,17 @@ impl Worker {
                     error = true;
                     break;
                 }
-                client.write_buf.advance(n as usize);
+                written_total += n as usize;
+            }
+
+            // Advance the appropriate buffer
+            match &mut client.transport {
+                Transport::Raw => {
+                    client.write_buf.advance(written_total);
+                }
+                Transport::WebSocket { ws_out, .. } => {
+                    ws_out.advance(written_total);
+                }
             }
 
             if error {
@@ -383,7 +463,11 @@ impl Worker {
                 continue;
             }
 
-            if client.write_buf.is_empty() && client.epoll_has_out {
+            let is_empty = match &client.transport {
+                Transport::Raw => client.write_buf.is_empty(),
+                Transport::WebSocket { ws_out, .. } => ws_out.is_empty(),
+            };
+            if is_empty && client.epoll_has_out {
                 epoll_mod(epoll_fd, client.fd, *conn_id, false);
                 client.epoll_has_out = false;
             }
@@ -410,6 +494,7 @@ impl Worker {
     }
 
     /// Try to flush write_buf to the socket. Registers/removes EPOLLOUT as needed.
+    /// For WebSocket connections, write_buf is encoded into ws_out first.
     fn try_flush_conn(&mut self, conn_id: u64) {
         let epoll_fd = self.epoll_fd.as_raw_fd();
 
@@ -418,12 +503,38 @@ impl Worker {
             None => return,
         };
 
-        while !client.write_buf.is_empty() {
+        // For WebSocket: encode pending write_buf into ws_out
+        // Exception: during WsHandshake, write_buf contains raw HTTP response
+        if matches!(client.transport, Transport::WebSocket { .. })
+            && !matches!(client.phase, ConnPhase::WsHandshake)
+            && !client.write_buf.is_empty()
+        {
+            if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                WsCodec::encode(&client.write_buf, ws_out);
+                client.write_buf.clear();
+            }
+        }
+
+        // Determine which buffer to flush
+        let flush_ws = matches!(client.transport, Transport::WebSocket { .. })
+            && !matches!(client.phase, ConnPhase::WsHandshake);
+
+        let buf = if flush_ws {
+            if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                ws_out
+            } else {
+                unreachable!()
+            }
+        } else {
+            &mut client.write_buf
+        };
+
+        while !buf.is_empty() {
             let n = unsafe {
                 libc::write(
                     client.fd,
-                    client.write_buf.as_ptr() as *const libc::c_void,
-                    client.write_buf.len(),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
                 )
             };
             if n < 0 {
@@ -436,11 +547,11 @@ impl Worker {
                     return;
                 }
                 // Write error — remove connection
-                let _ = client;
+                let _ = buf;
                 self.remove_conn(conn_id);
                 return;
             }
-            client.write_buf.advance(n as usize);
+            buf.advance(n as usize);
         }
 
         // All data flushed
@@ -456,8 +567,20 @@ impl Worker {
     }
 
     fn handle_read(&mut self, conn_id: u64) {
+        let is_ws = matches!(
+            self.conns.get(&conn_id).map(|c| &c.transport),
+            Some(Transport::WebSocket { .. })
+        );
+
+        if is_ws {
+            self.handle_read_ws(conn_id);
+        } else {
+            self.handle_read_raw(conn_id);
+        }
+    }
+
+    fn handle_read_raw(&mut self, conn_id: u64) {
         // Read from socket in a loop until WouldBlock to drain the kernel buffer.
-        // This reduces the number of epoll_wait returns.
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
@@ -479,11 +602,122 @@ impl Worker {
             }
         }
 
-        // Parse and handle ops
         self.process_read_buf(conn_id);
+        self.flush_notifications();
+    }
 
-        // Send batched eventfd notifications to remote workers.
-        // This amortizes N_pubs * N_workers eventfd writes down to just N_workers.
+    fn handle_read_ws(&mut self, conn_id: u64) {
+        // For WsHandshake phase, read directly into read_buf (raw HTTP bytes)
+        let is_handshake = matches!(
+            self.conns.get(&conn_id).map(|c| &c.phase),
+            Some(ConnPhase::WsHandshake)
+        );
+
+        if is_handshake {
+            // During handshake, read HTTP bytes into read_buf directly
+            loop {
+                let client = match self.conns.get_mut(&conn_id) {
+                    Some(c) => c,
+                    None => return,
+                };
+                match client.read_buf.read_from_fd(client.fd) {
+                    Ok(0) => {
+                        self.remove_conn(conn_id);
+                        return;
+                    }
+                    Ok(n) => {
+                        client.read_buf.after_read(n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        self.remove_conn(conn_id);
+                        return;
+                    }
+                }
+            }
+            self.process_read_buf(conn_id);
+            return;
+        }
+
+        // Active WS: read into raw_buf, decode frames into read_buf
+        loop {
+            let client = match self.conns.get_mut(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
+            let raw_buf = if let Transport::WebSocket { raw_buf, .. } = &mut client.transport {
+                raw_buf
+            } else {
+                return;
+            };
+            // Read from socket into raw_buf
+            raw_buf.reserve(4096);
+            let spare = raw_buf.spare_capacity_mut();
+            let n = unsafe {
+                libc::read(
+                    client.fd,
+                    spare.as_mut_ptr() as *mut libc::c_void,
+                    spare.len(),
+                )
+            };
+            if n == 0 {
+                self.remove_conn(conn_id);
+                return;
+            }
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                self.remove_conn(conn_id);
+                return;
+            }
+            unsafe { raw_buf.set_len(raw_buf.len() + n as usize) };
+        }
+
+        // Decode WS frames into read_buf
+        let mut close = false;
+        let mut decode_err = false;
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::WebSocket {
+                codec, raw_buf, ..
+            } = &mut client.transport
+            {
+                loop {
+                    match codec.decode(raw_buf, &mut *client.read_buf) {
+                        Ok(DecodeStatus::Complete) => continue,
+                        Ok(DecodeStatus::NeedMore) => break,
+                        Ok(DecodeStatus::Close) => {
+                            close = true;
+                            break;
+                        }
+                        Err(_) => {
+                            decode_err = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if decode_err {
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        if close {
+            // Send close frame back
+            if let Some(client) = self.conns.get_mut(&conn_id) {
+                if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                    WsCodec::encode_close(ws_out);
+                }
+            }
+            self.try_flush_conn(conn_id);
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        self.process_read_buf(conn_id);
         self.flush_notifications();
     }
 
@@ -491,12 +725,54 @@ impl Worker {
         loop {
             let phase = match self.conns.get(&conn_id) {
                 Some(c) => match c.phase {
+                    ConnPhase::WsHandshake => 0,
                     ConnPhase::SendInfo => return,
                     ConnPhase::WaitConnect => 1,
                     ConnPhase::Active => 2,
                 },
                 None => return,
             };
+
+            if phase == 0 {
+                // WsHandshake: parse HTTP upgrade request
+                let result = {
+                    let client = self.conns.get(&conn_id).unwrap();
+                    websocket::parse_ws_upgrade(&client.read_buf)
+                };
+                match result {
+                    None => return, // need more data
+                    Some(Err(_)) => {
+                        // Bad upgrade request
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client.write_buf.extend_from_slice(
+                                b"HTTP/1.1 400 Bad Request\r\n\r\n",
+                            );
+                        }
+                        self.try_flush_conn(conn_id);
+                        self.remove_conn(conn_id);
+                        return;
+                    }
+                    Some(Ok((upgrade, consumed))) => {
+                        let response = websocket::build_ws_accept_response(&upgrade.key);
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        // Consume HTTP request from read_buf
+                        client.read_buf.advance(consumed);
+                        // Write raw HTTP 101 response directly to ws_out
+                        // (bypassing WS framing since this is the upgrade response)
+                        if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                            ws_out.extend_from_slice(&response);
+                        }
+                        // Queue INFO in write_buf (will be WS-encoded by try_flush_conn)
+                        let info_line = self.info_line.clone();
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        client.write_buf.extend_from_slice(&info_line);
+                        // Now transition to SendInfo
+                        client.phase = ConnPhase::SendInfo;
+                        self.try_flush_conn(conn_id);
+                    }
+                }
+                continue;
+            }
 
             if phase == 1 {
                 // WaitConnect: parse CONNECT

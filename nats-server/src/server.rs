@@ -38,6 +38,9 @@ pub struct LeafServerConfig {
     pub write_buf_capacity: usize,
     /// Number of worker threads (default: available parallelism or 4).
     pub workers: usize,
+    /// Optional WebSocket port. When set, a second listener accepts WebSocket
+    /// connections on this port (NATS protocol over WebSocket binary frames).
+    pub ws_port: Option<u16>,
 }
 
 impl Default for LeafServerConfig {
@@ -53,6 +56,7 @@ impl Default for LeafServerConfig {
             max_read_buf_capacity: 65536,
             write_buf_capacity: 65536,
             workers,
+            ws_port: None,
         }
     }
 }
@@ -162,11 +166,12 @@ impl LeafServer {
         addr: std::net::SocketAddr,
         workers: &[WorkerHandle],
         next_worker: &mut usize,
+        is_websocket: bool,
     ) {
         let cid = self.state.next_client_id();
         let idx = *next_worker % workers.len();
         *next_worker = idx + 1;
-        workers[idx].send_conn(cid, tcp_stream, addr);
+        workers[idx].send_conn(cid, tcp_stream, addr, is_websocket);
     }
 
     /// Run the leaf server. Listens for connections and optionally
@@ -181,12 +186,64 @@ impl LeafServer {
         let listener = TcpListener::bind(&bind_addr)?;
         info!(addr = %bind_addr, "leaf server listening (tcp)");
 
-        loop {
-            match listener.accept() {
-                Ok((tcp_stream, addr)) => {
-                    self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker);
+        let ws_listener = if let Some(ws_port) = self.config.ws_port {
+            let ws_addr = format!("{}:{}", self.config.host, ws_port);
+            let wl = TcpListener::bind(&ws_addr)?;
+            info!(addr = %ws_addr, "leaf server listening (websocket)");
+            Some(wl)
+        } else {
+            None
+        };
+
+        if let Some(ref ws_listener) = ws_listener {
+            // Poll both listeners
+            listener.set_nonblocking(true)?;
+            ws_listener.set_nonblocking(true)?;
+            let tcp_fd = listener.as_raw_fd();
+            let ws_fd = ws_listener.as_raw_fd();
+            let mut pfds = [
+                libc::pollfd {
+                    fd: tcp_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: ws_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+
+            loop {
+                pfds[0].revents = 0;
+                pfds[1].revents = 0;
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err.into());
                 }
-                Err(e) => error!(error = %e, "failed to accept connection"),
+                if pfds[0].revents & libc::POLLIN != 0 {
+                    while let Ok((stream, addr)) = listener.accept() {
+                        self.accept_tcp(stream, addr, &workers, &mut next_worker, false);
+                    }
+                }
+                if pfds[1].revents & libc::POLLIN != 0 {
+                    while let Ok((stream, addr)) = ws_listener.accept() {
+                        self.accept_tcp(stream, addr, &workers, &mut next_worker, true);
+                    }
+                }
+            }
+        } else {
+            loop {
+                match listener.accept() {
+                    Ok((tcp_stream, addr)) => {
+                        self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker, false);
+                    }
+                    Err(e) => error!(error = %e, "failed to accept connection"),
+                }
             }
         }
     }
@@ -206,14 +263,35 @@ impl LeafServer {
 
         let bind_addr = format!("{}:{}", self.config.host, self.config.port);
         let listener = TcpListener::bind(&bind_addr)?;
+        listener.set_nonblocking(true)?;
         info!(addr = %bind_addr, "leaf server listening (tcp)");
 
-        let listener_fd = listener.as_raw_fd();
-        let mut pfd = [libc::pollfd {
-            fd: listener_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        }];
+        let ws_listener = if let Some(ws_port) = self.config.ws_port {
+            let ws_addr = format!("{}:{}", self.config.host, ws_port);
+            let wl = TcpListener::bind(&ws_addr)?;
+            wl.set_nonblocking(true)?;
+            info!(addr = %ws_addr, "leaf server listening (websocket)");
+            Some(wl)
+        } else {
+            None
+        };
+
+        let nfds = if ws_listener.is_some() { 2 } else { 1 };
+        let mut pfds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: ws_listener
+                    .as_ref()
+                    .map(|l| l.as_raw_fd())
+                    .unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
 
         loop {
             if shutdown.load(Ordering::Relaxed) {
@@ -221,8 +299,10 @@ impl LeafServer {
                 break;
             }
 
-            pfd[0].revents = 0;
-            let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 1000) }; // 1s timeout
+            pfds[0].revents = 0;
+            pfds[1].revents = 0;
+            let ret =
+                unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -232,12 +312,23 @@ impl LeafServer {
                 return Err(err.into());
             }
 
-            if ret > 0 && pfd[0].revents & libc::POLLIN != 0 {
-                match listener.accept() {
-                    Ok((tcp_stream, addr)) => {
-                        self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker);
+            if ret > 0 && pfds[0].revents & libc::POLLIN != 0 {
+                while let Ok((tcp_stream, addr)) = listener.accept() {
+                    self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker, false);
+                }
+            }
+
+            if ret > 0 && pfds[1].revents & libc::POLLIN != 0 {
+                if let Some(ref ws_listener) = ws_listener {
+                    while let Ok((tcp_stream, addr)) = ws_listener.accept() {
+                        self.accept_tcp(
+                            tcp_stream,
+                            addr,
+                            &workers,
+                            &mut next_worker,
+                            true,
+                        );
                     }
-                    Err(e) => error!(error = %e, "failed to accept connection"),
                 }
             }
         }
