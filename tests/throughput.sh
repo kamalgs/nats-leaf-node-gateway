@@ -17,7 +17,7 @@
 #   - cargo (Rust toolchain)
 #
 # Usage:
-#   cd bench && ./throughput.sh
+#   cd tests && ./throughput.sh
 #   ./throughput.sh --msgs 500000 --size 256 --runs 2
 
 set -euo pipefail
