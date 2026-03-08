@@ -7,12 +7,16 @@
 //   cargo run -- --read-buf-max 32768 --write-buf-size 32768
 //   cargo run -- --ws-port 8222
 
+use tracing_subscriber::EnvFilter;
+
 use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing if tracing-subscriber is available
-    #[cfg(feature = "_example_tracing")]
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let mut config = LeafServerConfig::default();
 
@@ -96,6 +100,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hub_creds.creds_file = Some(args[i].clone());
                 has_hub_creds = true;
             }
+            "--metrics-port" => {
+                i += 1;
+                config.metrics_port = Some(args[i].parse().expect("invalid metrics-port"));
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
@@ -103,7 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
                      [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
                      [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
-                     [--hub-token TOKEN] [--hub-creds PATH]"
+                     [--hub-token TOKEN] [--hub-creds PATH] \
+                     [--metrics-port PORT]"
                 );
                 std::process::exit(1);
             }
@@ -133,6 +142,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(ws_port) = config.ws_port {
         println!("WebSocket port: {ws_port}");
+    }
+    if let Some(metrics_port) = config.metrics_port {
+        println!("Metrics port: {metrics_port}");
     }
 
     let server = LeafServer::new(config);

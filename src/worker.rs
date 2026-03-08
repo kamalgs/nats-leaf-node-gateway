@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bytes::{Buf, Bytes, BytesMut};
+use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
 use crate::nats_proto;
@@ -146,6 +147,8 @@ pub(crate) struct Worker {
     /// Deduplicates across multiple PUBs in the same read buffer.
     pending_notify: [RawFd; 16],
     pending_notify_count: usize,
+    /// Worker index label for metrics.
+    worker_label: String,
 }
 
 impl Worker {
@@ -195,6 +198,7 @@ impl Worker {
                     shutdown: false,
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
+                    worker_label: index.to_string(),
                 };
                 worker.run();
             })
@@ -367,6 +371,10 @@ impl Worker {
         self.fd_to_conn.insert(fd, id);
         self.conns.insert(id, client);
 
+        counter!("connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+
         if is_websocket {
             debug!(id, addr = %addr, "accepted websocket connection on worker");
         } else {
@@ -388,6 +396,8 @@ impl Worker {
             }
             self.fd_to_conn.remove(&client.fd);
             cleanup_conn(conn_id, &self.state);
+            gauge!("connections_active", "worker" => self.worker_label.clone())
+                .set(self.conns.len() as f64);
             debug!(conn_id, "connection removed");
         }
     }
@@ -426,6 +436,8 @@ impl Worker {
                         max = max_pending,
                         "slow consumer, disconnecting"
                     );
+                    counter!("slow_consumers_total", "worker" => self.worker_label.clone())
+                        .increment(1);
                     to_remove.push(*conn_id);
                     continue;
                 }
@@ -850,6 +862,11 @@ impl Worker {
                             .validate(&connect_info, &self.state.info.nonce)
                         {
                             warn!(conn_id, "authorization violation");
+                            counter!(
+                                "auth_failures_total",
+                                "worker" => self.worker_label.clone()
+                            )
+                            .increment(1);
                             if let Some(client) = self.conns.get_mut(&conn_id) {
                                 client
                                     .write_buf
@@ -979,6 +996,11 @@ impl Worker {
                     }
                 }
 
+                gauge!(
+                    "subscriptions_active",
+                    "worker" => self.worker_label.clone()
+                )
+                .increment(1.0);
                 debug!(conn_id, sid, subject = %subject_str, "client subscribed");
             }
             ClientOp::Unsubscribe { sid, max: _ } => {
@@ -996,6 +1018,11 @@ impl Worker {
                     if let Some(ref mut up) = *upstream {
                         up.remove_interest(&removed.subject);
                     }
+                    gauge!(
+                        "subscriptions_active",
+                        "worker" => self.worker_label.clone()
+                    )
+                    .decrement(1.0);
                     debug!(conn_id, sid, subject = %removed.subject, "client unsubscribed");
                 }
             }
@@ -1006,11 +1033,24 @@ impl Worker {
                 headers,
                 ..
             } => {
+                let payload_len = payload.len() as u64;
+                counter!(
+                    "messages_received_total",
+                    "worker" => self.worker_label.clone()
+                )
+                .increment(1);
+                counter!(
+                    "messages_received_bytes",
+                    "worker" => self.worker_label.clone()
+                )
+                .increment(payload_len);
+
                 {
                     let my_event_fd = self.event_fd.as_raw_fd();
                     let pending_notify = &mut self.pending_notify;
                     let pending_count = &mut self.pending_notify_count;
                     let pub_echo = self.conns.get(&conn_id).map(|c| c.echo).unwrap_or(true);
+                    let worker_label = &self.worker_label;
 
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
@@ -1027,6 +1067,16 @@ impl Worker {
                             headers.as_ref(),
                             &payload,
                         );
+                        counter!(
+                            "messages_delivered_total",
+                            "worker" => worker_label.clone()
+                        )
+                        .increment(1);
+                        counter!(
+                            "messages_delivered_bytes",
+                            "worker" => worker_label.clone()
+                        )
+                        .increment(payload_len);
                         // Skip notification for our own worker — flush_pending
                         // runs after the event loop iteration.
                         let fd = sub.writer.event_raw_fd();

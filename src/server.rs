@@ -139,6 +139,8 @@ pub struct LeafServerConfig {
     pub client_auth: ClientAuth,
     /// Credentials for connecting to the upstream hub.
     pub hub_credentials: Option<HubCredentials>,
+    /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for LeafServerConfig {
@@ -160,8 +162,19 @@ impl Default for LeafServerConfig {
             max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
             hub_credentials: None,
+            metrics_port: None,
         }
     }
+}
+
+/// Install the Prometheus metrics exporter on the given port.
+///
+/// Spawns a background HTTP listener thread serving `/metrics` in Prometheus
+/// text format. Uses `metrics-exporter-prometheus` which is sync-compatible.
+fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    builder.with_http_listener(([0, 0, 0, 0], port)).install()?;
+    Ok(())
 }
 
 /// Shared server state accessible by all client connections.
@@ -312,6 +325,11 @@ impl LeafServer {
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(port) = self.config.metrics_port {
+            install_metrics_exporter(port)?;
+            info!(port, "prometheus metrics endpoint listening");
+        }
+
         self.connect_upstream()?;
 
         let workers = self.spawn_workers();
@@ -391,6 +409,11 @@ impl LeafServer {
         &self,
         shutdown: Arc<AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(port) = self.config.metrics_port {
+            install_metrics_exporter(port)?;
+            info!(port, "prometheus metrics endpoint listening");
+        }
+
         self.connect_upstream()?;
 
         let workers = self.spawn_workers();
@@ -679,5 +702,23 @@ mod tests {
         assert!(nonce
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    // --- install_metrics_exporter ---
+
+    #[test]
+    fn install_metrics_exporter_does_not_panic() {
+        // Port 0 lets the OS pick an available port. install() sets a global
+        // recorder, so this can only succeed once per process. If another test
+        // has already installed a recorder, install() returns Err — that's fine.
+        let _ = install_metrics_exporter(0);
+    }
+
+    // --- metrics_port config ---
+
+    #[test]
+    fn default_metrics_port_is_none() {
+        let config = LeafServerConfig::default();
+        assert!(config.metrics_port.is_none());
     }
 }
