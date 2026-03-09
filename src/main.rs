@@ -7,14 +7,26 @@
 //   cargo run -- --read-buf-max 32768 --write-buf-size 32768
 //   cargo run -- --ws-port 8222
 
-use open_wire::{LeafServer, LeafServerConfig};
+use tracing_subscriber::EnvFilter;
+
+use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing if tracing-subscriber is available
-    #[cfg(feature = "_example_tracing")]
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let mut config = LeafServerConfig::default();
+
+    // Accumulate auth-related CLI values before building config
+    let mut auth_token: Option<String> = None;
+    let mut auth_user: Option<String> = None;
+    let mut auth_pass: Option<String> = None;
+    let mut auth_nkeys: Vec<String> = Vec::new();
+    let mut hub_creds = HubCredentials::default();
+    let mut has_hub_creds = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -38,13 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--read-buf-max" => {
                 i += 1;
-                config.max_read_buf_capacity =
-                    args[i].parse().expect("invalid read-buf-max");
+                config.max_read_buf_capacity = args[i].parse().expect("invalid read-buf-max");
             }
             "--write-buf-size" => {
                 i += 1;
-                config.write_buf_capacity =
-                    args[i].parse().expect("invalid write-buf-size");
+                config.write_buf_capacity = args[i].parse().expect("invalid write-buf-size");
             }
             "--workers" | "-w" => {
                 i += 1;
@@ -52,20 +62,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--ws-port" => {
                 i += 1;
-                config.ws_port =
-                    Some(args[i].parse().expect("invalid ws-port"));
+                config.ws_port = Some(args[i].parse().expect("invalid ws-port"));
+            }
+            "--token" => {
+                i += 1;
+                auth_token = Some(args[i].clone());
+            }
+            "--user" => {
+                i += 1;
+                auth_user = Some(args[i].clone());
+            }
+            "--pass" => {
+                i += 1;
+                auth_pass = Some(args[i].clone());
+            }
+            "--nkey" => {
+                i += 1;
+                auth_nkeys.push(args[i].clone());
+            }
+            "--hub-user" => {
+                i += 1;
+                hub_creds.user = Some(args[i].clone());
+                has_hub_creds = true;
+            }
+            "--hub-pass" => {
+                i += 1;
+                hub_creds.pass = Some(args[i].clone());
+                has_hub_creds = true;
+            }
+            "--hub-token" => {
+                i += 1;
+                hub_creds.token = Some(args[i].clone());
+                has_hub_creds = true;
+            }
+            "--hub-creds" => {
+                i += 1;
+                hub_creds.creds_file = Some(args[i].clone());
+                has_hub_creds = true;
+            }
+            "--metrics-port" => {
+                i += 1;
+                config.metrics_port = Some(args[i].parse().expect("invalid metrics-port"));
             }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
-                    "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
+                    "Usage: open-wire [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
                      [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
-                     [--ws-port PORT]"
+                     [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
+                     [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
+                     [--hub-token TOKEN] [--hub-creds PATH] \
+                     [--metrics-port PORT]"
                 );
                 std::process::exit(1);
             }
         }
         i += 1;
+    }
+
+    // Build client auth from CLI flags
+    if !auth_nkeys.is_empty() {
+        config.client_auth = ClientAuth::NKey(auth_nkeys);
+    } else if let Some(token) = auth_token {
+        config.client_auth = ClientAuth::Token(token);
+    } else if let (Some(user), Some(pass)) = (auth_user, auth_pass) {
+        config.client_auth = ClientAuth::UserPass { user, pass };
+    }
+
+    if has_hub_creds {
+        config.hub_credentials = Some(hub_creds);
     }
 
     println!(
@@ -77,6 +142,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(ws_port) = config.ws_port {
         println!("WebSocket port: {ws_port}");
+    }
+    if let Some(metrics_port) = config.metrics_port {
+        println!("Metrics port: {metrics_port}");
     }
 
     let server = LeafServer::new(config);

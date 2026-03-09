@@ -13,12 +13,98 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 
-use crate::types::ServerInfo;
+use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::protocol::BufConfig;
 use crate::sub_list::SubList;
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
+
+/// Downstream client authentication configuration.
+#[derive(Debug, Clone, Default)]
+pub enum ClientAuth {
+    /// No authentication required (default).
+    #[default]
+    None,
+    /// Single token. Client sends `auth_token` in CONNECT.
+    Token(String),
+    /// Single user/password pair.
+    UserPass { user: String, pass: String },
+    /// NKey public key allowlist. Server sends nonce in INFO;
+    /// client signs nonce and sends `nkey` + `sig` in CONNECT.
+    NKey(Vec<String>),
+}
+
+impl ClientAuth {
+    /// Returns `true` if authentication is required.
+    pub fn is_required(&self) -> bool {
+        !matches!(self, ClientAuth::None)
+    }
+
+    /// Returns `true` if the auth mode requires a nonce in INFO.
+    pub fn needs_nonce(&self) -> bool {
+        matches!(self, ClientAuth::NKey(_))
+    }
+
+    /// Validate a client's CONNECT info against the configured auth.
+    pub fn validate(&self, info: &ConnectInfo, nonce: &str) -> bool {
+        match self {
+            ClientAuth::None => true,
+            ClientAuth::Token(t) => info.auth_token.as_deref() == Some(t.as_str()),
+            ClientAuth::UserPass { user, pass } => {
+                info.user.as_deref() == Some(user.as_str())
+                    && info.pass.as_deref() == Some(pass.as_str())
+            }
+            ClientAuth::NKey(allowed_keys) => {
+                let nkey = match info.nkey.as_deref() {
+                    Some(k) => k,
+                    None => return false,
+                };
+                if !allowed_keys.iter().any(|k| k == nkey) {
+                    return false;
+                }
+                let sig = match info.signature.as_deref() {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let sig_bytes = match data_encoding::BASE64URL_NOPAD.decode(sig.as_bytes()) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        // Try standard base64 as fallback (some clients use it)
+                        match data_encoding::BASE64.decode(sig.as_bytes()) {
+                            Ok(b) => b,
+                            Err(_) => return false,
+                        }
+                    }
+                };
+                match nkeys::KeyPair::from_public_key(nkey) {
+                    Ok(kp) => kp.verify(nonce.as_bytes(), &sig_bytes).is_ok(),
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+}
+
+/// Credentials for connecting to an upstream hub server.
+#[derive(Debug, Clone, Default)]
+pub struct HubCredentials {
+    /// Username for user/password auth.
+    pub user: Option<String>,
+    /// Password for user/password auth.
+    pub pass: Option<String>,
+    /// Token for token auth.
+    pub token: Option<String>,
+    /// Path to a `.creds` file (JWT + NKey seed) for NKey/JWT auth.
+    pub creds_file: Option<String>,
+}
+
+/// Generate a random nonce for NKey challenge-response auth.
+fn generate_nonce() -> String {
+    let mut data = [0u8; 11];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut data);
+    data_encoding::BASE64URL_NOPAD.encode(&data)
+}
 
 /// Configuration for the leaf node server.
 #[derive(Debug, Clone)]
@@ -41,6 +127,20 @@ pub struct LeafServerConfig {
     /// Optional WebSocket port. When set, a second listener accepts WebSocket
     /// connections on this port (NATS protocol over WebSocket binary frames).
     pub ws_port: Option<u16>,
+    /// Maximum pending write bytes per connection before disconnecting as a
+    /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
+    pub max_pending: usize,
+    /// Interval between server-initiated PING keepalives (default: 2 minutes).
+    /// Set to `Duration::ZERO` to disable keepalive.
+    pub ping_interval: std::time::Duration,
+    /// Maximum outstanding PINGs before closing a connection (default: 2).
+    pub max_pings_outstanding: u32,
+    /// Client authentication configuration.
+    pub client_auth: ClientAuth,
+    /// Credentials for connecting to the upstream hub.
+    pub hub_credentials: Option<HubCredentials>,
+    /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for LeafServerConfig {
@@ -57,13 +157,32 @@ impl Default for LeafServerConfig {
             write_buf_capacity: 65536,
             workers,
             ws_port: None,
+            max_pending: 64 * 1024 * 1024,
+            ping_interval: std::time::Duration::from_secs(120),
+            max_pings_outstanding: 2,
+            client_auth: ClientAuth::None,
+            hub_credentials: None,
+            metrics_port: None,
         }
     }
+}
+
+/// Install the Prometheus metrics exporter on the given port.
+///
+/// Spawns a background HTTP listener thread serving `/metrics` in Prometheus
+/// text format. Uses `metrics-exporter-prometheus` which is sync-compatible.
+fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
+    builder.with_http_listener(([0, 0, 0, 0], port)).install()?;
+    Ok(())
 }
 
 /// Shared server state accessible by all client connections.
 pub(crate) struct ServerState {
     pub info: ServerInfo,
+    pub auth: ClientAuth,
+    pub ping_interval: std::time::Duration,
+    pub max_pings_outstanding: u32,
     pub subs: std::sync::RwLock<SubList>,
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
@@ -78,9 +197,18 @@ pub(crate) struct ServerState {
 }
 
 impl ServerState {
-    fn new(info: ServerInfo, buf_config: BufConfig) -> Self {
+    fn new(
+        info: ServerInfo,
+        auth: ClientAuth,
+        ping_interval: std::time::Duration,
+        max_pings_outstanding: u32,
+        buf_config: BufConfig,
+    ) -> Self {
         Self {
             info,
+            auth,
+            ping_interval,
+            max_pings_outstanding,
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: std::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
@@ -107,6 +235,12 @@ pub struct LeafServer {
 impl LeafServer {
     /// Create a new leaf server with the given configuration.
     pub fn new(config: LeafServerConfig) -> Self {
+        let nonce = if config.client_auth.needs_nonce() {
+            generate_nonce()
+        } else {
+            String::new()
+        };
+
         let info = ServerInfo {
             server_id: format!("LEAF_{}", rand::random::<u32>()),
             server_name: config.server_name.clone(),
@@ -116,17 +250,27 @@ impl LeafServer {
             headers: true,
             host: config.host.clone(),
             port: config.port,
+            auth_required: config.client_auth.is_required(),
+            nonce,
             ..Default::default()
         };
 
         let buf_config = BufConfig {
             max_read_buf: config.max_read_buf_capacity,
             write_buf: config.write_buf_capacity,
+            max_pending: config.max_pending,
         };
 
+        let auth = config.client_auth.clone();
         Self {
-            config,
-            state: Arc::new(ServerState::new(info, buf_config)),
+            config: config.clone(),
+            state: Arc::new(ServerState::new(
+                info,
+                auth,
+                config.ping_interval,
+                config.max_pings_outstanding,
+                buf_config,
+            )),
         }
     }
 
@@ -134,7 +278,11 @@ impl LeafServer {
     fn connect_upstream(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref hub_url) = self.config.hub_url {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
-            match Upstream::connect(hub_url, Arc::clone(&self.state)) {
+            match Upstream::connect(
+                hub_url,
+                self.config.hub_credentials.as_ref(),
+                Arc::clone(&self.state),
+            ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
                     *self.state.upstream.write().unwrap() = Some(upstream);
@@ -177,6 +325,11 @@ impl LeafServer {
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(port) = self.config.metrics_port {
+            install_metrics_exporter(port)?;
+            info!(port, "prometheus metrics endpoint listening");
+        }
+
         self.connect_upstream()?;
 
         let workers = self.spawn_workers();
@@ -256,6 +409,11 @@ impl LeafServer {
         &self,
         shutdown: Arc<AtomicBool>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(port) = self.config.metrics_port {
+            install_metrics_exporter(port)?;
+            info!(port, "prometheus metrics endpoint listening");
+        }
+
         self.connect_upstream()?;
 
         let workers = self.spawn_workers();
@@ -284,10 +442,7 @@ impl LeafServer {
                 revents: 0,
             },
             libc::pollfd {
-                fd: ws_listener
-                    .as_ref()
-                    .map(|l| l.as_raw_fd())
-                    .unwrap_or(-1),
+                fd: ws_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -301,8 +456,7 @@ impl LeafServer {
 
             pfds[0].revents = 0;
             pfds[1].revents = 0;
-            let ret =
-                unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 1000) };
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -321,13 +475,7 @@ impl LeafServer {
             if ret > 0 && pfds[1].revents & libc::POLLIN != 0 {
                 if let Some(ref ws_listener) = ws_listener {
                     while let Ok((tcp_stream, addr)) = ws_listener.accept() {
-                        self.accept_tcp(
-                            tcp_stream,
-                            addr,
-                            &workers,
-                            &mut next_worker,
-                            true,
-                        );
+                        self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker, true);
                     }
                 }
             }
@@ -352,5 +500,225 @@ impl LeafServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- is_required / needs_nonce ---
+
+    #[test]
+    fn none_not_required() {
+        let auth = ClientAuth::None;
+        assert!(!auth.is_required());
+        assert!(!auth.needs_nonce());
+    }
+
+    #[test]
+    fn token_required_no_nonce() {
+        let auth = ClientAuth::Token("secret".into());
+        assert!(auth.is_required());
+        assert!(!auth.needs_nonce());
+    }
+
+    #[test]
+    fn userpass_required_no_nonce() {
+        let auth = ClientAuth::UserPass {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+        assert!(auth.is_required());
+        assert!(!auth.needs_nonce());
+    }
+
+    #[test]
+    fn nkey_required_needs_nonce() {
+        let auth = ClientAuth::NKey(vec!["UABC".into()]);
+        assert!(auth.is_required());
+        assert!(auth.needs_nonce());
+    }
+
+    // --- ClientAuth::None ---
+
+    #[test]
+    fn none_always_passes() {
+        let auth = ClientAuth::None;
+        let info = ConnectInfo::default();
+        assert!(auth.validate(&info, ""));
+    }
+
+    // --- ClientAuth::Token ---
+
+    #[test]
+    fn token_match() {
+        let auth = ClientAuth::Token("secret".into());
+        let info = ConnectInfo {
+            auth_token: Some("secret".into()),
+            ..Default::default()
+        };
+        assert!(auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn token_mismatch() {
+        let auth = ClientAuth::Token("secret".into());
+        let info = ConnectInfo {
+            auth_token: Some("wrong".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn token_absent() {
+        let auth = ClientAuth::Token("secret".into());
+        let info = ConnectInfo::default();
+        assert!(!auth.validate(&info, ""));
+    }
+
+    // --- ClientAuth::UserPass ---
+
+    #[test]
+    fn userpass_match() {
+        let auth = ClientAuth::UserPass {
+            user: "admin".into(),
+            pass: "password".into(),
+        };
+        let info = ConnectInfo {
+            user: Some("admin".into()),
+            pass: Some("password".into()),
+            ..Default::default()
+        };
+        assert!(auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn userpass_wrong_pass() {
+        let auth = ClientAuth::UserPass {
+            user: "admin".into(),
+            pass: "password".into(),
+        };
+        let info = ConnectInfo {
+            user: Some("admin".into()),
+            pass: Some("wrong".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn userpass_missing_user() {
+        let auth = ClientAuth::UserPass {
+            user: "admin".into(),
+            pass: "password".into(),
+        };
+        let info = ConnectInfo {
+            pass: Some("password".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, ""));
+    }
+
+    // --- ClientAuth::NKey ---
+
+    #[test]
+    fn nkey_valid_signature() {
+        let kp = nkeys::KeyPair::new_user();
+        let pub_key = kp.public_key();
+        let nonce = "testnonce123";
+        let sig = kp.sign(nonce.as_bytes()).unwrap();
+        let sig_b64 = data_encoding::BASE64URL_NOPAD.encode(&sig);
+
+        let auth = ClientAuth::NKey(vec![pub_key.clone()]);
+        let info = ConnectInfo {
+            nkey: Some(pub_key),
+            signature: Some(sig_b64),
+            ..Default::default()
+        };
+        assert!(auth.validate(&info, nonce));
+    }
+
+    #[test]
+    fn nkey_wrong_key_rejected() {
+        let kp = nkeys::KeyPair::new_user();
+        let other_kp = nkeys::KeyPair::new_user();
+        let nonce = "testnonce";
+        let sig = kp.sign(nonce.as_bytes()).unwrap();
+        let sig_b64 = data_encoding::BASE64URL_NOPAD.encode(&sig);
+
+        // Allowlist has a different key
+        let auth = ClientAuth::NKey(vec![other_kp.public_key()]);
+        let info = ConnectInfo {
+            nkey: Some(kp.public_key()),
+            signature: Some(sig_b64),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, nonce));
+    }
+
+    #[test]
+    fn nkey_bad_signature_rejected() {
+        let kp = nkeys::KeyPair::new_user();
+        let pub_key = kp.public_key();
+        let auth = ClientAuth::NKey(vec![pub_key.clone()]);
+
+        let info = ConnectInfo {
+            nkey: Some(pub_key),
+            signature: Some("badsig".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, "nonce"));
+    }
+
+    #[test]
+    fn nkey_missing_sig() {
+        let kp = nkeys::KeyPair::new_user();
+        let pub_key = kp.public_key();
+        let auth = ClientAuth::NKey(vec![pub_key.clone()]);
+        let info = ConnectInfo {
+            nkey: Some(pub_key),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, "nonce"));
+    }
+
+    #[test]
+    fn nkey_missing_key() {
+        let auth = ClientAuth::NKey(vec!["UABC".into()]);
+        let info = ConnectInfo::default();
+        assert!(!auth.validate(&info, "nonce"));
+    }
+
+    // --- generate_nonce ---
+
+    #[test]
+    fn generate_nonce_length() {
+        let nonce = generate_nonce();
+        // 11 bytes base64url-no-pad = ceil(11*4/3) = 15 chars
+        assert_eq!(nonce.len(), 15);
+        // Should be valid base64url characters
+        assert!(nonce
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    // --- install_metrics_exporter ---
+
+    #[test]
+    fn install_metrics_exporter_does_not_panic() {
+        // Port 0 lets the OS pick an available port. install() sets a global
+        // recorder, so this can only succeed once per process. If another test
+        // has already installed a recorder, install() returns Err — that's fine.
+        let _ = install_metrics_exporter(0);
+    }
+
+    // --- metrics_port config ---
+
+    #[test]
+    fn default_metrics_port_is_none() {
+        let config = LeafServerConfig::default();
+        assert!(config.metrics_port.is_none());
     }
 }

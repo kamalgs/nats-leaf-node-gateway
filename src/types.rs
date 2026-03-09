@@ -116,10 +116,7 @@ impl HeaderMap {
 
     /// Append a value to the given header key (allows multiple values per key).
     pub fn append(&mut self, name: &str, value: String) {
-        self.inner
-            .entry(name.to_owned())
-            .or_default()
-            .push(value);
+        self.inner.entry(name.to_owned()).or_default().push(value);
     }
 
     /// Set a header key to a single value, replacing any existing values.
@@ -129,7 +126,10 @@ impl HeaderMap {
 
     /// Get the first value for a header key (case-sensitive).
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.inner.get(name).and_then(|v| v.first()).map(|s| s.as_str())
+        self.inner
+            .get(name)
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
     }
 
     /// Serialize headers to NATS wire format:

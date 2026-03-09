@@ -6,6 +6,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use std::collections::HashMap;
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -15,8 +16,8 @@ use tracing::{debug, error, warn};
 
 use crate::types::HeaderMap;
 
-use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
-use crate::server::ServerState;
+use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter, UpstreamConnectCreds};
+use crate::server::{HubCredentials, ServerState};
 use crate::sub_list::DirectWriter;
 
 /// Commands sent from the Upstream handle to the background writer thread.
@@ -52,9 +53,10 @@ impl Upstream {
     /// threads that read from the hub and write commands batched together.
     pub(crate) fn connect(
         hub_url: &str,
+        config_creds: Option<&HubCredentials>,
         state: Arc<ServerState>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let addr = parse_hub_addr(hub_url)?;
+        let (addr, url_creds) = parse_hub_url(hub_url)?;
         let tcp = TcpStream::connect(&addr)?;
         tcp.set_nodelay(true)?;
 
@@ -63,11 +65,15 @@ impl Upstream {
 
         let mut leaf = LeafConn::new(tcp, state.buf_config);
 
+        // Merge URL-extracted creds with config-level creds (config wins)
+        let merged = merge_hub_credentials(&url_creds, config_creds);
+
         // --- Handshake ---
         // 1. Read INFO from hub
-        match leaf.read_leaf_op()? {
-            Some(LeafOp::Info(_info)) => {
+        let hub_nonce = match leaf.read_leaf_op()? {
+            Some(LeafOp::Info(hub_info)) => {
                 debug!("received INFO from hub");
+                hub_info.nonce.clone()
             }
             Some(other) => {
                 return Err(format!("expected INFO from hub, got: {other:?}").into());
@@ -75,10 +81,16 @@ impl Upstream {
             None => {
                 return Err("hub closed connection before INFO".into());
             }
-        }
+        };
 
-        // 2. Send CONNECT (leaf-style) + PING
-        leaf.send_leaf_connect("rust-leaf", true)?;
+        // 2. Build credentials and send CONNECT (leaf-style) + PING
+        let connect_creds = build_upstream_creds(&merged, &hub_nonce)?;
+        let creds_ref = if has_any_creds(&connect_creds) {
+            Some(&connect_creds)
+        } else {
+            None
+        };
+        leaf.send_leaf_connect("rust-leaf", true, creds_ref)?;
         leaf.send_ping()?;
         leaf.flush()?;
 
@@ -366,16 +378,286 @@ fn handle_hub_op(
     Ok(())
 }
 
-/// Parse a hub URL like "nats://host:port" into "host:port".
-fn parse_hub_addr(url: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Parse a hub URL like "nats://user:pass@host:port" into (addr, HubCredentials).
+///
+/// Supported formats:
+/// - `nats://host:port` — no credentials
+/// - `nats://token@host:port` — token auth (no colon in userinfo)
+/// - `nats://user:pass@host:port` — user/pass auth
+/// - `host:port` — bare address, no credentials
+fn parse_hub_url(url: &str) -> Result<(String, HubCredentials), Box<dyn std::error::Error>> {
     let stripped = url
         .strip_prefix("nats://")
         .or_else(|| url.strip_prefix("nats-leaf://"))
         .unwrap_or(url);
-    if stripped.contains(':') {
-        Ok(stripped.to_string())
+
+    let mut creds = HubCredentials::default();
+
+    // Check for userinfo@ — use rfind('@') to handle passwords with '@'
+    let host_port = if let Some(at_pos) = stripped.rfind('@') {
+        let userinfo = &stripped[..at_pos];
+        let rest = &stripped[at_pos + 1..];
+
+        if let Some(colon_pos) = userinfo.find(':') {
+            // user:pass
+            creds.user = Some(userinfo[..colon_pos].to_string());
+            creds.pass = Some(userinfo[colon_pos + 1..].to_string());
+        } else {
+            // token only
+            creds.token = Some(userinfo.to_string());
+        }
+        rest
+    } else {
+        stripped
+    };
+
+    let addr = if host_port.contains(':') {
+        host_port.to_string()
     } else {
         // Default leafnode port
-        Ok(format!("{stripped}:7422"))
+        format!("{host_port}:7422")
+    };
+
+    Ok((addr, creds))
+}
+
+/// Merge URL-extracted credentials with config-level credentials.
+/// Config-level fields take precedence over URL fields.
+fn merge_hub_credentials(
+    url_creds: &HubCredentials,
+    config_creds: Option<&HubCredentials>,
+) -> HubCredentials {
+    let config = match config_creds {
+        Some(c) => c,
+        None => return url_creds.clone(),
+    };
+
+    HubCredentials {
+        user: config.user.clone().or_else(|| url_creds.user.clone()),
+        pass: config.pass.clone().or_else(|| url_creds.pass.clone()),
+        token: config.token.clone().or_else(|| url_creds.token.clone()),
+        creds_file: config
+            .creds_file
+            .clone()
+            .or_else(|| url_creds.creds_file.clone()),
+    }
+}
+
+/// Parse a NATS `.creds` file containing a JWT and NKey seed.
+///
+/// The file format uses markers:
+/// ```text
+/// -----BEGIN NATS USER JWT-----
+/// <jwt>
+/// ------END NATS USER JWT------
+/// -----BEGIN USER NKEY SEED-----
+/// <seed>
+/// ------END USER NKEY SEED------
+/// ```
+fn parse_creds_file(path: &str) -> io::Result<(String, nkeys::KeyPair)> {
+    let contents = std::fs::read_to_string(path)?;
+
+    let jwt = extract_between(
+        &contents,
+        "-----BEGIN NATS USER JWT-----",
+        "------END NATS USER JWT------",
+    )
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing JWT in creds file"))?
+    .trim()
+    .to_string();
+
+    let seed = extract_between(
+        &contents,
+        "-----BEGIN USER NKEY SEED-----",
+        "------END USER NKEY SEED------",
+    )
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing NKey seed in creds file",
+        )
+    })?
+    .trim();
+
+    let kp = nkeys::KeyPair::from_seed(seed).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid NKey seed: {e}"),
+        )
+    })?;
+
+    Ok((jwt, kp))
+}
+
+/// Extract text between two marker lines.
+fn extract_between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
+    let start = text.find(begin)?;
+    let after_begin = start + begin.len();
+    let end_pos = text[after_begin..].find(end)?;
+    Some(&text[after_begin..after_begin + end_pos])
+}
+
+/// Build `UpstreamConnectCreds` from merged hub credentials and the hub's nonce.
+fn build_upstream_creds(
+    creds: &HubCredentials,
+    hub_nonce: &str,
+) -> Result<UpstreamConnectCreds, Box<dyn std::error::Error>> {
+    let mut out = UpstreamConnectCreds::default();
+
+    if let Some(ref creds_path) = creds.creds_file {
+        let (jwt, kp) = parse_creds_file(creds_path)?;
+        let sig_bytes = kp
+            .sign(hub_nonce.as_bytes())
+            .map_err(|e| io::Error::other(format!("NKey sign failed: {e}")))?;
+        out.jwt = Some(jwt);
+        out.nkey = Some(kp.public_key());
+        out.sig = Some(data_encoding::BASE64URL_NOPAD.encode(&sig_bytes));
+    }
+
+    // Explicit user/pass/token override creds-file fields
+    if let Some(ref u) = creds.user {
+        out.user = Some(u.clone());
+    }
+    if let Some(ref p) = creds.pass {
+        out.pass = Some(p.clone());
+    }
+    if let Some(ref t) = creds.token {
+        out.token = Some(t.clone());
+    }
+
+    Ok(out)
+}
+
+/// Check if any credential fields are set.
+fn has_any_creds(c: &UpstreamConnectCreds) -> bool {
+    c.user.is_some()
+        || c.pass.is_some()
+        || c.token.is_some()
+        || c.jwt.is_some()
+        || c.nkey.is_some()
+        || c.sig.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_hub_url ---
+
+    #[test]
+    fn parse_bare_host_port() {
+        let (addr, creds) = parse_hub_url("hub.example.com:7422").unwrap();
+        assert_eq!(addr, "hub.example.com:7422");
+        assert!(creds.user.is_none());
+        assert!(creds.pass.is_none());
+        assert!(creds.token.is_none());
+    }
+
+    #[test]
+    fn parse_nats_scheme() {
+        let (addr, creds) = parse_hub_url("nats://hub:7422").unwrap();
+        assert_eq!(addr, "hub:7422");
+        assert!(creds.token.is_none());
+    }
+
+    #[test]
+    fn parse_token_url() {
+        let (addr, creds) = parse_hub_url("nats://mytoken@hub:7422").unwrap();
+        assert_eq!(addr, "hub:7422");
+        assert_eq!(creds.token.as_deref(), Some("mytoken"));
+        assert!(creds.user.is_none());
+    }
+
+    #[test]
+    fn parse_userpass_url() {
+        let (addr, creds) = parse_hub_url("nats://admin:secret@hub:7422").unwrap();
+        assert_eq!(addr, "hub:7422");
+        assert_eq!(creds.user.as_deref(), Some("admin"));
+        assert_eq!(creds.pass.as_deref(), Some("secret"));
+        assert!(creds.token.is_none());
+    }
+
+    #[test]
+    fn parse_default_port() {
+        let (addr, _) = parse_hub_url("nats://hub").unwrap();
+        assert_eq!(addr, "hub:7422");
+    }
+
+    #[test]
+    fn parse_nats_leaf_scheme() {
+        let (addr, _) = parse_hub_url("nats-leaf://hub:7422").unwrap();
+        assert_eq!(addr, "hub:7422");
+    }
+
+    // --- merge_hub_credentials ---
+
+    #[test]
+    fn merge_config_wins() {
+        let url = HubCredentials {
+            user: Some("url_user".into()),
+            pass: Some("url_pass".into()),
+            ..Default::default()
+        };
+        let cfg = HubCredentials {
+            user: Some("cfg_user".into()),
+            ..Default::default()
+        };
+        let merged = merge_hub_credentials(&url, Some(&cfg));
+        assert_eq!(merged.user.as_deref(), Some("cfg_user"));
+        // pass falls back to URL
+        assert_eq!(merged.pass.as_deref(), Some("url_pass"));
+    }
+
+    #[test]
+    fn merge_no_config() {
+        let url = HubCredentials {
+            token: Some("t".into()),
+            ..Default::default()
+        };
+        let merged = merge_hub_credentials(&url, None);
+        assert_eq!(merged.token.as_deref(), Some("t"));
+    }
+
+    // --- parse_creds_file ---
+
+    #[test]
+    fn parse_creds_file_valid() {
+        let kp = nkeys::KeyPair::new_user();
+        let seed = kp.seed().unwrap();
+        let content = format!(
+            "-----BEGIN NATS USER JWT-----\n\
+             eyJhbGciOiJlZDI1NTE5LW5rZXkifQ.test.jwt\n\
+             ------END NATS USER JWT------\n\
+             \n\
+             -----BEGIN USER NKEY SEED-----\n\
+             {seed}\n\
+             ------END USER NKEY SEED------\n"
+        );
+
+        let dir = std::env::temp_dir().join("open_wire_test_creds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.creds");
+        std::fs::write(&path, &content).unwrap();
+
+        let (jwt, parsed_kp) = parse_creds_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(jwt, "eyJhbGciOiJlZDI1NTE5LW5rZXkifQ.test.jwt");
+        assert_eq!(parsed_kp.public_key(), kp.public_key());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- extract_between ---
+
+    #[test]
+    fn extract_between_works() {
+        let text = "AAA---BEGIN---\nhello\n---END---BBB";
+        let result = extract_between(text, "---BEGIN---", "---END---");
+        assert_eq!(result, Some("\nhello\n"));
+    }
+
+    #[test]
+    fn extract_between_missing() {
+        let result = extract_between("no markers", "---BEGIN---", "---END---");
+        assert!(result.is_none());
     }
 }

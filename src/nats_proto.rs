@@ -320,8 +320,8 @@ fn parse_connect(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         None => return proto_err(buf, "CONNECT missing args"),
     };
     let json = &line[space + 1..trim_cr(line, nl)];
-    let info: ConnectInfo = serde_json::from_slice(json)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let info: ConnectInfo =
+        serde_json::from_slice(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     buf.advance(nl + 1);
     Ok(Some(ClientOp::Connect(info)))
 }
@@ -851,9 +851,9 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
         if line.is_empty() {
             continue;
         }
-        let (name, value) = line.split_once(':').ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid header line")
-        })?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid header line"))?;
         let mut value = value.trim_start().to_owned();
         while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
             value.push_str(v);
@@ -1370,8 +1370,7 @@ mod tests {
 
     #[test]
     fn test_leaf_info() {
-        let mut buf =
-            BytesMut::from("INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n");
+        let mut buf = BytesMut::from("INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n");
         match try_parse_leaf_op(&mut buf).unwrap().unwrap() {
             LeafOp::Info(info) => {
                 assert_eq!(info.server_id, "hub1");

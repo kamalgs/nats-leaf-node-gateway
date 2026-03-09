@@ -14,6 +14,17 @@ use bytes::{BufMut, BytesMut};
 
 use crate::types::{HeaderMap, ServerInfo};
 
+/// Resolved credentials to include in a leaf CONNECT message to the hub.
+#[derive(Debug, Default)]
+pub(crate) struct UpstreamConnectCreds {
+    pub user: Option<String>,
+    pub pass: Option<String>,
+    pub token: Option<String>,
+    pub jwt: Option<String>,
+    pub nkey: Option<String>,
+    pub sig: Option<String>,
+}
+
 use crate::nats_proto::{self, MsgBuilder};
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
@@ -32,6 +43,9 @@ const SHORTS_TO_SHRINK: u8 = 2;
 pub(crate) struct BufConfig {
     pub max_read_buf: usize,
     pub write_buf: usize,
+    /// Maximum pending write bytes per connection before disconnecting as slow consumer.
+    /// 0 means unlimited.
+    pub max_pending: usize,
 }
 
 impl Default for BufConfig {
@@ -39,6 +53,7 @@ impl Default for BufConfig {
         Self {
             max_read_buf: DEFAULT_MAX_BUF,
             write_buf: DEFAULT_MAX_BUF,
+            max_pending: 64 * 1024 * 1024,
         }
     }
 }
@@ -71,7 +86,9 @@ impl AdaptiveBuf {
             // Buffer was fully utilized — grow
             self.target_cap = (self.target_cap * 2).min(self.max_cap);
             // Ensure we have enough capacity for the next read
-            let additional = self.target_cap.saturating_sub(self.buf.capacity() - self.buf.len());
+            let additional = self
+                .target_cap
+                .saturating_sub(self.buf.capacity() - self.buf.len());
             if additional > 0 {
                 self.buf.reserve(additional);
             }
@@ -106,9 +123,7 @@ impl AdaptiveBuf {
             self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
         }
         let chunk = self.buf.chunk_mut();
-        let n = unsafe {
-            libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-        };
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -195,7 +210,13 @@ impl ServerConn {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) -> io::Result<()> {
-        self.write_msg(subject.as_bytes(), sid, reply.map(|r| r.as_bytes()), headers, payload)?;
+        self.write_msg(
+            subject.as_bytes(),
+            sid,
+            reply.map(|r| r.as_bytes()),
+            headers,
+            payload,
+        )?;
         self.flush()
     }
 
@@ -251,10 +272,7 @@ impl ServerConn {
         self.read_client_op_inner(false)
     }
 
-    pub(crate) fn read_client_op_inner(
-        &mut self,
-        skip_pub: bool,
-    ) -> io::Result<Option<ClientOp>> {
+    pub(crate) fn read_client_op_inner(&mut self, skip_pub: bool) -> io::Result<Option<ClientOp>> {
         loop {
             let parsed = if skip_pub {
                 self.try_skip_or_parse_client_op()?
@@ -375,21 +393,44 @@ impl LeafConn {
         }
     }
 
-    /// Send a leaf node CONNECT to the hub.
+    /// Send a leaf node CONNECT to the hub, optionally including credentials.
     pub(crate) fn send_leaf_connect(
         &mut self,
         name: &str,
         headers: bool,
+        creds: Option<&UpstreamConnectCreds>,
     ) -> io::Result<()> {
-        let json = serde_json::json!({
-            "verbose": false,
-            "pedantic": false,
-            "headers": headers,
-            "no_responders": true,
-            "name": name,
-            "version": "0.5.0",
-            "protocol": 1,
-        });
+        let mut map = serde_json::Map::new();
+        map.insert("verbose".into(), false.into());
+        map.insert("pedantic".into(), false.into());
+        map.insert("headers".into(), headers.into());
+        map.insert("no_responders".into(), true.into());
+        map.insert("name".into(), name.into());
+        map.insert("version".into(), "0.5.0".into());
+        map.insert("protocol".into(), 1.into());
+
+        if let Some(c) = creds {
+            if let Some(ref u) = c.user {
+                map.insert("user".into(), u.clone().into());
+            }
+            if let Some(ref p) = c.pass {
+                map.insert("pass".into(), p.clone().into());
+            }
+            if let Some(ref t) = c.token {
+                map.insert("auth_token".into(), t.clone().into());
+            }
+            if let Some(ref j) = c.jwt {
+                map.insert("jwt".into(), j.clone().into());
+            }
+            if let Some(ref n) = c.nkey {
+                map.insert("nkey".into(), n.clone().into());
+            }
+            if let Some(ref s) = c.sig {
+                map.insert("sig".into(), s.clone().into());
+            }
+        }
+
+        let json = serde_json::Value::Object(map);
         let line = format!("CONNECT {json}\r\n");
         self.stream.write_all(line.as_bytes())
     }
@@ -551,9 +592,7 @@ mod tests {
     fn test_parse_sub() {
         let (mut conn, mut client) = make_pair();
         client.write_all(b"SUB test.subject 1\r\n").unwrap();
-        client
-            .write_all(b"SUB test.queue myqueue 2\r\n")
-            .unwrap();
+        client.write_all(b"SUB test.queue myqueue 2\r\n").unwrap();
         client.flush().unwrap();
 
         let op = conn.read_client_op().unwrap().unwrap();
@@ -746,10 +785,7 @@ mod tests {
             conn.read_leaf_op().unwrap().unwrap(),
             LeafOp::Pong
         ));
-        assert!(matches!(
-            conn.read_leaf_op().unwrap().unwrap(),
-            LeafOp::Ok
-        ));
+        assert!(matches!(conn.read_leaf_op().unwrap().unwrap(), LeafOp::Ok));
         match conn.read_leaf_op().unwrap().unwrap() {
             LeafOp::Err(msg) => assert_eq!(msg, "test error"),
             _ => panic!("expected Err"),
@@ -789,8 +825,7 @@ mod tests {
     #[test]
     fn test_leaf_parse_lmsg_no_reply_no_headers() {
         let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"LMSG test.subject 5\r\nhello\r\n")
-            .unwrap();
+        hub.write_all(b"LMSG test.subject 5\r\nhello\r\n").unwrap();
         hub.flush().unwrap();
 
         match conn.read_leaf_op().unwrap().unwrap() {
@@ -950,5 +985,41 @@ mod tests {
         drop(hub);
         let result = conn.read_leaf_op().unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_leaf_connect_no_creds() {
+        let (mut conn, mut hub) = make_leaf_pair();
+        conn.send_leaf_connect("test-leaf", true, None).unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.starts_with("CONNECT "));
+        assert!(s.ends_with("\r\n"));
+        // Should not contain auth fields
+        assert!(!s.contains("\"user\""));
+        assert!(!s.contains("\"auth_token\""));
+        assert!(s.contains("\"name\":\"test-leaf\""));
+    }
+
+    #[test]
+    fn test_leaf_connect_with_creds() {
+        let (mut conn, mut hub) = make_leaf_pair();
+        let creds = UpstreamConnectCreds {
+            user: Some("admin".into()),
+            pass: Some("secret".into()),
+            token: Some("tok".into()),
+            ..Default::default()
+        };
+        conn.send_leaf_connect("test-leaf", true, Some(&creds))
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        let s = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(s.contains("\"user\":\"admin\""));
+        assert!(s.contains("\"pass\":\"secret\""));
+        assert!(s.contains("\"auth_token\":\"tok\""));
     }
 }
