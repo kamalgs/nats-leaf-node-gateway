@@ -107,7 +107,7 @@ sleep 1
 
 # --- Start Rust leaf (with WebSocket) ---
 echo "Starting Rust leaf (tcp=$RUST_LEAF_PORT, ws=$RUST_LEAF_WS_PORT)..."
-"$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
+RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
   --hub "nats://127.0.0.1:$HUB_LEAF_PORT" &
 PIDS+=($!)
 sleep 2

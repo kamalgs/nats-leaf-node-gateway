@@ -531,20 +531,29 @@ impl Worker {
                 continue;
             }
             client.has_pending.store(false, Ordering::Relaxed);
-            {
+            let direct_data = {
                 let mut dbuf = client.direct_buf.lock().unwrap();
                 if !dbuf.is_empty() {
-                    client.write_buf.extend_from_slice(&dbuf);
-                    dbuf.clear();
+                    if matches!(client.transport, Transport::Raw) {
+                        // O(1) take for Raw — we'll use writev to avoid copying
+                        dbuf.split()
+                    } else {
+                        // WS/TLS need the data in write_buf for transformation
+                        client.write_buf.extend_from_slice(&dbuf);
+                        dbuf.clear();
+                        BytesMut::new()
+                    }
+                } else {
+                    BytesMut::new()
                 }
-            }
+            };
 
             // Slow consumer detection: if pending data exceeds max_pending,
             // disconnect the client to protect server memory.
             let max_pending = self.state.buf_config.max_pending;
             if max_pending > 0 {
                 let pending = match &client.transport {
-                    Transport::Raw => client.write_buf.len(),
+                    Transport::Raw => client.write_buf.len() + direct_data.len(),
                     Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
                     Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
                 };
@@ -584,55 +593,132 @@ impl Worker {
             }
 
             // For WebSocket: encode write_buf into ws_out, then write ws_out
-            let (write_ptr, write_len) = match &mut client.transport {
-                Transport::Raw => (client.write_buf.as_ptr(), client.write_buf.len()),
-                Transport::WebSocket { ws_out, .. } => {
-                    if !client.write_buf.is_empty() {
-                        WsCodec::encode(&client.write_buf, ws_out);
-                        client.write_buf.clear();
+            // For Raw: we use writev with write_buf + direct_data (zero-copy)
+            let is_raw = matches!(client.transport, Transport::Raw);
+            if !is_raw {
+                match &mut client.transport {
+                    Transport::WebSocket { ws_out, .. } => {
+                        if !client.write_buf.is_empty() {
+                            WsCodec::encode(&client.write_buf, ws_out);
+                            client.write_buf.clear();
+                        }
                     }
-                    (ws_out.as_ptr(), ws_out.len())
+                    Transport::Tls(_) => {} // already handled above
+                    Transport::Raw => unreachable!(),
                 }
-                Transport::Tls(ref tls) => (tls.enc_out.as_ptr(), tls.enc_out.len()),
-            };
+            }
 
             // Inline flush
             let mut error = false;
-            let mut written_total = 0usize;
-            let total = write_len;
-            while written_total < total {
-                let n = unsafe {
-                    libc::write(
-                        client.fd,
-                        write_ptr.add(written_total) as *const libc::c_void,
-                        total - written_total,
-                    )
-                };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        if !client.epoll_has_out {
-                            epoll_mod(epoll_fd, client.fd, *conn_id, true);
-                            client.epoll_has_out = true;
+            if is_raw {
+                // writev path: write_buf and direct_data as two iovecs
+                let wb_len = client.write_buf.len();
+                let dd_len = direct_data.len();
+                let total = wb_len + dd_len;
+                let mut written_total = 0usize;
+
+                while written_total < total {
+                    // SAFETY: pointers are valid slices from BytesMut, offsets
+                    // are bounds-checked by the while condition.
+                    let n = unsafe {
+                        if wb_len > 0 && dd_len > 0 && written_total < wb_len {
+                            // Both buffers have data and we haven't finished write_buf
+                            let iovs = [
+                                libc::iovec {
+                                    iov_base: client.write_buf.as_ptr().add(written_total)
+                                        as *mut libc::c_void,
+                                    iov_len: wb_len - written_total,
+                                },
+                                libc::iovec {
+                                    iov_base: direct_data.as_ptr() as *mut libc::c_void,
+                                    iov_len: dd_len,
+                                },
+                            ];
+                            libc::writev(client.fd, iovs.as_ptr(), 2)
+                        } else if written_total < wb_len {
+                            // Only write_buf has data (or direct_data is empty)
+                            libc::write(
+                                client.fd,
+                                client.write_buf.as_ptr().add(written_total) as *const libc::c_void,
+                                wb_len - written_total,
+                            )
+                        } else {
+                            // Past write_buf, writing from direct_data
+                            let dd_offset = written_total - wb_len;
+                            libc::write(
+                                client.fd,
+                                direct_data.as_ptr().add(dd_offset) as *const libc::c_void,
+                                dd_len - dd_offset,
+                            )
                         }
+                    };
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            if !client.epoll_has_out {
+                                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                client.epoll_has_out = true;
+                            }
+                            break;
+                        }
+                        error = true;
                         break;
                     }
-                    error = true;
-                    break;
+                    written_total += n as usize;
                 }
-                written_total += n as usize;
-            }
 
-            // Advance the appropriate buffer
-            match &mut client.transport {
-                Transport::Raw => {
+                // Advance/merge buffers based on how much was written
+                if written_total >= wb_len {
+                    client.write_buf.clear();
+                    let dd_consumed = written_total - wb_len;
+                    if dd_consumed < dd_len {
+                        // Partial write into direct_data — merge remainder into write_buf
+                        client
+                            .write_buf
+                            .extend_from_slice(&direct_data[dd_consumed..]);
+                    }
+                } else {
+                    // Partial write within write_buf — merge all of direct_data
                     client.write_buf.advance(written_total);
+                    if !direct_data.is_empty() {
+                        client.write_buf.extend_from_slice(&direct_data);
+                    }
                 }
-                Transport::WebSocket { ws_out, .. } => {
-                    ws_out.advance(written_total);
+            } else {
+                // WS/TLS: single-buffer write
+                let (write_ptr, write_len) = match &mut client.transport {
+                    Transport::WebSocket { ws_out, .. } => (ws_out.as_ptr(), ws_out.len()),
+                    Transport::Tls(ref tls) => (tls.enc_out.as_ptr(), tls.enc_out.len()),
+                    Transport::Raw => unreachable!(),
+                };
+                let mut written_total = 0usize;
+                let total = write_len;
+                while written_total < total {
+                    let n = unsafe {
+                        libc::write(
+                            client.fd,
+                            write_ptr.add(written_total) as *const libc::c_void,
+                            total - written_total,
+                        )
+                    };
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            if !client.epoll_has_out {
+                                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                client.epoll_has_out = true;
+                            }
+                            break;
+                        }
+                        error = true;
+                        break;
+                    }
+                    written_total += n as usize;
                 }
-                Transport::Tls(ref mut tls) => {
-                    tls.enc_out.advance(written_total);
+                match &mut client.transport {
+                    Transport::WebSocket { ws_out, .. } => ws_out.advance(written_total),
+                    Transport::Tls(ref mut tls) => tls.enc_out.advance(written_total),
+                    Transport::Raw => unreachable!(),
                 }
             }
 

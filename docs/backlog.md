@@ -44,7 +44,7 @@ Items marked ~~strikethrough~~ are already implemented.
 ## Performance Ideas
 
 - **io_uring** — replace epoll with io_uring for batched syscalls.
-- **writev / vectored writes** — coalesce messages into a single syscall.
+- ~~**writev / vectored writes**~~ — coalesce messages into a single syscall.
 - **Connection affinity** — pin publisher and subscribers to the same worker.
 - **Trie-based subject matching** — replace wildcard `Vec` linear scan with a
   trie or radix tree.
