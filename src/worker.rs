@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::nats_proto;
 use crate::protocol::{AdaptiveBuf, ClientOp};
-use crate::reactor::{EpollReactor, Reactor, ERROR, READABLE, WRITABLE};
+use crate::reactor::{EpollReactor, Reactor, ERROR, READABLE, RECV_DONE, SEND_DONE, WRITABLE};
 use crate::server::ServerState;
 use crate::sub_list::{create_eventfd, DirectWriter, Subscription};
 use crate::upstream::UpstreamCmd;
@@ -190,6 +190,16 @@ struct ClientState {
     sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
     permissions: Option<crate::server::Permissions>,
+    /// Buffer frozen during io_uring SEND (split from write_buf before submission).
+    send_buf: Option<BytesMut>,
+    /// Direct data frozen during io_uring SEND.
+    pending_direct: Option<BytesMut>,
+    /// iovecs kept alive during io_uring WRITEV.
+    pending_iovecs: Option<[libc::iovec; 2]>,
+    /// Whether an io_uring RECV is in flight.
+    recv_pending: bool,
+    /// Whether an io_uring SEND is in flight.
+    send_in_flight: bool,
 }
 
 // --- Worker ---
@@ -360,6 +370,12 @@ impl<R: Reactor> Worker<R> {
             for &(key, revents) in events.iter().take(n) {
                 if key == EVENT_FD_KEY {
                     self.handle_eventfd();
+                } else if revents & RECV_DONE != 0 {
+                    let bytes = (revents & 0x3FFF_FFFF) as usize;
+                    self.handle_recv_complete(key, bytes);
+                } else if revents & SEND_DONE != 0 {
+                    let bytes = (revents & 0x3FFF_FFFF) as usize;
+                    self.handle_send_complete(key, bytes);
                 } else {
                     let conn_id = key;
                     if revents & ERROR != 0 {
@@ -439,6 +455,436 @@ impl<R: Reactor> Worker<R> {
         // so we don't need to call it here.
     }
 
+    /// Handle a completed io_uring RECV operation.
+    fn handle_recv_complete(&mut self, conn_id: u64, bytes_read: usize) {
+        if bytes_read == 0 {
+            // EOF or error
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        let transport_type = match self.conns.get(&conn_id).map(|c| &c.transport) {
+            Some(Transport::WebSocket { .. }) => 1,
+            Some(Transport::Tls(..)) => 2,
+            Some(Transport::Raw) => 0,
+            None => return,
+        };
+
+        match transport_type {
+            0 => self.handle_recv_complete_raw(conn_id, bytes_read),
+            1 => self.handle_recv_complete_ws(conn_id, bytes_read),
+            2 => self.handle_recv_complete_tls(conn_id, bytes_read),
+            _ => unreachable!(),
+        }
+    }
+
+    fn handle_recv_complete_raw(&mut self, conn_id: u64, bytes_read: usize) {
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            // SAFETY: bytes_read bytes were written by io_uring RECV.
+            unsafe { client.read_buf.note_recv(bytes_read) };
+            client.recv_pending = false;
+            client.last_activity = Instant::now();
+        }
+
+        self.process_read_buf(conn_id);
+        self.flush_notifications();
+
+        // Submit next RECV
+        self.submit_next_recv(conn_id);
+    }
+
+    fn handle_recv_complete_ws(&mut self, conn_id: u64, bytes_read: usize) {
+        let is_handshake = matches!(
+            self.conns.get(&conn_id).map(|c| &c.phase),
+            Some(ConnPhase::WsHandshake)
+        );
+
+        if is_handshake {
+            // During handshake, data was read into read_buf
+            if let Some(client) = self.conns.get_mut(&conn_id) {
+                unsafe { client.read_buf.note_recv(bytes_read) };
+                client.recv_pending = false;
+            }
+            self.process_read_buf(conn_id);
+            self.submit_next_recv(conn_id);
+            return;
+        }
+
+        // Active WS: data was read into raw_buf
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::WebSocket { raw_buf, .. } = &mut client.transport {
+                unsafe { raw_buf.set_len(raw_buf.len() + bytes_read) };
+            }
+            client.recv_pending = false;
+        }
+
+        // Decode WS frames into read_buf
+        let mut close = false;
+        let mut decode_err = false;
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::WebSocket { codec, raw_buf, .. } = &mut client.transport {
+                loop {
+                    match codec.decode(raw_buf, &mut client.read_buf) {
+                        Ok(DecodeStatus::Complete) => continue,
+                        Ok(DecodeStatus::NeedMore) => break,
+                        Ok(DecodeStatus::Close) => {
+                            close = true;
+                            break;
+                        }
+                        Err(_) => {
+                            decode_err = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if decode_err {
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        if close {
+            if let Some(client) = self.conns.get_mut(&conn_id) {
+                if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                    WsCodec::encode_close(ws_out);
+                }
+            }
+            self.try_flush_conn(conn_id);
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            client.last_activity = Instant::now();
+        }
+        self.process_read_buf(conn_id);
+        self.flush_notifications();
+        self.submit_next_recv(conn_id);
+    }
+
+    fn handle_recv_complete_tls(&mut self, conn_id: u64, bytes_read: usize) {
+        // Data was read into enc_in
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::Tls(ref mut tls) = client.transport {
+                unsafe { tls.enc_in.set_len(tls.enc_in.len() + bytes_read) };
+            }
+            client.recv_pending = false;
+        }
+
+        // Feed encrypted data to TLS and extract plaintext
+        let mut error = false;
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::Tls(ref mut tls) = client.transport {
+                loop {
+                    if tls.enc_in.is_empty() {
+                        break;
+                    }
+                    match tls.tls_conn.read_tls(&mut io::Cursor::new(&tls.enc_in[..])) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            tls.enc_in.advance(n);
+                        }
+                        Err(e) => {
+                            warn!(conn_id, error = %e, "TLS read_tls error");
+                            error = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !error {
+                    match tls.tls_conn.process_new_packets() {
+                        Ok(state) => {
+                            if state.plaintext_bytes_to_read() > 0 {
+                                let n = state.plaintext_bytes_to_read();
+                                client.read_buf.reserve(n);
+                                let chunk = client.read_buf.chunk_mut();
+                                let buf = unsafe {
+                                    std::slice::from_raw_parts_mut(chunk.as_mut_ptr(), chunk.len())
+                                };
+                                match tls.tls_conn.reader().read(buf) {
+                                    Ok(read) => {
+                                        unsafe { client.read_buf.advance_mut(read) };
+                                    }
+                                    Err(e) => {
+                                        warn!(conn_id, error = %e, "TLS plaintext read error");
+                                        error = true;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(conn_id, error = %e, "TLS process error");
+                            error = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if error {
+            self.tls_flush_encrypted(conn_id);
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        self.tls_flush_encrypted(conn_id);
+
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            client.last_activity = Instant::now();
+        }
+        self.process_read_buf(conn_id);
+        self.flush_notifications();
+        self.submit_next_recv(conn_id);
+    }
+
+    /// Submit the next RECV for a connection after processing its data.
+    fn submit_next_recv(&mut self, conn_id: u64) {
+        let client = match self.conns.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return,
+        };
+        if client.recv_pending {
+            return;
+        }
+        let fd = client.fd;
+        let (ptr, len) = match &mut client.transport {
+            Transport::WebSocket { raw_buf, .. }
+                if !matches!(client.phase, ConnPhase::WsHandshake) =>
+            {
+                raw_buf.reserve(4096);
+                let spare = raw_buf.spare_capacity_mut();
+                (spare.as_mut_ptr() as *mut u8, spare.len())
+            }
+            Transport::Tls(ref mut tls) => {
+                tls.enc_in.reserve(8192);
+                let spare = tls.enc_in.spare_capacity_mut();
+                (spare.as_mut_ptr() as *mut u8, spare.len())
+            }
+            _ => client.read_buf.spare_capacity_mut(),
+        };
+        self.reactor.submit_recv(fd, conn_id, ptr, len);
+        let client = self.conns.get_mut(&conn_id).unwrap();
+        client.recv_pending = true;
+    }
+
+    /// Handle a completed io_uring SEND operation.
+    fn handle_send_complete(&mut self, conn_id: u64, bytes_sent: usize) {
+        if bytes_sent == 0 {
+            // Send error
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        let client = match self.conns.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Drop iovecs (no longer needed after WRITEV completes)
+        client.pending_iovecs = None;
+
+        let mut remaining = bytes_sent;
+
+        // Advance send_buf
+        if let Some(ref mut sb) = client.send_buf {
+            if remaining >= sb.len() {
+                remaining -= sb.len();
+                client.send_buf = None;
+            } else {
+                sb.advance(remaining);
+                remaining = 0;
+            }
+        }
+
+        // Advance pending_direct
+        if remaining > 0 {
+            if let Some(ref mut pd) = client.pending_direct {
+                if remaining >= pd.len() {
+                    client.pending_direct = None;
+                } else {
+                    pd.advance(remaining);
+                }
+            }
+        }
+
+        // Check if there's remaining data in send_buf or pending_direct
+        let has_send_buf = client.send_buf.is_some();
+        let has_pending_direct = client.pending_direct.is_some();
+
+        if has_send_buf || has_pending_direct {
+            // Partial send — resubmit for the remainder
+            let fd = client.fd;
+            if has_send_buf && has_pending_direct {
+                let sb = client.send_buf.as_ref().unwrap();
+                let pd = client.pending_direct.as_ref().unwrap();
+                client.pending_iovecs = Some([
+                    libc::iovec {
+                        iov_base: sb.as_ptr() as *mut libc::c_void,
+                        iov_len: sb.len(),
+                    },
+                    libc::iovec {
+                        iov_base: pd.as_ptr() as *mut libc::c_void,
+                        iov_len: pd.len(),
+                    },
+                ]);
+                let iovs_ptr = client.pending_iovecs.as_ref().unwrap().as_ptr();
+                self.reactor.submit_writev(fd, conn_id, iovs_ptr, 2);
+            } else if has_send_buf {
+                let sb = client.send_buf.as_ref().unwrap();
+                self.reactor.submit_send(fd, conn_id, sb.as_ptr(), sb.len());
+            } else {
+                let pd = client.pending_direct.as_ref().unwrap();
+                self.reactor.submit_send(fd, conn_id, pd.as_ptr(), pd.len());
+            }
+            return;
+        }
+
+        client.send_in_flight = false;
+
+        // Phase transition: SendInfo → WaitConnect (INFO fully sent)
+        if matches!(client.phase, ConnPhase::SendInfo) {
+            client.phase = ConnPhase::WaitConnect;
+        }
+
+        // If write_buf has new data, start next SEND
+        if !client.write_buf.is_empty() || client.has_pending.load(Ordering::Acquire) {
+            let conn_id_val = conn_id;
+            self.submit_conn_send(conn_id_val);
+        }
+    }
+
+    /// Prepare and submit a SEND for a connection with pending write data.
+    /// Used only in completion I/O mode.
+    fn submit_conn_send(&mut self, conn_id: u64) {
+        let client = match self.conns.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        if client.send_in_flight {
+            return;
+        }
+
+        // Drain direct_buf if pending
+        if client.has_pending.load(Ordering::Acquire) {
+            client.has_pending.store(false, Ordering::Relaxed);
+            let mut dbuf = client.direct_buf.lock().unwrap();
+            if !dbuf.is_empty() {
+                if matches!(client.transport, Transport::Raw) {
+                    // O(1) split for raw — will use writev
+                    let direct_data = dbuf.split();
+                    client.pending_direct = Some(direct_data);
+                } else {
+                    client.write_buf.extend_from_slice(&dbuf);
+                    dbuf.clear();
+                }
+            }
+        }
+
+        // Slow consumer detection
+        let max_pending = self.state.buf_config.max_pending;
+        if max_pending > 0 {
+            let pending = match &client.transport {
+                Transport::Raw => {
+                    client.write_buf.len() + client.pending_direct.as_ref().map_or(0, |d| d.len())
+                }
+                Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
+                Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
+            };
+            if pending > max_pending {
+                warn!(
+                    conn_id,
+                    pending_bytes = pending,
+                    max = max_pending,
+                    "slow consumer, disconnecting"
+                );
+                counter!("slow_consumers_total", "worker" => self.worker_label.clone())
+                    .increment(1);
+                self.state
+                    .stats
+                    .slow_consumers
+                    .fetch_add(1, Ordering::Relaxed);
+                self.remove_conn(conn_id);
+                return;
+            }
+        }
+
+        let fd = client.fd;
+
+        match &mut client.transport {
+            Transport::Raw => {
+                let has_wb = !client.write_buf.is_empty();
+                let has_dd = client.pending_direct.is_some();
+                if !has_wb && !has_dd {
+                    return;
+                }
+                client.send_buf = if has_wb {
+                    Some(client.write_buf.split())
+                } else {
+                    None
+                };
+                client.send_in_flight = true;
+
+                if let (Some(ref sb), true) = (&client.send_buf, has_dd) {
+                    let pd = client.pending_direct.as_ref().unwrap();
+                    client.pending_iovecs = Some([
+                        libc::iovec {
+                            iov_base: sb.as_ptr() as *mut libc::c_void,
+                            iov_len: sb.len(),
+                        },
+                        libc::iovec {
+                            iov_base: pd.as_ptr() as *mut libc::c_void,
+                            iov_len: pd.len(),
+                        },
+                    ]);
+                    let iovs_ptr = client.pending_iovecs.as_ref().unwrap().as_ptr();
+                    self.reactor.submit_writev(fd, conn_id, iovs_ptr, 2);
+                } else if let Some(ref sb) = client.send_buf {
+                    self.reactor.submit_send(fd, conn_id, sb.as_ptr(), sb.len());
+                } else if let Some(ref pd) = client.pending_direct {
+                    self.reactor.submit_send(fd, conn_id, pd.as_ptr(), pd.len());
+                }
+            }
+            Transport::WebSocket { ws_out, .. } => {
+                if !client.write_buf.is_empty() {
+                    WsCodec::encode(&client.write_buf, ws_out);
+                    client.write_buf.clear();
+                }
+                if ws_out.is_empty() {
+                    return;
+                }
+                client.send_buf = Some(ws_out.split());
+                client.send_in_flight = true;
+                let sb = client.send_buf.as_ref().unwrap();
+                self.reactor.submit_send(fd, conn_id, sb.as_ptr(), sb.len());
+            }
+            Transport::Tls(ref mut tls) => {
+                if !client.write_buf.is_empty() {
+                    let _ = tls.tls_conn.writer().write_all(&client.write_buf);
+                    client.write_buf.clear();
+                }
+                loop {
+                    let mut tmp = [0u8; 8192];
+                    match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
+                        Ok(0) => break,
+                        Ok(n) => tls.enc_out.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                if tls.enc_out.is_empty() {
+                    return;
+                }
+                client.send_buf = Some(tls.enc_out.split());
+                client.send_in_flight = true;
+                let sb = client.send_buf.as_ref().unwrap();
+                self.reactor.submit_send(fd, conn_id, sb.as_ptr(), sb.len());
+            }
+        }
+    }
+
     fn add_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr, is_websocket: bool) {
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
@@ -508,6 +954,11 @@ impl<R: Reactor> Worker<R> {
             pings_outstanding: 0,
             sub_count: 0,
             permissions: None,
+            send_buf: None,
+            pending_direct: None,
+            pending_iovecs: None,
+            recv_pending: false,
+            send_in_flight: false,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -516,6 +967,31 @@ impl<R: Reactor> Worker<R> {
         counter!("connections_total", "worker" => self.worker_label.clone()).increment(1);
         gauge!("connections_active", "worker" => self.worker_label.clone())
             .set(self.conns.len() as f64);
+
+        // For completion I/O, submit the initial RECV.
+        if self.reactor.is_completion_io() {
+            let client = self.conns.get_mut(&id).unwrap();
+            let (ptr, len) = match &mut client.transport {
+                Transport::WebSocket { .. } if !is_websocket => {
+                    // Won't happen, but handle for safety
+                    client.read_buf.spare_capacity_mut()
+                }
+                Transport::WebSocket { .. } => {
+                    // WS handshake reads into read_buf first
+                    client.read_buf.spare_capacity_mut()
+                }
+                Transport::Tls(ref mut tls) => {
+                    // TLS reads encrypted data into enc_in
+                    tls.enc_in.reserve(8192);
+                    let chunk = tls.enc_in.spare_capacity_mut();
+                    (chunk.as_mut_ptr() as *mut u8, chunk.len())
+                }
+                Transport::Raw => client.read_buf.spare_capacity_mut(),
+            };
+            self.reactor.submit_recv(fd, id, ptr, len);
+            let client = self.conns.get_mut(&id).unwrap();
+            client.recv_pending = true;
+        }
 
         if is_websocket {
             debug!(id, addr = %addr, "accepted websocket connection on worker");
@@ -528,6 +1004,10 @@ impl<R: Reactor> Worker<R> {
 
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
+            if self.reactor.is_completion_io() {
+                // Cancel any in-flight RECV/SEND before closing fd.
+                self.reactor.cancel_io(conn_id);
+            }
             self.reactor.deregister(client.fd, conn_id);
             self.fd_to_conn.remove(&client.fd);
             self.state
@@ -543,6 +1023,20 @@ impl<R: Reactor> Worker<R> {
     /// Scan all connections for pending DirectWriter data, drain into write_buf,
     /// and try to flush to socket.
     fn flush_pending(&mut self) {
+        // Completion I/O path: collect conn_ids with pending data and submit SENDs.
+        if self.reactor.is_completion_io() {
+            let pending_ids: Vec<u64> = self
+                .conns
+                .iter()
+                .filter(|(_, c)| c.has_pending.load(Ordering::Acquire) && !c.send_in_flight)
+                .map(|(id, _)| *id)
+                .collect();
+            for conn_id in pending_ids {
+                self.submit_conn_send(conn_id);
+            }
+            return;
+        }
+
         let mut to_remove: Vec<u64> = Vec::new();
 
         for (conn_id, client) in &mut self.conns {
@@ -936,7 +1430,12 @@ impl<R: Reactor> Worker<R> {
     /// Try to flush write_buf to the socket. Registers/removes EPOLLOUT as needed.
     /// For WebSocket connections, write_buf is encoded into ws_out first.
     /// For TLS connections, delegates to tls_flush_encrypted.
+    /// For completion I/O, submits a SEND instead of sync write.
     fn try_flush_conn(&mut self, conn_id: u64) {
+        if self.reactor.is_completion_io() {
+            self.submit_conn_send(conn_id);
+            return;
+        }
         // TLS connections use their own flush path
         if matches!(
             self.conns.get(&conn_id).map(|c| &c.transport),
@@ -1286,7 +1785,12 @@ impl<R: Reactor> Worker<R> {
     }
 
     /// Encrypt pending write_buf data via TLS and flush encrypted output to socket.
+    /// For completion I/O, submits a SEND instead of sync write.
     fn tls_flush_encrypted(&mut self, conn_id: u64) {
+        if self.reactor.is_completion_io() {
+            self.submit_conn_send(conn_id);
+            return;
+        }
         let client = match self.conns.get_mut(&conn_id) {
             Some(c) => c,
             None => return,
@@ -1581,6 +2085,10 @@ impl<R: Reactor> Worker<R> {
     }
 
     fn handle_write(&mut self, conn_id: u64) {
+        // Completion I/O: no POLLOUT events, SEND handles writes internally.
+        if self.reactor.is_completion_io() {
+            return;
+        }
         self.try_flush_conn(conn_id);
     }
 

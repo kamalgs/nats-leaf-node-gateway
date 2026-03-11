@@ -185,6 +185,27 @@ impl AdaptiveBuf {
         }
     }
 
+    /// Get a pointer and length of spare capacity for io_uring RECV submission.
+    /// Ensures at least `target_cap` bytes are available.
+    pub(crate) fn spare_capacity_mut(&mut self) -> (*mut u8, usize) {
+        if self.buf.remaining_mut() == 0 {
+            self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
+        }
+        let chunk = self.buf.chunk_mut();
+        (chunk.as_mut_ptr(), chunk.len())
+    }
+
+    /// Mark `n` bytes as written (by io_uring RECV) and run adaptive sizing.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that `n` bytes have been written into the spare
+    /// capacity returned by a prior `spare_capacity_mut()` call.
+    pub(crate) unsafe fn note_recv(&mut self, n: usize) {
+        self.buf.advance_mut(n);
+        self.after_read(n);
+    }
+
     /// Read from a raw fd into the buffer's spare capacity (non-blocking).
     /// Uses libc::read directly for non-blocking socket I/O.
     pub(crate) fn read_from_fd(&mut self, fd: RawFd) -> io::Result<usize> {
