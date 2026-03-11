@@ -22,16 +22,6 @@ pub(crate) const WRITABLE: u32 = libc::POLLOUT as u32;
 /// Readiness flag: the fd has an error condition.
 pub(crate) const ERROR: u32 = libc::POLLERR as u32;
 
-/// Sentinel token for the worker's eventfd (uses POLL_ADD even in completion mode).
-#[cfg(feature = "io-uring")]
-const EVENT_FD_KEY: u64 = 0;
-
-/// CQE flag: a RECV operation completed. Low 30 bits = bytes read.
-pub(crate) const RECV_DONE: u32 = 1 << 31;
-
-/// CQE flag: a SEND operation completed. Low 30 bits = bytes sent.
-pub(crate) const SEND_DONE: u32 = 1 << 30;
-
 /// I/O event multiplexer used by the worker event loop.
 ///
 /// `wait()` fills a caller-provided buffer with `(token, revents)` pairs where
@@ -51,23 +41,6 @@ pub(crate) trait Reactor {
     /// Returns the number of events written into `events`.
     /// `timeout_ms == -1` means wait indefinitely.
     fn wait(&mut self, events: &mut [(u64, u32)], timeout_ms: i32) -> io::Result<usize>;
-
-    /// Submit a RECV SQE for completion-based I/O. No-op for readiness reactors.
-    fn submit_recv(&mut self, _fd: RawFd, _token: u64, _buf: *mut u8, _len: usize) {}
-
-    /// Submit a SEND SQE for completion-based I/O. No-op for readiness reactors.
-    fn submit_send(&mut self, _fd: RawFd, _token: u64, _buf: *const u8, _len: usize) {}
-
-    /// Submit a WRITEV SQE for completion-based I/O. No-op for readiness reactors.
-    fn submit_writev(&mut self, _fd: RawFd, _token: u64, _iovs: *const libc::iovec, _nr: u32) {}
-
-    /// Cancel pending RECV/SEND operations for a token. No-op for readiness reactors.
-    fn cancel_io(&mut self, _token: u64) {}
-
-    /// Returns true if this reactor uses completion-based I/O (RECV/SEND).
-    fn is_completion_io(&self) -> bool {
-        false
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,32 +142,24 @@ mod uring {
     /// Sentinel user_data for poll-remove / cancel CQEs.
     const CANCEL_TOKEN: u64 = u64::MAX - 1;
 
-    /// Tag bit in user_data to identify RECV completion CQEs.
-    const RECV_TAG: u64 = 1 << 63;
-
-    /// Tag bit in user_data to identify SEND completion CQEs.
-    const SEND_TAG: u64 = 1 << 62;
-
-    /// Reactor backed by `io_uring` using full completion-based I/O.
+    /// Reactor backed by `io_uring` using `POLL_ADD` for readiness notification.
     ///
-    /// Client sockets use RECV/SEND SQEs (completion I/O). The eventfd still
-    /// uses POLL_ADD (readiness) since it just needs a wake-up signal.
+    /// This is a hybrid approach: io_uring notifies readiness, but actual I/O
+    /// still uses regular `read`/`write`/`writev` syscalls. This gives an
+    /// apples-to-apples comparison with the epoll backend.
     pub(crate) struct IoUringReactor {
         ring: io_uring::IoUring,
-        /// token → (fd, current poll mask) — only for POLL_ADD tokens (eventfd).
+        /// token → (fd, current poll mask)
         polls: HashMap<u64, (RawFd, u32)>,
-        /// token → fd — tracked for completion I/O connections.
-        completion_fds: HashMap<u64, RawFd>,
     }
 
     impl IoUringReactor {
-        /// Create a new io_uring instance with 512 SQ entries.
+        /// Create a new io_uring instance with 256 SQ entries.
         pub(crate) fn new() -> io::Result<Self> {
-            let ring = io_uring::IoUring::new(512)?;
+            let ring = io_uring::IoUring::new(256)?;
             Ok(Self {
                 ring,
                 polls: HashMap::new(),
-                completion_fds: HashMap::new(),
             })
         }
 
@@ -203,7 +168,9 @@ mod uring {
             let entry = io_uring::opcode::PollAdd::new(io_uring::types::Fd(fd), mask)
                 .build()
                 .user_data(token);
+            // SAFETY: the SQE is valid for the lifetime of the ring submission.
             unsafe {
+                // If the SQ is full, flush pending submissions first.
                 if self.ring.submission().push(&entry).is_err() {
                     let _ = self.ring.submit();
                     let _ = self.ring.submission().push(&entry);
@@ -223,56 +190,32 @@ mod uring {
                 }
             }
         }
-
-        /// Push an SQE, flushing the SQ if full.
-        fn push_sqe(&mut self, entry: &io_uring::squeue::Entry) {
-            unsafe {
-                if self.ring.submission().push(entry).is_err() {
-                    let _ = self.ring.submit();
-                    let _ = self.ring.submission().push(entry);
-                }
-            }
-        }
     }
 
     impl Reactor for IoUringReactor {
         fn register(&mut self, fd: RawFd, token: u64) -> io::Result<()> {
-            if token == EVENT_FD_KEY {
-                // eventfd uses POLL_ADD (readiness notification)
-                let mask = libc::POLLIN as u32;
-                self.polls.insert(token, (fd, mask));
-                self.submit_poll_add(fd, token, mask);
-            } else {
-                // Client sockets: just track fd→token for completion I/O.
-                // Worker will call submit_recv() to start the first RECV.
-                self.completion_fds.insert(token, fd);
-            }
+            let mask = libc::POLLIN as u32;
+            self.polls.insert(token, (fd, mask));
+            self.submit_poll_add(fd, token, mask);
             Ok(())
         }
 
         fn deregister(&mut self, _fd: RawFd, token: u64) {
             if self.polls.remove(&token).is_some() {
                 self.submit_poll_remove(token);
-            } else if self.completion_fds.remove(&token).is_some() {
-                // Cancel pending RECV and SEND for this token.
-                self.cancel_io(token);
             }
         }
 
         fn modify(&mut self, fd: RawFd, token: u64, enable_out: bool) {
-            // Only applies to POLL_ADD tokens (eventfd).
             let mask = if enable_out {
                 libc::POLLIN as u32 | libc::POLLOUT as u32
             } else {
                 libc::POLLIN as u32
             };
-            if let Some(entry) = self.polls.get_mut(&token) {
-                *entry = (fd, mask);
-                // Cancel the old poll and re-arm with the new mask.
-                self.submit_poll_remove(token);
-                self.submit_poll_add(fd, token, mask);
-            }
-            // For completion I/O tokens: no-op (SEND handles writes internally).
+            self.polls.insert(token, (fd, mask));
+            // Cancel the old poll and re-arm with the new mask.
+            self.submit_poll_remove(token);
+            self.submit_poll_add(fd, token, mask);
         }
 
         fn wait(&mut self, events: &mut [(u64, u32)], timeout_ms: i32) -> io::Result<usize> {
@@ -284,19 +227,27 @@ mod uring {
                 let entry = io_uring::opcode::Timeout::new(&ts)
                     .build()
                     .user_data(TIMEOUT_TOKEN);
-                self.push_sqe(&entry);
+                unsafe {
+                    if self.ring.submission().push(&entry).is_err() {
+                        let _ = self.ring.submit();
+                        let _ = self.ring.submission().push(&entry);
+                    }
+                }
             }
 
             // Submit pending SQEs and wait for at least 1 CQE.
             if timeout_ms == 0 {
+                // Non-blocking: just submit and drain whatever is ready.
                 self.ring.submit()?;
             } else {
                 self.ring.submit_and_wait(1)?;
             }
 
+            // Drain CQEs into a temp buffer first (to release the borrow on
+            // self.ring before we re-arm polls).
             let mut count = 0;
             let max = events.len();
-            // Stack buffer for POLL_ADD tokens that need re-arming.
+            // Stack buffer for tokens that need re-arming.
             let mut rearm: [(u64, RawFd, u32); 256] = [(0, 0, 0); 256];
             let mut rearm_count = 0;
 
@@ -308,64 +259,15 @@ mod uring {
                     continue;
                 }
 
-                let result = cqe.result();
-
-                // Check if this is a RECV or SEND completion.
-                if ud & RECV_TAG != 0 {
-                    let token = ud & !(RECV_TAG | SEND_TAG);
-                    // Skip stale CQEs for deregistered connections.
-                    if !self.completion_fds.contains_key(&token) {
-                        continue;
-                    }
-                    if result < 0 {
-                        if result == -libc::ECANCELED {
-                            continue;
-                        }
-                        // RECV error: report as RECV_DONE with 0 bytes (signals error)
-                        if count < max {
-                            events[count] = (token, RECV_DONE);
-                            count += 1;
-                        }
-                    } else {
-                        let bytes = result as u32;
-                        if count < max {
-                            events[count] = (token, RECV_DONE | bytes);
-                            count += 1;
-                        }
-                    }
-                    continue;
-                }
-
-                if ud & SEND_TAG != 0 {
-                    let token = ud & !(RECV_TAG | SEND_TAG);
-                    if !self.completion_fds.contains_key(&token) {
-                        continue;
-                    }
-                    if result < 0 {
-                        if result == -libc::ECANCELED {
-                            continue;
-                        }
-                        if count < max {
-                            events[count] = (token, SEND_DONE);
-                            count += 1;
-                        }
-                    } else {
-                        let bytes = result as u32;
-                        if count < max {
-                            events[count] = (token, SEND_DONE | bytes);
-                            count += 1;
-                        }
-                    }
-                    continue;
-                }
-
-                // POLL_ADD completion (readiness event — eventfd).
+                // Skip stale CQEs for deregistered tokens.
                 let (fd, mask) = match self.polls.get(&ud) {
                     Some(entry) => *entry,
                     None => continue,
                 };
 
+                let result = cqe.result();
                 let revents = if result < 0 {
+                    // -ECANCELED from modify's remove → re-arm is already queued.
                     if result == -libc::ECANCELED {
                         continue;
                     }
@@ -379,56 +281,19 @@ mod uring {
                     count += 1;
                 }
 
+                // Record for re-arm after the CQE drain loop.
                 if rearm_count < rearm.len() {
                     rearm[rearm_count] = (ud, fd, mask);
                     rearm_count += 1;
                 }
             }
 
-            // Re-arm oneshot POLL_ADD events.
+            // Re-arm: oneshot POLL_ADD needs to be resubmitted after each event.
             for &(token, fd, mask) in &rearm[..rearm_count] {
                 self.submit_poll_add(fd, token, mask);
             }
 
             Ok(count)
-        }
-
-        fn submit_recv(&mut self, fd: RawFd, token: u64, buf: *mut u8, len: usize) {
-            let entry = io_uring::opcode::Recv::new(io_uring::types::Fd(fd), buf, len as u32)
-                .build()
-                .user_data(token | RECV_TAG);
-            self.push_sqe(&entry);
-        }
-
-        fn submit_send(&mut self, fd: RawFd, token: u64, buf: *const u8, len: usize) {
-            let entry = io_uring::opcode::Send::new(io_uring::types::Fd(fd), buf, len as u32)
-                .build()
-                .user_data(token | SEND_TAG);
-            self.push_sqe(&entry);
-        }
-
-        fn submit_writev(&mut self, fd: RawFd, token: u64, iovs: *const libc::iovec, nr: u32) {
-            let entry = io_uring::opcode::Writev::new(io_uring::types::Fd(fd), iovs, nr)
-                .build()
-                .user_data(token | SEND_TAG);
-            self.push_sqe(&entry);
-        }
-
-        fn cancel_io(&mut self, token: u64) {
-            // Cancel pending RECV
-            let recv_cancel = io_uring::opcode::AsyncCancel::new(token | RECV_TAG)
-                .build()
-                .user_data(CANCEL_TOKEN);
-            self.push_sqe(&recv_cancel);
-            // Cancel pending SEND
-            let send_cancel = io_uring::opcode::AsyncCancel::new(token | SEND_TAG)
-                .build()
-                .user_data(CANCEL_TOKEN);
-            self.push_sqe(&send_cancel);
-        }
-
-        fn is_completion_io(&self) -> bool {
-            true
         }
     }
 }
