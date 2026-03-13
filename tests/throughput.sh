@@ -10,6 +10,11 @@
 #   6. WS pub/sub          — 1 pub + 1 sub over WebSocket
 #   7. WS fan-out x5       — 1 pub + 5 subs over WebSocket
 #   8. WS fan-out x10      — 1 pub + 10 subs over WebSocket (high fan-out)
+#   9. Hub mode: pub only  — fire-and-forget on Rust hub
+#  10. Hub mode: pub/sub   — 1 pub + 1 sub on Rust hub (local routing)
+#  11. Hub mode: fan-out   — 1 pub + 5 subs on Rust hub
+#  12. Hub mode: leaf→hub  — pub on Go leaf, sub on Rust hub
+#  13. Hub mode: hub→leaf  — pub on Rust hub, sub on Go leaf
 #
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
@@ -47,6 +52,9 @@ GO_LEAF_PORT=4225
 GO_LEAF_WS_PORT=4226
 RUST_LEAF_PORT=5223
 RUST_LEAF_WS_PORT=5224
+RUST_HUB_CLIENT_PORT=6333
+RUST_HUB_LEAF_PORT=6422
+GO_LEAF_TO_RUST_PORT=6225
 
 # PID tracking for cleanup
 PIDS=()
@@ -73,7 +81,8 @@ done
 
 # Check ports are free
 for port in $HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $GO_LEAF_WS_PORT \
-            $RUST_LEAF_PORT $RUST_LEAF_WS_PORT; do
+            $RUST_LEAF_PORT $RUST_LEAF_WS_PORT \
+            $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $GO_LEAF_TO_RUST_PORT; do
   if ss -tln 2>/dev/null | grep -q ":${port} "; then
     echo "ERROR: port $port already in use"
     exit 1
@@ -112,6 +121,18 @@ RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT
 PIDS+=($!)
 sleep 2
 
+# --- Start Rust hub (hub mode — accepts inbound leaf connections) ---
+echo "Starting Rust hub (client=$RUST_HUB_CLIENT_PORT, leafnode=$RUST_HUB_LEAF_PORT)..."
+RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" &
+PIDS+=($!)
+sleep 1
+
+# --- Start Go leaf connecting to Rust hub ---
+echo "Starting Go leaf → Rust hub (tcp=$GO_LEAF_TO_RUST_PORT)..."
+nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf_to_rust.conf" &
+PIDS+=($!)
+sleep 1
+
 # Verify connections
 echo ""
 echo "Verifying connectivity..."
@@ -120,7 +141,9 @@ nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_PORT"    >/dev/null 2>&1
 nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF_PORT"  >/dev/null 2>&1 || { echo "FAIL: rust leaf"; exit 1; }
 nats pub _bench.ping pong -s "ws://127.0.0.1:$GO_LEAF_WS_PORT"   >/dev/null 2>&1 || { echo "FAIL: go leaf ws"; exit 1; }
 nats pub _bench.ping pong -s "ws://127.0.0.1:$RUST_LEAF_WS_PORT" >/dev/null 2>&1 || { echo "FAIL: rust leaf ws"; exit 1; }
-echo "All servers responding (TCP + WebSocket)."
+nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" >/dev/null 2>&1 || { echo "FAIL: rust hub"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" >/dev/null 2>&1 || { echo "FAIL: go leaf→rust hub"; exit 1; }
+echo "All servers responding (TCP + WebSocket + Hub mode)."
 echo ""
 
 # Kill any lingering background bench processes
@@ -302,6 +325,59 @@ echo "================================================================"
 echo ""
 run_url_pubsub "Go Leaf WS"    "ws://127.0.0.1:$GO_LEAF_WS_PORT"   10 "bench.ws.fan10"
 run_url_pubsub "Rust Leaf WS"  "ws://127.0.0.1:$RUST_LEAF_WS_PORT" 10 "bench.ws.fan10"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 9: Hub Mode — Publish Only (Rust as hub)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  9. HUB MODE: PUBLISH ONLY (fire-and-forget, Rust as hub)"
+echo "     ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_pub_only "Go Hub (baseline)"  "nats://127.0.0.1:$HUB_CLIENT_PORT"
+run_pub_only "Rust Hub"           "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 10: Hub Mode — Local Pub/Sub (1 pub + 1 sub on Rust hub)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  10. HUB MODE: LOCAL PUB/SUB (1 pub + 1 sub, Rust as hub)"
+echo "      ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_url_pubsub "Go Hub (baseline)"  "nats://127.0.0.1:$HUB_CLIENT_PORT"      1
+run_url_pubsub "Rust Hub"           "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT"  1
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 11: Hub Mode — Fan-out (1 pub + 5 subs on Rust hub)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  11. HUB MODE: FAN-OUT (1 pub + 5 subs, Rust as hub)"
+echo "      ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_url_pubsub "Go Hub (baseline)"  "nats://127.0.0.1:$HUB_CLIENT_PORT"      5
+run_url_pubsub "Rust Hub"           "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT"  5
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 12: Hub Mode — Leaf→Hub (pub on Go leaf, sub on Rust hub)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  12. HUB MODE: LEAF → RUST HUB (pub on Go leaf, sub on Rust hub)"
+echo "      ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_cross_pubsub "Go Leaf → Rust Hub"  "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT"
+
+# ──────────────────────────────────────────────────────────────────────
+# Scenario 13: Hub Mode — Hub→Leaf (pub on Rust hub, sub on Go leaf)
+# ──────────────────────────────────────────────────────────────────────
+echo "================================================================"
+echo "  13. HUB MODE: RUST HUB → LEAF (pub on Rust hub, sub on Go leaf)"
+echo "      ${MSGS} msgs × ${SIZE}B"
+echo "================================================================"
+echo ""
+run_cross_pubsub "Rust Hub → Go Leaf"  "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT"
 
 echo "================================================================"
 echo "  BENCHMARK COMPLETE"

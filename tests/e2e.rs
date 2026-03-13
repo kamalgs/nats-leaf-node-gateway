@@ -263,3 +263,198 @@ async fn leaf_to_upstream() {
 
     shutdown_tx.store(true, Ordering::Release);
 }
+
+// --- Hub mode helpers ---
+
+/// Start a LeafServer in hub mode (with leafnode_port), returning the shutdown sender.
+fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let reload = Arc::new(AtomicBool::new(false));
+
+    let config = LeafServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: client_port,
+        hub_url: None,
+        server_name: format!("test-hub-{}", client_port),
+        leafnode_port: Some(leafnode_port),
+        ..Default::default()
+    };
+    let server = LeafServer::new(config);
+
+    std::thread::spawn(move || {
+        if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
+            eprintln!("hub server error: {}", e);
+        }
+    });
+
+    shutdown
+}
+
+impl NatsServer {
+    /// Start a Go nats-server configured as a leaf connecting to the given hub leafnode port.
+    fn start_as_leaf(client_port: u16, hub_leafnode_port: u16) -> Self {
+        let bin = nats_server_bin();
+
+        // Write a temporary config file for leaf mode
+        let config_path = format!("/tmp/nats_leaf_test_{}.conf", client_port);
+        std::fs::write(
+            &config_path,
+            format!(
+                "listen: 127.0.0.1:{client_port}\n\
+                 leafnodes {{\n  remotes [{{\n    url: \"nats://127.0.0.1:{hub_leafnode_port}\"\n  }}]\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let child = Command::new(&bin)
+            .args(["-c", &config_path])
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to start nats-server leaf at {}: {}", bin, e));
+
+        let server = NatsServer {
+            child,
+            port: client_port,
+        };
+        server.wait_ready();
+
+        // Give the leaf connection time to establish
+        std::thread::sleep(Duration::from_millis(500));
+
+        server
+    }
+}
+
+// --- Hub mode tests ---
+
+#[tokio::test]
+async fn hub_mode_local_pub_sub() {
+    let hub_client_port = free_port();
+    let hub_leaf_port = free_port();
+    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
+    wait_for_leaf(hub_client_port).await;
+
+    let client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
+        .await
+        .expect("failed to connect to hub");
+
+    let mut sub = client
+        .subscribe("hub.test")
+        .await
+        .expect("subscribe failed");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client
+        .publish("hub.test", "hello-hub".into())
+        .await
+        .expect("publish failed");
+
+    client.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("timed out waiting for message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "hub.test");
+    assert_eq!(&msg.payload[..], b"hello-hub");
+
+    shutdown_tx.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+async fn hub_mode_leaf_to_hub() {
+    // Start Rust hub
+    let hub_client_port = free_port();
+    let hub_leaf_port = free_port();
+    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
+    wait_for_leaf(hub_client_port).await;
+
+    // Start Go nats-server as leaf connecting to Rust hub
+    let leaf_client_port = free_port();
+    let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
+
+    // Subscribe on hub
+    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
+        .await
+        .expect("connect to hub failed");
+
+    let mut hub_sub = hub_client
+        .subscribe("cross.test")
+        .await
+        .expect("hub subscribe failed");
+
+    // Wait for LS+ to propagate from hub to leaf
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on leaf
+    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
+        .await
+        .expect("connect to leaf failed");
+
+    leaf_client
+        .publish("cross.test", "from-leaf".into())
+        .await
+        .expect("leaf publish failed");
+
+    leaf_client.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), hub_sub.next())
+        .await
+        .expect("timed out waiting for leaf→hub message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "cross.test");
+    assert_eq!(&msg.payload[..], b"from-leaf");
+
+    shutdown_tx.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+async fn hub_mode_hub_to_leaf() {
+    // Start Rust hub
+    let hub_client_port = free_port();
+    let hub_leaf_port = free_port();
+    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
+    wait_for_leaf(hub_client_port).await;
+
+    // Start Go nats-server as leaf connecting to Rust hub
+    let leaf_client_port = free_port();
+    let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
+
+    // Subscribe on leaf
+    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
+        .await
+        .expect("connect to leaf failed");
+
+    let mut leaf_sub = leaf_client
+        .subscribe("reverse.test")
+        .await
+        .expect("leaf subscribe failed");
+
+    // Wait for LS+ from Go leaf to propagate to Rust hub
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on hub
+    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
+        .await
+        .expect("connect to hub failed");
+
+    hub_client
+        .publish("reverse.test", "from-hub".into())
+        .await
+        .expect("hub publish failed");
+
+    hub_client.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), leaf_sub.next())
+        .await
+        .expect("timed out waiting for hub→leaf message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "reverse.test");
+    assert_eq!(&msg.payload[..], b"from-hub");
+
+    shutdown_tx.store(true, Ordering::Release);
+}

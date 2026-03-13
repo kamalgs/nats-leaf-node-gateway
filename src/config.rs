@@ -915,9 +915,12 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
                 }
             }
             "listen" => {
-                // leafnodes.listen — this is for accepting inbound leaf
-                // connections, which open-wire doesn't support yet. Log and skip.
-                tracing::debug!("ignoring leafnodes.listen (inbound leaf not supported)");
+                // leafnodes.listen — parse host:port for inbound leaf connections.
+                let s = as_string(lval)?;
+                let (_host, port) = parse_listen(&s)?;
+                if let Some(p) = port {
+                    config.leafnode_port = Some(p);
+                }
             }
             _ => {
                 tracing::debug!("ignoring leafnodes key: {lkey}");
@@ -1294,11 +1297,11 @@ leafnodes {
   listen: 127.0.0.1:7422
 }
 "#;
-        // This should parse without error; leafnodes.listen is ignored.
         let config = load_config_str(input).unwrap();
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 4333);
         assert!(config.hub_url.is_none());
+        assert_eq!(config.leafnode_port, Some(7422));
     }
 
     #[test]

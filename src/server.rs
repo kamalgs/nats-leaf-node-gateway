@@ -5,6 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
@@ -20,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::protocol::BufConfig;
-use crate::sub_list::SubList;
+use crate::sub_list::{DirectWriter, SubList};
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
 
@@ -210,6 +211,9 @@ pub struct LeafServerConfig {
     /// Optional WebSocket port. When set, a second listener accepts WebSocket
     /// connections on this port (NATS protocol over WebSocket binary frames).
     pub ws_port: Option<u16>,
+    /// Optional leafnode listen port. When set, open-wire acts as a hub and
+    /// accepts inbound leaf node connections on this port.
+    pub leafnode_port: Option<u16>,
     /// Maximum pending write bytes per connection before disconnecting as a
     /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
     pub max_pending: usize,
@@ -285,6 +289,7 @@ impl Default for LeafServerConfig {
             write_buf_capacity: 65536,
             workers,
             ws_port: None,
+            leafnode_port: None,
             max_pending: 64 * 1024 * 1024,
             max_payload: 1_048_576,
             max_connections: 65_536,
@@ -566,6 +571,12 @@ pub(crate) struct ServerState {
     pub max_subscriptions: AtomicUsize,
     /// Aggregated server statistics.
     pub stats: ServerStats,
+    /// Port advertised in INFO to inbound leaf connections (`leafnodes.listen` port).
+    /// `None` when hub mode is not enabled.
+    pub leafnode_port: Option<u16>,
+    /// Registry of DirectWriters for inbound leaf connections.
+    /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
+    pub leaf_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
 }
 
 impl ServerState {
@@ -582,6 +593,7 @@ impl ServerState {
         max_payload: usize,
         max_control_line: usize,
         max_subscriptions: usize,
+        leafnode_port: Option<u16>,
     ) -> Self {
         Self {
             info,
@@ -602,6 +614,8 @@ impl ServerState {
             max_control_line: AtomicUsize::new(max_control_line),
             max_subscriptions: AtomicUsize::new(max_subscriptions),
             stats: ServerStats::default(),
+            leafnode_port,
+            leaf_writers: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -677,6 +691,7 @@ impl LeafServer {
                 config.max_payload,
                 config.max_control_line,
                 config.max_subscriptions,
+                config.leafnode_port,
             )),
         }
     }
@@ -772,6 +787,20 @@ impl LeafServer {
         workers[idx].send_conn(cid, tcp_stream, addr, is_websocket);
     }
 
+    /// Distribute a new inbound leaf TCP connection to the next worker (round-robin).
+    fn accept_leaf_tcp(
+        &self,
+        tcp_stream: TcpStream,
+        addr: std::net::SocketAddr,
+        workers: &[WorkerHandle],
+        next_worker: &mut usize,
+    ) {
+        let cid = self.state.next_client_id();
+        let idx = *next_worker % workers.len();
+        *next_worker = idx + 1;
+        workers[idx].send_leaf_conn(cid, tcp_stream, addr);
+    }
+
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -802,29 +831,48 @@ impl LeafServer {
             None
         };
 
-        if let Some(ref ws_listener) = ws_listener {
-            // Poll both listeners
+        let leaf_listener = if let Some(leaf_port) = self.config.leafnode_port {
+            let leaf_addr = format!("{}:{}", self.config.host, leaf_port);
+            let ll = TcpListener::bind(&leaf_addr)?;
+            info!(addr = %leaf_addr, "leaf server listening (leafnode)");
+            Some(ll)
+        } else {
+            None
+        };
+
+        let has_extra_listeners = ws_listener.is_some() || leaf_listener.is_some();
+        if has_extra_listeners {
+            // Poll multiple listeners
             listener.set_nonblocking(true)?;
-            ws_listener.set_nonblocking(true)?;
-            let tcp_fd = listener.as_raw_fd();
-            let ws_fd = ws_listener.as_raw_fd();
+            if let Some(ref wl) = ws_listener {
+                wl.set_nonblocking(true)?;
+            }
+            if let Some(ref ll) = leaf_listener {
+                ll.set_nonblocking(true)?;
+            }
+
             let mut pfds = [
                 libc::pollfd {
-                    fd: tcp_fd,
+                    fd: listener.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: ws_fd,
+                    fd: ws_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: leaf_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
                     events: libc::POLLIN,
                     revents: 0,
                 },
             ];
-
             loop {
                 pfds[0].revents = 0;
                 pfds[1].revents = 0;
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
+                pfds[2].revents = 0;
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) };
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -838,8 +886,17 @@ impl LeafServer {
                     }
                 }
                 if pfds[1].revents & libc::POLLIN != 0 {
-                    while let Ok((stream, addr)) = ws_listener.accept() {
-                        self.accept_tcp(stream, addr, &workers, &mut next_worker, true);
+                    if let Some(ref wl) = ws_listener {
+                        while let Ok((stream, addr)) = wl.accept() {
+                            self.accept_tcp(stream, addr, &workers, &mut next_worker, true);
+                        }
+                    }
+                }
+                if pfds[2].revents & libc::POLLIN != 0 {
+                    if let Some(ref ll) = leaf_listener {
+                        while let Ok((stream, addr)) = ll.accept() {
+                            self.accept_leaf_tcp(stream, addr, &workers, &mut next_worker);
+                        }
                     }
                 }
             }
@@ -897,7 +954,16 @@ impl LeafServer {
             None
         };
 
-        let nfds = if ws_listener.is_some() { 2 } else { 1 };
+        let leaf_listener = if let Some(leaf_port) = self.config.leafnode_port {
+            let leaf_addr = format!("{}:{}", self.config.host, leaf_port);
+            let ll = TcpListener::bind(&leaf_addr)?;
+            ll.set_nonblocking(true)?;
+            info!(addr = %leaf_addr, "leaf server listening (leafnode)");
+            Some(ll)
+        } else {
+            None
+        };
+
         let mut pfds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -906,6 +972,11 @@ impl LeafServer {
             },
             libc::pollfd {
                 fd: ws_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: leaf_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -929,7 +1000,8 @@ impl LeafServer {
 
             pfds[0].revents = 0;
             pfds[1].revents = 0;
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 1000) };
+            pfds[2].revents = 0;
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -949,6 +1021,14 @@ impl LeafServer {
                 if let Some(ref ws_listener) = ws_listener {
                     while let Ok((tcp_stream, addr)) = ws_listener.accept() {
                         self.accept_tcp(tcp_stream, addr, &workers, &mut next_worker, true);
+                    }
+                }
+            }
+
+            if ret > 0 && pfds[2].revents & libc::POLLIN != 0 {
+                if let Some(ref ll) = leaf_listener {
+                    while let Ok((tcp_stream, addr)) = ll.accept() {
+                        self.accept_leaf_tcp(tcp_stream, addr, &workers, &mut next_worker);
                     }
                 }
             }

@@ -12,6 +12,9 @@ GO_LEAF_PORT=4225
 GO_LEAF_WS_PORT=4226
 RUST_LEAF_PORT=5223
 RUST_LEAF_WS_PORT=5224
+RUST_HUB_CLIENT_PORT=6333
+RUST_HUB_LEAF_PORT=6422
+GO_LEAF_TO_RUST_PORT=6225
 MSGS=100
 SIZE=64
 
@@ -42,6 +45,14 @@ PIDS+=($!); sleep 0.5
 "$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
   --hub "nats://127.0.0.1:$HUB_LEAF_PORT" >/dev/null 2>&1 &
 PIDS+=($!); sleep 1
+
+# Rust hub (hub mode)
+"$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" >/dev/null 2>&1 &
+PIDS+=($!); sleep 0.5
+
+# Go leaf connecting to Rust hub
+nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf_to_rust.conf" >/dev/null 2>&1 &
+PIDS+=($!); sleep 0.5
 
 echo ""
 echo "=== Smoke Test (${MSGS} msgs each) ==="
@@ -223,6 +234,53 @@ for label in "GoLeaf" "RustLeaf"; do
   wait "$sub_pid" 2>/dev/null \
     && pass "$label ws→tcp" || fail "$label ws→tcp"
 done
+
+# --- 10. Hub mode: publish only ---
+echo ""
+echo "[10] Hub mode: publish only"
+for label_port in "RustHub:$RUST_HUB_CLIENT_PORT" "GoLeaf→RustHub:$GO_LEAF_TO_RUST_PORT"; do
+  label="${label_port%%:*}"; port="${label_port##*:}"
+  nats bench pub smoke.hub.test --msgs $MSGS --size $SIZE --no-progress \
+    -s "nats://127.0.0.1:$port" >/dev/null 2>&1 \
+    && pass "$label pub-only" || fail "$label pub-only"
+done
+
+# --- 11. Hub mode: local pub/sub on Rust hub ---
+echo ""
+echo "[11] Hub mode: local pub/sub (Rust hub)"
+url="nats://127.0.0.1:$RUST_HUB_CLIENT_PORT"
+nats bench sub smoke.hub.ps --msgs $MSGS --size $SIZE --no-progress \
+  -s "$url" >/dev/null 2>&1 &
+sub_pid=$!
+sleep 0.3
+nats bench pub smoke.hub.ps --msgs $MSGS --size $SIZE --no-progress \
+  -s "$url" >/dev/null 2>&1
+wait "$sub_pid" 2>/dev/null \
+  && pass "RustHub local pub/sub" || fail "RustHub local pub/sub"
+
+# --- 12. Hub mode: leaf → Rust hub ---
+echo ""
+echo "[12] Hub mode: Go leaf → Rust hub"
+nats bench sub smoke.hub.cross --msgs $MSGS --size $SIZE --no-progress \
+  -s "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" >/dev/null 2>&1 &
+sub_pid=$!
+sleep 0.3
+nats bench pub smoke.hub.cross --msgs $MSGS --size $SIZE --no-progress \
+  -s "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" >/dev/null 2>&1
+wait "$sub_pid" 2>/dev/null \
+  && pass "GoLeaf → RustHub" || fail "GoLeaf → RustHub"
+
+# --- 13. Hub mode: Rust hub → leaf ---
+echo ""
+echo "[13] Hub mode: Rust hub → Go leaf"
+nats bench sub smoke.hub.down --msgs $MSGS --size $SIZE --no-progress \
+  -s "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" >/dev/null 2>&1 &
+sub_pid=$!
+sleep 0.3
+nats bench pub smoke.hub.down --msgs $MSGS --size $SIZE --no-progress \
+  -s "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" >/dev/null 2>&1
+wait "$sub_pid" 2>/dev/null \
+  && pass "RustHub → GoLeaf" || fail "RustHub → GoLeaf"
 
 echo ""
 echo "=== ALL SMOKE TESTS PASSED ==="

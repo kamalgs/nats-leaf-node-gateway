@@ -90,6 +90,30 @@ impl DirectWriter {
         self.has_pending.store(true, Ordering::Release);
     }
 
+    /// Format and append an LMSG to the shared buffer (for leaf node delivery).
+    pub(crate) fn write_lmsg(
+        &self,
+        subject: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) {
+        let mut builder = self.msg_builder.lock().unwrap();
+        let data = builder.build_lmsg(subject, reply, headers, payload);
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
+    /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS- lines).
+    pub(crate) fn write_raw(&self, data: &[u8]) {
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
     /// Notify the worker thread that there is data to flush.
     /// Writes 1 to the eventfd — wakes epoll_wait() on the worker thread.
     /// Multiple writers sharing one eventfd collapse into a single wake.
@@ -158,6 +182,8 @@ pub struct Subscription {
     pub(crate) max_msgs: AtomicU64,
     /// Number of messages delivered so far (only incremented when max_msgs > 0).
     pub(crate) delivered: AtomicU64,
+    /// True for inbound leaf node subscriptions (deliver via LMSG, not MSG).
+    pub is_leaf: bool,
 }
 
 impl Clone for Subscription {
@@ -171,6 +197,7 @@ impl Clone for Subscription {
             writer: self.writer.clone(),
             max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
             delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
+            is_leaf: self.is_leaf,
         }
     }
 }
@@ -189,6 +216,7 @@ impl Subscription {
             writer,
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            is_leaf: false,
         }
     }
 }
@@ -444,6 +472,25 @@ impl SubList {
         subjects
     }
 
+    /// Returns unique non-leaf (subject, queue) pairs for leaf interest propagation.
+    /// Only includes subscriptions from client connections (not leaf connections).
+    pub fn client_interests(&self) -> Vec<(&str, Option<&str>)> {
+        let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
+        for (subj, subs) in &self.exact {
+            for sub in subs {
+                if !sub.is_leaf {
+                    set.insert((subj.as_str(), sub.queue.as_deref()));
+                }
+            }
+        }
+        for sub in &self.wild {
+            if !sub.is_leaf {
+                set.insert((sub.subject.as_str(), sub.queue.as_deref()));
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// Returns unique (subject, queue) pairs for upstream interest sync.
     /// Non-queue subs have `queue = None`. Queue subs are deduplicated
     /// by (subject, queue_name) so each group is announced once.
@@ -641,6 +688,28 @@ mod tests {
     }
 
     // --- DirectWriter tests ---
+
+    #[test]
+    fn test_direct_writer_formats_lmsg() {
+        let writer = DirectWriter::new_dummy();
+
+        writer.write_lmsg(b"test.sub", None, None, b"hello");
+
+        let data = writer.drain().expect("should have data");
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "LMSG test.sub 5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_direct_writer_formats_lmsg_with_reply() {
+        let writer = DirectWriter::new_dummy();
+
+        writer.write_lmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "LMSG test.sub reply.to 2\r\nhi\r\n");
+    }
 
     #[test]
     fn test_direct_writer_formats_msg() {
@@ -1052,6 +1121,51 @@ mod tests {
         // Increasing the max should un-expire it
         sl.set_unsub_max(1, 1, 5);
         assert!(!sl.is_expired(1, 1));
+    }
+
+    #[test]
+    fn test_client_interests_excludes_leaf_subs() {
+        let mut sl = SubList::new();
+        // Client subs
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.insert(test_queue_sub(2, 1, "bar", "q1"));
+
+        // Leaf sub — should be excluded from client_interests
+        let mut leaf_sub = Subscription::new_dummy(10, 1, "foo".to_string(), None);
+        leaf_sub.is_leaf = true;
+        sl.insert(leaf_sub);
+
+        let mut leaf_queue_sub =
+            Subscription::new_dummy(11, 1, "bar".to_string(), Some("q1".to_string()));
+        leaf_queue_sub.is_leaf = true;
+        sl.insert(leaf_queue_sub);
+
+        let interests = sl.client_interests();
+        // Should only have client interests: ("foo", None) and ("bar", Some("q1"))
+        assert_eq!(interests.len(), 2);
+        assert!(interests.contains(&("foo", None)));
+        assert!(interests.contains(&("bar", Some("q1"))));
+
+        // Verify leaf subs are still in the list for matching
+        let matches = sl.match_subject("foo");
+        assert_eq!(matches.len(), 2); // client + leaf
+    }
+
+    #[test]
+    fn test_direct_writer_write_raw() {
+        let writer = DirectWriter::new_dummy();
+        // No data yet
+        assert!(writer.drain().is_none());
+
+        writer.write_raw(b"LS+ foo\r\n");
+        let data = writer.drain().unwrap();
+        assert_eq!(&data[..], b"LS+ foo\r\n");
+
+        // Multiple raw writes accumulate
+        writer.write_raw(b"LS+ bar\r\n");
+        writer.write_raw(b"LS- baz\r\n");
+        let data = writer.drain().unwrap();
+        assert_eq!(&data[..], b"LS+ bar\r\nLS- baz\r\n");
     }
 
     #[test]

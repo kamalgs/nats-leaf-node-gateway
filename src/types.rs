@@ -53,6 +53,9 @@ pub struct ServerInfo {
     pub lame_duck_mode: bool,
     #[serde(default)]
     pub jetstream: bool,
+    /// Advertised leafnode URLs (present in INFO sent on leafnode listener).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leafnode_urls: Option<Vec<String>>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -302,6 +305,28 @@ mod tests {
         h.set_status(408, Some("Request Timeout".into()));
         let s = format!("{h}");
         assert!(s.starts_with("NATS/1.0 408 Request Timeout\n"));
+    }
+
+    #[test]
+    fn server_info_leafnode_urls_serialization() {
+        // When leafnode_urls is Some, it should be serialized
+        let info = ServerInfo {
+            server_id: "HUB".into(),
+            leafnode_urls: Some(vec!["nats-leaf://127.0.0.1:7422".into()]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("leafnode_urls"));
+        assert!(json.contains("nats-leaf://127.0.0.1:7422"));
+
+        // When leafnode_urls is None, it should be omitted
+        let info = ServerInfo {
+            server_id: "LEAF".into(),
+            leafnode_urls: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("leafnode_urls"));
     }
 
     #[test]
