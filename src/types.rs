@@ -54,6 +54,7 @@ pub struct ServerInfo {
     #[serde(default)]
     pub jetstream: bool,
     /// Advertised leafnode URLs (present in INFO sent on leafnode listener).
+    #[cfg(feature = "hub")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leafnode_urls: Option<Vec<String>>,
 }
@@ -308,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "hub")]
     fn server_info_leafnode_urls_serialization() {
         // When leafnode_urls is Some, it should be serialized
         let info = ServerInfo {

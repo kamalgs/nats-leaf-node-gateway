@@ -14,7 +14,9 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use open_wire::config;
-use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
+#[cfg(feature = "leaf")]
+use open_wire::HubCredentials;
+use open_wire::{ClientAuth, LeafServer, LeafServerConfig};
 
 /// Global pointer to the reload flag, accessible from the SIGHUP handler.
 static RELOAD_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
@@ -76,7 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut auth_user: Option<String> = None;
     let mut auth_pass: Option<String> = None;
     let mut auth_nkeys: Vec<String> = Vec::new();
+    #[cfg(feature = "leaf")]
     let mut hub_creds = HubCredentials::default();
+    #[cfg(feature = "leaf")]
     let mut has_hub_creds = false;
 
     let mut i = 1;
@@ -93,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.host = args[i].clone();
             }
+            #[cfg(feature = "leaf")]
             "--hub" => {
                 i += 1;
                 config.hub_url = Some(args[i].clone());
@@ -133,21 +138,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 auth_nkeys.push(args[i].clone());
             }
+            #[cfg(feature = "leaf")]
             "--hub-user" => {
                 i += 1;
                 hub_creds.user = Some(args[i].clone());
                 has_hub_creds = true;
             }
+            #[cfg(feature = "leaf")]
             "--hub-pass" => {
                 i += 1;
                 hub_creds.pass = Some(args[i].clone());
                 has_hub_creds = true;
             }
+            #[cfg(feature = "leaf")]
             "--hub-token" => {
                 i += 1;
                 hub_creds.token = Some(args[i].clone());
                 has_hub_creds = true;
             }
+            #[cfg(feature = "leaf")]
             "--hub-creds" => {
                 i += 1;
                 hub_creds.creds_file = Some(args[i].clone());
@@ -236,6 +245,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.client_auth = ClientAuth::UserPass { user, pass };
     }
 
+    #[cfg(feature = "leaf")]
     if has_hub_creds {
         config.hub_credentials = Some(hub_creds);
     }
@@ -267,6 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting leaf node server on {}:{} ({} workers)",
         config.host, config.port, config.workers
     );
+    #[cfg(feature = "leaf")]
     if let Some(ref hub) = config.hub_url {
         println!("Upstream hub: {hub}");
     }

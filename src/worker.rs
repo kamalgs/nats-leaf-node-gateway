@@ -25,14 +25,16 @@ use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
 use crate::client_handler::ClientHandler;
-use crate::handler::{
-    handle_expired_subs, send_existing_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx,
-};
+#[cfg(feature = "hub")]
+use crate::handler::send_existing_subs;
+use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+#[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
 use crate::protocol::{AdaptiveBuf, ClientOp};
 use crate::server::ServerState;
 use crate::sub_list::{create_eventfd, DirectWriter};
+#[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
@@ -51,6 +53,7 @@ pub(crate) enum WorkerCmd {
         is_websocket: bool,
     },
     /// Accept an inbound leaf node connection (hub mode).
+    #[cfg(feature = "hub")]
     NewLeafConn {
         id: u64,
         stream: TcpStream,
@@ -83,6 +86,7 @@ impl WorkerHandle {
     }
 
     /// Send a new inbound leaf node connection to this worker and wake it.
+    #[cfg(feature = "hub")]
     pub fn send_leaf_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewLeafConn { id, stream, addr });
         self.wake();
@@ -192,6 +196,7 @@ pub(crate) struct ClientState {
     #[allow(dead_code)]
     conn_id: u64,
     ext: ConnExt,
+    #[cfg(feature = "leaf")]
     upstream_tx: Option<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
     epoll_has_out: bool,
@@ -220,6 +225,7 @@ pub(crate) struct Worker {
     state: Arc<ServerState>,
     info_line: Vec<u8>,
     /// INFO line for inbound leaf connections (port set to leafnode_port).
+    #[cfg(feature = "hub")]
     leaf_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
@@ -249,6 +255,7 @@ impl Worker {
         // Must have: port = leafnode_port, client_id != 0, leafnode_urls present.
         // The Go nats-server checks CID != 0 && leafnode_urls != nil to confirm
         // it connected to a leafnode port (not a client port).
+        #[cfg(feature = "hub")]
         let leaf_info_line = if let Some(lp) = state.leafnode_port {
             let mut leaf_info = state.info.clone();
             leaf_info.port = lp;
@@ -291,6 +298,7 @@ impl Worker {
                     rx,
                     state,
                     info_line,
+                    #[cfg(feature = "hub")]
                     leaf_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
@@ -426,6 +434,7 @@ impl Worker {
                 } => {
                     self.add_conn(id, stream, addr, is_websocket);
                 }
+                #[cfg(feature = "hub")]
                 WorkerCmd::NewLeafConn { id, stream, addr } => {
                     self.add_leaf_conn(id, stream, addr);
                 }
@@ -513,6 +522,7 @@ impl Worker {
             transport,
             conn_id: id,
             ext: ConnExt::Client,
+            #[cfg(feature = "leaf")]
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
@@ -541,6 +551,7 @@ impl Worker {
 
     /// Add an inbound leaf node connection (hub mode).
     /// Sends INFO immediately and waits for CONNECT from the leaf.
+    #[cfg(feature = "hub")]
     fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
@@ -585,6 +596,7 @@ impl Worker {
                 leaf_sid_counter: 0,
                 leaf_sids: HashMap::new(),
             },
+            #[cfg(feature = "leaf")]
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
@@ -623,6 +635,7 @@ impl Worker {
                 .fetch_sub(1, Ordering::Relaxed);
 
             // Unregister leaf DirectWriter from shared registry.
+            #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
             }
@@ -1592,28 +1605,38 @@ impl Worker {
                 };
                 match op {
                     Some(ClientOp::Connect(connect_info)) => {
+                        #[cfg(feature = "hub")]
                         let is_leaf = self
                             .conns
                             .get(&conn_id)
                             .map(|c| c.ext.is_leaf())
                             .unwrap_or(false);
+                        #[cfg(not(feature = "hub"))]
+                        let is_leaf = false;
 
                         if is_leaf {
                             // Inbound leaf node — skip client auth, send PING, go Active.
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            client.phase = ConnPhase::Active;
-                            client.echo = false; // suppress echo for leaf conns
-                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
-                            client.write_buf.extend_from_slice(b"PING\r\n");
+                            #[cfg(feature = "hub")]
+                            {
+                                let client = self.conns.get_mut(&conn_id).unwrap();
+                                client.phase = ConnPhase::Active;
+                                client.echo = false; // suppress echo for leaf conns
+                                #[cfg(feature = "leaf")]
+                                {
+                                    client.upstream_tx =
+                                        self.state.upstream_tx.read().unwrap().clone();
+                                }
+                                client.write_buf.extend_from_slice(b"PING\r\n");
 
-                            // Register leaf DirectWriter so interest can be propagated.
-                            let dw = client.direct_writer.clone();
-                            self.state.leaf_writers.write().unwrap().insert(conn_id, dw);
+                                // Register leaf DirectWriter so interest can be propagated.
+                                let dw = client.direct_writer.clone();
+                                self.state.leaf_writers.write().unwrap().insert(conn_id, dw);
 
-                            // Send existing subscriptions as LS+ to the new leaf.
-                            send_existing_subs(&self.state, &client.direct_writer);
+                                // Send existing subscriptions as LS+ to the new leaf.
+                                send_existing_subs(&self.state, &client.direct_writer);
 
-                            info!(conn_id, "inbound leaf connected");
+                                info!(conn_id, "inbound leaf connected");
+                            }
                         } else {
                             // Regular client connection — validate auth.
                             if !self
@@ -1641,7 +1664,10 @@ impl Worker {
                             client.phase = ConnPhase::Active;
                             client.echo = connect_info.echo;
                             client.permissions = perms;
-                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            #[cfg(feature = "leaf")]
+                            {
+                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            }
                             info!(conn_id, "client connected");
                         }
                     }
@@ -1660,81 +1686,96 @@ impl Worker {
                 }
             } else {
                 // Active phase: parse ops (client or leaf protocol).
+                #[cfg(feature = "hub")]
                 let is_leaf = self
                     .conns
                     .get(&conn_id)
                     .map(|c| c.ext.is_leaf())
                     .unwrap_or(false);
+                #[cfg(not(feature = "hub"))]
+                let is_leaf = false;
 
                 if is_leaf {
                     // Leaf connection: parse leaf protocol ops (LS+, LS-, LMSG, PING, PONG).
-                    let op = {
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        match nats_proto::try_parse_leaf_op(&mut client.read_buf) {
-                            Ok(op) => op,
-                            Err(_) => {
-                                self.remove_conn(conn_id);
-                                return;
-                            }
-                        }
-                    };
-                    match op {
-                        Some(op) => {
-                            let (result, expired) = {
-                                let client = self.conns.get_mut(&conn_id).unwrap();
-                                let draining = matches!(client.phase, ConnPhase::Draining);
-                                let mut conn_ctx = ConnCtx {
-                                    conn_id,
-                                    write_buf: &mut client.write_buf,
-                                    direct_writer: &client.direct_writer,
-                                    echo: client.echo,
-                                    sub_count: &mut client.sub_count,
-                                    upstream_tx: &mut client.upstream_tx,
-                                    permissions: &client.permissions,
-                                    ext: &mut client.ext,
-                                    draining,
-                                };
-                                let mut worker_ctx = WorkerCtx {
-                                    state: &self.state,
-                                    event_fd: self.event_fd.as_raw_fd(),
-                                    pending_notify: &mut self.pending_notify,
-                                    pending_notify_count: &mut self.pending_notify_count,
-                                    msgs_received: &mut self.msgs_received,
-                                    msgs_received_bytes: &mut self.msgs_received_bytes,
-                                    msgs_delivered: &mut self.msgs_delivered,
-                                    msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
-                                    worker_label: &self.worker_label,
-                                };
-                                LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
-                            };
-                            handle_expired_subs(
-                                &expired,
-                                &self.state,
-                                &mut self.conns,
-                                &self.worker_label,
-                            );
-                            match result {
-                                HandleResult::Ok => {}
-                                HandleResult::Flush => self.try_flush_conn(conn_id),
-                                HandleResult::Disconnect => {
-                                    self.try_flush_conn(conn_id);
+                    #[cfg(feature = "hub")]
+                    {
+                        let op = {
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            match nats_proto::try_parse_leaf_op(&mut client.read_buf) {
+                                Ok(op) => op,
+                                Err(_) => {
                                     self.remove_conn(conn_id);
                                     return;
                                 }
                             }
-                        }
-                        None => {
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.read_buf.try_shrink();
+                        };
+                        match op {
+                            Some(op) => {
+                                let (result, expired) = {
+                                    let client = self.conns.get_mut(&conn_id).unwrap();
+                                    let draining = matches!(client.phase, ConnPhase::Draining);
+                                    let mut conn_ctx = ConnCtx {
+                                        conn_id,
+                                        write_buf: &mut client.write_buf,
+                                        direct_writer: &client.direct_writer,
+                                        echo: client.echo,
+                                        sub_count: &mut client.sub_count,
+                                        #[cfg(feature = "leaf")]
+                                        upstream_tx: &mut client.upstream_tx,
+                                        permissions: &client.permissions,
+                                        ext: &mut client.ext,
+                                        draining,
+                                    };
+                                    let mut worker_ctx = WorkerCtx {
+                                        state: &self.state,
+                                        event_fd: self.event_fd.as_raw_fd(),
+                                        pending_notify: &mut self.pending_notify,
+                                        pending_notify_count: &mut self.pending_notify_count,
+                                        msgs_received: &mut self.msgs_received,
+                                        msgs_received_bytes: &mut self.msgs_received_bytes,
+                                        msgs_delivered: &mut self.msgs_delivered,
+                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                                        worker_label: &self.worker_label,
+                                    };
+                                    LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+                                };
+                                handle_expired_subs(
+                                    &expired,
+                                    &self.state,
+                                    &mut self.conns,
+                                    &self.worker_label,
+                                );
+                                match result {
+                                    HandleResult::Ok => {}
+                                    HandleResult::Flush => self.try_flush_conn(conn_id),
+                                    HandleResult::Disconnect => {
+                                        self.try_flush_conn(conn_id);
+                                        self.remove_conn(conn_id);
+                                        return;
+                                    }
+                                }
                             }
-                            return;
+                            None => {
+                                if let Some(client) = self.conns.get_mut(&conn_id) {
+                                    client.read_buf.try_shrink();
+                                }
+                                return;
+                            }
                         }
                     }
                 } else {
                     // Client connection: parse client protocol ops.
                     let can_skip = {
-                        let client = self.conns.get(&conn_id).unwrap();
-                        client.upstream_tx.is_none() && !self.state.has_subs.load(Ordering::Relaxed)
+                        #[cfg(feature = "leaf")]
+                        {
+                            let client = self.conns.get(&conn_id).unwrap();
+                            client.upstream_tx.is_none()
+                                && !self.state.has_subs.load(Ordering::Relaxed)
+                        }
+                        #[cfg(not(feature = "leaf"))]
+                        {
+                            !self.state.has_subs.load(Ordering::Relaxed)
+                        }
                     };
 
                     let op = {
@@ -1774,6 +1815,7 @@ impl Worker {
                                     direct_writer: &client.direct_writer,
                                     echo: client.echo,
                                     sub_count: &mut client.sub_count,
+                                    #[cfg(feature = "leaf")]
                                     upstream_tx: &mut client.upstream_tx,
                                     permissions: &client.permissions,
                                     ext: &mut client.ext,
@@ -1850,6 +1892,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
         r
     };
 
+    #[cfg(feature = "leaf")]
     if !removed.is_empty() {
         let mut upstream = state.upstream.write().unwrap();
         if let Some(ref mut up) = *upstream {
@@ -1858,6 +1901,8 @@ fn cleanup_conn(id: u64, state: &ServerState) {
             }
         }
     }
+    #[cfg(not(feature = "leaf"))]
+    let _ = &removed;
 
     info!(id, "client cleaned up");
 }

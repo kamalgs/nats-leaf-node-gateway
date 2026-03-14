@@ -27,5 +27,5 @@
 - **Production use** — this is an experiment, not a hardened production system.
   Operational tooling is improving but not yet production-grade.
 - **Protocol completeness** — only the subset of NATS client and leaf protocols
-  needed for leaf node relay is implemented (no UNSUB max-messages yet, no
-  drain protocol).
+  needed for leaf node relay is implemented. See [backlog.md](backlog.md) for
+  remaining gaps.

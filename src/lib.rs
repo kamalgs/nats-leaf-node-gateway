@@ -17,22 +17,25 @@
 //! and optionally forwards traffic to an upstream NATS hub server.
 
 pub mod config;
+#[cfg(feature = "leaf")]
 pub(crate) mod interest;
 pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
 pub mod types;
+#[cfg(feature = "leaf")]
 pub(crate) mod upstream;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 
 pub(crate) mod client_handler;
 pub(crate) mod handler;
+#[cfg(feature = "hub")]
 pub(crate) mod leaf_handler;
 
-#[cfg(feature = "subject-mapping")]
+#[cfg(all(feature = "leaf", feature = "subject-mapping"))]
 pub use interest::SubjectMapping;
-pub use server::{
-    ClientAuth, HubCredentials, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig,
-};
+#[cfg(feature = "leaf")]
+pub use server::HubCredentials;
+pub use server::{ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig};

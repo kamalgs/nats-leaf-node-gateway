@@ -9,6 +9,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::RawFd;
+#[cfg(feature = "leaf")]
 use std::sync::{Arc, Mutex};
 
 use bytes::{BufMut, BytesMut};
@@ -16,6 +17,7 @@ use bytes::{BufMut, BytesMut};
 use crate::types::{HeaderMap, ServerInfo};
 
 /// Resolved credentials to include in a leaf CONNECT message to the hub.
+#[cfg(feature = "leaf")]
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamConnectCreds {
     pub user: Option<String>,
@@ -32,6 +34,7 @@ use crate::nats_proto::{self, MsgBuilder};
 ///
 /// For TLS, both halves share the same `ClientConnection` behind an `Arc<Mutex>`.
 /// Each half also holds a cloned `TcpStream` so reads and writes go to the same socket.
+#[cfg(feature = "leaf")]
 pub(crate) enum HubStream {
     Plain(TcpStream),
     Tls {
@@ -40,6 +43,7 @@ pub(crate) enum HubStream {
     },
 }
 
+#[cfg(feature = "leaf")]
 impl Read for HubStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -70,6 +74,7 @@ impl Read for HubStream {
     }
 }
 
+#[cfg(feature = "leaf")]
 impl Write for HubStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
@@ -98,6 +103,7 @@ impl Write for HubStream {
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
 pub(crate) use crate::nats_proto::ClientOp;
+#[cfg(any(feature = "leaf", feature = "hub"))]
 pub(crate) use crate::nats_proto::LeafOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
@@ -413,12 +419,14 @@ impl ServerConn {
 /// Owns the raw stream and its own read buffer for parsing hub operations.
 /// Used during the handshake phase; call `split()` to get independent
 /// reader/writer halves for the I/O loop.
+#[cfg(feature = "leaf")]
 pub(crate) struct LeafConn {
     stream: HubStream,
     read_buf: AdaptiveBuf,
     buf_config: BufConfig,
 }
 
+#[cfg(feature = "leaf")]
 impl LeafConn {
     pub(crate) fn new(stream: TcpStream, buf_config: BufConfig) -> Self {
         Self {
@@ -576,11 +584,13 @@ impl LeafConn {
 }
 
 /// Read half of a leaf connection.
+#[cfg(feature = "leaf")]
 pub(crate) struct LeafReader {
     reader: HubStream,
     read_buf: AdaptiveBuf,
 }
 
+#[cfg(feature = "leaf")]
 impl LeafReader {
     /// Read the next leaf operation from the hub.
     /// Performs I/O if the buffer doesn't contain a complete op.
@@ -609,11 +619,13 @@ impl LeafReader {
 }
 
 /// Write half of a leaf connection, wrapped in BufWriter.
+#[cfg(feature = "leaf")]
 pub(crate) struct LeafWriter {
     writer: BufWriter<HubStream>,
     msg_builder: MsgBuilder,
 }
 
+#[cfg(feature = "leaf")]
 impl LeafWriter {
     /// Send LS+ subscription interest to the hub.
     pub(crate) fn send_leaf_sub(&mut self, subject: &[u8]) -> io::Result<()> {
@@ -879,6 +891,7 @@ mod tests {
 
     // --- LeafConn tests ---
 
+    #[cfg(feature = "leaf")]
     fn make_leaf_pair() -> (LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
         let conn = LeafConn::new(server, BufConfig::default());
@@ -886,6 +899,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_info() {
         let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n")
@@ -903,6 +917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_ping_pong_ok_err() {
         let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"PING\r\nPONG\r\n+OK\r\n-ERR 'test error'\r\n")
@@ -925,6 +940,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_ls_sub_unsub() {
         let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LS+ foo.bar\r\nLS+ baz.* myqueue\r\nLS- foo.bar\r\n")
@@ -955,6 +971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_lmsg_no_reply_no_headers() {
         let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LMSG test.subject 5\r\nhello\r\n").unwrap();
@@ -977,6 +994,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_lmsg_with_reply() {
         let (mut conn, mut hub) = make_leaf_pair();
         hub.write_all(b"LMSG test.subject reply.to 5\r\nhello\r\n")
@@ -1000,6 +1018,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_lmsg_with_headers() {
         let (mut conn, mut hub) = make_leaf_pair();
         let hdr = b"NATS/1.0\r\nX-Key: val\r\n\r\n";
@@ -1034,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_parse_lmsg_with_reply_and_headers() {
         let (mut conn, mut hub) = make_leaf_pair();
         let hdr = b"NATS/1.0\r\nFoo: bar\r\n\r\n";
@@ -1068,6 +1088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_send_leaf_sub_unsub() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -1082,6 +1103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_send_lmsg_no_headers() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -1097,6 +1119,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_send_lmsg_with_reply() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -1112,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_eof_returns_none() {
         let (mut conn, hub) = make_leaf_pair();
         drop(hub);
@@ -1120,6 +1144,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_connect_no_creds() {
         let (mut conn, mut hub) = make_leaf_pair();
         conn.send_leaf_connect("test-leaf", true, None).unwrap();
@@ -1136,6 +1161,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "leaf")]
     fn test_leaf_connect_with_creds() {
         let (mut conn, mut hub) = make_leaf_pair();
         let creds = UpstreamConnectCreds {

@@ -13,7 +13,7 @@ Items marked ~~strikethrough~~ are already implemented.
   behavior (multi-value, empty headers, etc.).
 - **Request-reply timeout** — server-side request timeout support.
 - **Multiple hub connections** — connect to more than one upstream hub.
-- **Inbound leaf connections** — accept solicited leaf connections from other servers.
+- ~~**Inbound leaf connections**~~ — accept solicited leaf connections from other servers.
 
 ## Config / Operational Gaps
 
@@ -43,7 +43,7 @@ Items marked ~~strikethrough~~ are already implemented.
 
 ## Performance Ideas
 
-- **io_uring** — replace epoll with io_uring for batched syscalls.
+- ~~**io_uring**~~ — replace epoll with io_uring for batched syscalls.
 - ~~**writev / vectored writes**~~ — coalesce messages into a single syscall.
 - **Connection affinity** — pin publisher and subscribers to the same worker.
 - **Trie-based subject matching** — replace wildcard `Vec` linear scan with a
@@ -61,5 +61,6 @@ Items marked ~~strikethrough~~ are already implemented.
 
 ## Platform
 
-- **Cross-platform portability** — extract a reactor trait, add poll()/kqueue/IOCP/WASI
-  backends. See [portability.md](portability.md).
+- ~~**Cross-platform portability**~~ — extract a reactor trait, add poll()/kqueue/IOCP/WASI
+  backends. See [portability.md](portability.md). *(Reactor trait extracted; epoll and
+  io_uring backends implemented. kqueue/IOCP/WASI remain future work.)*

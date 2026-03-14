@@ -5,12 +5,14 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+#[cfg(feature = "hub")]
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +23,10 @@ use tracing::{error, info, warn};
 use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::protocol::BufConfig;
-use crate::sub_list::{DirectWriter, SubList};
+#[cfg(feature = "hub")]
+use crate::sub_list::DirectWriter;
+use crate::sub_list::SubList;
+#[cfg(feature = "leaf")]
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
 
@@ -171,6 +176,7 @@ impl ClientAuth {
 }
 
 /// Credentials for connecting to an upstream hub server.
+#[cfg(feature = "leaf")]
 #[derive(Debug, Clone, Default)]
 pub struct HubCredentials {
     /// Username for user/password auth.
@@ -198,6 +204,7 @@ pub struct LeafServerConfig {
     /// Port to listen on.
     pub port: u16,
     /// Optional upstream hub URL (e.g., "nats://hub:4222").
+    #[cfg(feature = "leaf")]
     pub hub_url: Option<String>,
     /// Server name.
     pub server_name: String,
@@ -213,6 +220,7 @@ pub struct LeafServerConfig {
     pub ws_port: Option<u16>,
     /// Optional leafnode listen port. When set, open-wire acts as a hub and
     /// accepts inbound leaf node connections on this port.
+    #[cfg(feature = "hub")]
     pub leafnode_port: Option<u16>,
     /// Maximum pending write bytes per connection before disconnecting as a
     /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
@@ -234,6 +242,7 @@ pub struct LeafServerConfig {
     /// Client authentication configuration.
     pub client_auth: ClientAuth,
     /// Credentials for connecting to the upstream hub.
+    #[cfg(feature = "leaf")]
     pub hub_credentials: Option<HubCredentials>,
     /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
     pub metrics_port: Option<u16>,
@@ -264,14 +273,14 @@ pub struct LeafServerConfig {
     /// When a client subscribes to a subject matching a template, the leaf sends
     /// a single collapsed wildcard `LS+` to the hub instead of per-subject `LS+`.
     /// This reduces upstream interest propagation from O(N) to O(1) per template.
-    #[cfg(feature = "interest-collapse")]
+    #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
     pub interest_collapse: Vec<String>,
     /// Subject mapping rules for upstream leaf subscriptions.
     ///
     /// Each mapping rewrites subjects matching the `from` pattern to the `to` pattern
     /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
     /// exact mappings.
-    #[cfg(feature = "subject-mapping")]
+    #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
     pub subject_mappings: Vec<crate::interest::SubjectMapping>,
 }
 
@@ -283,12 +292,14 @@ impl Default for LeafServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 4222,
+            #[cfg(feature = "leaf")]
             hub_url: None,
             server_name: "leaf-node".to_string(),
             max_read_buf_capacity: 65536,
             write_buf_capacity: 65536,
             workers,
             ws_port: None,
+            #[cfg(feature = "hub")]
             leafnode_port: None,
             max_pending: 64 * 1024 * 1024,
             max_payload: 1_048_576,
@@ -298,6 +309,7 @@ impl Default for LeafServerConfig {
             ping_interval: std::time::Duration::from_secs(120),
             max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
+            #[cfg(feature = "leaf")]
             hub_credentials: None,
             metrics_port: None,
             tls_cert: None,
@@ -310,9 +322,9 @@ impl Default for LeafServerConfig {
             lame_duck_duration: std::time::Duration::from_secs(30),
             lame_duck_grace_period: std::time::Duration::from_secs(10),
             monitoring_port: None,
-            #[cfg(feature = "interest-collapse")]
+            #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
             interest_collapse: Vec::new(),
-            #[cfg(feature = "subject-mapping")]
+            #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
             subject_mappings: Vec::new(),
         }
     }
@@ -547,9 +559,11 @@ pub(crate) struct ServerState {
     pub auth_timeout_ms: AtomicU64,
     pub max_pings_outstanding: AtomicU32,
     pub subs: std::sync::RwLock<SubList>,
+    #[cfg(feature = "leaf")]
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
     /// Set once after upstream connects; read without locking on every publish.
+    #[cfg(feature = "leaf")]
     pub upstream_tx: std::sync::RwLock<Option<mpsc::Sender<UpstreamCmd>>>,
     /// Lock-free flag: true when at least one subscription exists.
     /// Updated on subscribe/unsubscribe. Avoids taking subs lock on every publish
@@ -573,9 +587,11 @@ pub(crate) struct ServerState {
     pub stats: ServerStats,
     /// Port advertised in INFO to inbound leaf connections (`leafnodes.listen` port).
     /// `None` when hub mode is not enabled.
+    #[cfg(feature = "hub")]
     pub leafnode_port: Option<u16>,
     /// Registry of DirectWriters for inbound leaf connections.
     /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
+    #[cfg(feature = "hub")]
     pub leaf_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
 }
 
@@ -593,7 +609,7 @@ impl ServerState {
         max_payload: usize,
         max_control_line: usize,
         max_subscriptions: usize,
-        leafnode_port: Option<u16>,
+        #[cfg(feature = "hub")] leafnode_port: Option<u16>,
     ) -> Self {
         Self {
             info,
@@ -602,7 +618,9 @@ impl ServerState {
             auth_timeout_ms: AtomicU64::new(auth_timeout.as_millis() as u64),
             max_pings_outstanding: AtomicU32::new(max_pings_outstanding),
             subs: std::sync::RwLock::new(SubList::new()),
+            #[cfg(feature = "leaf")]
             upstream: std::sync::RwLock::new(None),
+            #[cfg(feature = "leaf")]
             upstream_tx: std::sync::RwLock::new(None),
             has_subs: AtomicBool::new(false),
             buf_config,
@@ -614,7 +632,9 @@ impl ServerState {
             max_control_line: AtomicUsize::new(max_control_line),
             max_subscriptions: AtomicUsize::new(max_subscriptions),
             stats: ServerStats::default(),
+            #[cfg(feature = "hub")]
             leafnode_port,
+            #[cfg(feature = "hub")]
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
         }
     }
@@ -691,6 +711,7 @@ impl LeafServer {
                 config.max_payload,
                 config.max_control_line,
                 config.max_subscriptions,
+                #[cfg(feature = "hub")]
                 config.leafnode_port,
             )),
         }
@@ -699,6 +720,7 @@ impl LeafServer {
     /// Connect to the upstream hub if configured, using the leaf node protocol.
     /// Uses a supervisor pattern: initial failure is non-fatal, the supervisor
     /// will keep retrying with exponential backoff.
+    #[cfg(feature = "leaf")]
     fn connect_upstream(&self) {
         if let Some(ref hub_url) = self.config.hub_url {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
@@ -788,6 +810,7 @@ impl LeafServer {
     }
 
     /// Distribute a new inbound leaf TCP connection to the next worker (round-robin).
+    #[cfg(feature = "hub")]
     fn accept_leaf_tcp(
         &self,
         tcp_stream: TcpStream,
@@ -813,6 +836,7 @@ impl LeafServer {
             spawn_monitoring_server(port, Arc::clone(&self.state));
         }
 
+        #[cfg(feature = "leaf")]
         self.connect_upstream();
 
         let workers = self.spawn_workers();
@@ -831,6 +855,7 @@ impl LeafServer {
             None
         };
 
+        #[cfg(feature = "hub")]
         let leaf_listener = if let Some(leaf_port) = self.config.leafnode_port {
             let leaf_addr = format!("{}:{}", self.config.host, leaf_port);
             let ll = TcpListener::bind(&leaf_addr)?;
@@ -839,6 +864,8 @@ impl LeafServer {
         } else {
             None
         };
+        #[cfg(not(feature = "hub"))]
+        let leaf_listener: Option<TcpListener> = None;
 
         let has_extra_listeners = ws_listener.is_some() || leaf_listener.is_some();
         if has_extra_listeners {
@@ -892,6 +919,7 @@ impl LeafServer {
                         }
                     }
                 }
+                #[cfg(feature = "hub")]
                 if pfds[2].revents & libc::POLLIN != 0 {
                     if let Some(ref ll) = leaf_listener {
                         while let Ok((stream, addr)) = ll.accept() {
@@ -934,6 +962,7 @@ impl LeafServer {
             spawn_monitoring_server(port, Arc::clone(&self.state));
         }
 
+        #[cfg(feature = "leaf")]
         self.connect_upstream();
 
         let workers = self.spawn_workers();
@@ -954,6 +983,7 @@ impl LeafServer {
             None
         };
 
+        #[cfg(feature = "hub")]
         let leaf_listener = if let Some(leaf_port) = self.config.leafnode_port {
             let leaf_addr = format!("{}:{}", self.config.host, leaf_port);
             let ll = TcpListener::bind(&leaf_addr)?;
@@ -963,6 +993,8 @@ impl LeafServer {
         } else {
             None
         };
+        #[cfg(not(feature = "hub"))]
+        let leaf_listener: Option<TcpListener> = None;
 
         let mut pfds = [
             libc::pollfd {
@@ -1025,6 +1057,7 @@ impl LeafServer {
                 }
             }
 
+            #[cfg(feature = "hub")]
             if ret > 0 && pfds[2].revents & libc::POLLIN != 0 {
                 if let Some(ref ll) = leaf_listener {
                     while let Ok((tcp_stream, addr)) = ll.accept() {
@@ -1078,6 +1111,7 @@ impl LeafServer {
         }
 
         // Drop upstream
+        #[cfg(feature = "leaf")]
         {
             *self.state.upstream_tx.write().unwrap() = None;
             let mut upstream = self.state.upstream.write().unwrap();

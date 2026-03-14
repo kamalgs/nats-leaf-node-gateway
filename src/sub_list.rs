@@ -91,6 +91,7 @@ impl DirectWriter {
     }
 
     /// Format and append an LMSG to the shared buffer (for leaf node delivery).
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub(crate) fn write_lmsg(
         &self,
         subject: &[u8],
@@ -107,6 +108,7 @@ impl DirectWriter {
     }
 
     /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS- lines).
+    #[cfg(feature = "hub")]
     pub(crate) fn write_raw(&self, data: &[u8]) {
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
@@ -474,6 +476,7 @@ impl SubList {
 
     /// Returns unique non-leaf (subject, queue) pairs for leaf interest propagation.
     /// Only includes subscriptions from client connections (not leaf connections).
+    #[cfg(feature = "hub")]
     pub fn client_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
@@ -690,6 +693,7 @@ mod tests {
     // --- DirectWriter tests ---
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_direct_writer_formats_lmsg() {
         let writer = DirectWriter::new_dummy();
 
@@ -701,6 +705,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_direct_writer_formats_lmsg_with_reply() {
         let writer = DirectWriter::new_dummy();
 
@@ -1124,6 +1129,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "hub")]
     fn test_client_interests_excludes_leaf_subs() {
         let mut sl = SubList::new();
         // Client subs
@@ -1152,6 +1158,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "hub")]
     fn test_direct_writer_write_raw() {
         let writer = DirectWriter::new_dummy();
         // No data yet

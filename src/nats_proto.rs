@@ -27,7 +27,9 @@
 use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 
-use crate::types::{ConnectInfo, HeaderMap, ServerInfo};
+#[cfg(any(feature = "leaf", feature = "hub"))]
+use crate::types::ServerInfo;
+use crate::types::{ConnectInfo, HeaderMap};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Itoa: pre-computed decimal byte strings for small integers.
@@ -547,6 +549,7 @@ fn proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// A parsed hub→leaf operation.
+#[cfg(any(feature = "leaf", feature = "hub"))]
 #[derive(Debug)]
 pub enum LeafOp {
     Info(Box<ServerInfo>),
@@ -573,6 +576,7 @@ pub enum LeafOp {
 }
 
 /// Try to parse the next hub→leaf operation from `buf`.
+#[cfg(any(feature = "leaf", feature = "hub"))]
 pub fn try_parse_leaf_op(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     if buf.is_empty() {
         return Ok(None);
@@ -659,6 +663,7 @@ pub fn try_parse_leaf_op(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     }
 }
 
+#[cfg(any(feature = "leaf", feature = "hub"))]
 fn parse_leaf_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     let nl = match find_newline(buf) {
         Some(i) => i,
@@ -710,6 +715,7 @@ fn parse_leaf_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     Ok(Some(op))
 }
 
+#[cfg(any(feature = "leaf", feature = "hub"))]
 fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     // LMSG subject [reply] [hdr_size] total_size\r\n[payload]\r\n
     let nl = match find_newline(buf) {
@@ -822,6 +828,7 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     }
 }
 
+#[cfg(any(feature = "leaf", feature = "hub"))]
 fn leaf_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     if let Some(nl) = find_newline(buf) {
         buf.advance(nl + 1);
@@ -963,6 +970,7 @@ impl MsgBuilder {
     }
 
     /// Build `LMSG subject [reply] [hdr_len] total_len\r\npayload\r\n`.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_lmsg(
         &mut self,
         subject: &[u8],
@@ -1015,6 +1023,7 @@ impl MsgBuilder {
     /// Build `LMSG` header only (no payload copy).
     /// Returns the protocol header line ending with `\r\n`, plus any serialized
     /// headers. Caller writes payload + `\r\n` separately.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_lmsg_header(
         &mut self,
         subject: &[u8],
@@ -1061,6 +1070,7 @@ impl MsgBuilder {
     }
 
     /// Build `LS+ subject\r\n`.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_leaf_sub(&mut self, subject: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"LS+ ");
@@ -1070,6 +1080,7 @@ impl MsgBuilder {
     }
 
     /// Build `LS- subject\r\n`.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_leaf_unsub(&mut self, subject: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"LS- ");
@@ -1079,6 +1090,7 @@ impl MsgBuilder {
     }
 
     /// Build `LS+ subject queue\r\n` for queue group subscriptions.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_leaf_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"LS+ ");
@@ -1090,6 +1102,7 @@ impl MsgBuilder {
     }
 
     /// Build `LS- subject queue\r\n` for queue group unsubscriptions.
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     pub fn build_leaf_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"LS- ");
@@ -1393,6 +1406,7 @@ mod tests {
     // -- Leaf op parsing --------------------------------------------------------
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_ping_pong_ok_err() {
         let mut buf = BytesMut::from("PING\r\nPONG\r\n+OK\r\n-ERR 'test error'\r\n");
         assert!(matches!(
@@ -1414,6 +1428,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_info() {
         let mut buf = BytesMut::from("INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n");
         match try_parse_leaf_op(&mut buf).unwrap().unwrap() {
@@ -1426,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_sub_unsub() {
         let mut buf = BytesMut::from("LS+ foo.bar\r\nLS+ baz.* myqueue\r\nLS- foo.bar\r\n");
         match try_parse_leaf_op(&mut buf).unwrap().unwrap() {
@@ -1452,6 +1468,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_lmsg_no_reply() {
         let mut buf = BytesMut::from("LMSG test.subject 5\r\nhello\r\n");
         match try_parse_leaf_op(&mut buf).unwrap().unwrap() {
@@ -1471,6 +1488,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_lmsg_with_reply() {
         let mut buf = BytesMut::from("LMSG test.subject reply.to 5\r\nhello\r\n");
         match try_parse_leaf_op(&mut buf).unwrap().unwrap() {
@@ -1490,6 +1508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_lmsg_with_headers() {
         let hdr = b"NATS/1.0\r\nX-Key: val\r\n\r\n";
         let payload = b"data";
@@ -1524,6 +1543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_leaf_lmsg_with_reply_and_headers() {
         let hdr = b"NATS/1.0\r\nFoo: bar\r\n\r\n";
         let payload = b"body";
@@ -1581,6 +1601,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_lmsg_no_reply() {
         let mut b = MsgBuilder::new();
         let result = b.build_lmsg(b"test.sub", None, None, b"hello");
@@ -1588,6 +1609,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_lmsg_with_reply() {
         let mut b = MsgBuilder::new();
         let result = b.build_lmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
@@ -1595,18 +1617,21 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_leaf_sub() {
         let mut b = MsgBuilder::new();
         assert_eq!(b.build_leaf_sub(b"foo.>"), b"LS+ foo.>\r\n");
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_leaf_unsub() {
         let mut b = MsgBuilder::new();
         assert_eq!(b.build_leaf_unsub(b"foo.>"), b"LS- foo.>\r\n");
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_leaf_sub_queue() {
         let mut b = MsgBuilder::new();
         assert_eq!(
@@ -1616,6 +1641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "leaf", feature = "hub"))]
     fn test_build_leaf_unsub_queue() {
         let mut b = MsgBuilder::new();
         assert_eq!(

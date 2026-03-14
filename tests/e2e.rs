@@ -91,6 +91,7 @@ impl Drop for NatsServer {
 
 /// Start a LeafServer on the given port with optional hub_url, returning the
 /// shutdown sender. The server runs in a background tokio task.
+#[cfg(feature = "leaf")]
 fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -127,6 +128,7 @@ async fn wait_for_leaf(port: u16) {
 }
 
 #[tokio::test]
+#[cfg(feature = "leaf")]
 async fn local_pub_sub() {
     let leaf_port = free_port();
     let shutdown_tx = spawn_leaf(leaf_port, None);
@@ -163,6 +165,7 @@ async fn local_pub_sub() {
 }
 
 #[tokio::test]
+#[cfg(feature = "leaf")]
 async fn upstream_forward() {
     // Start upstream nats-server
     let upstream_port = free_port();
@@ -214,6 +217,7 @@ async fn upstream_forward() {
 }
 
 #[tokio::test]
+#[cfg(feature = "leaf")]
 async fn leaf_to_upstream() {
     // Start upstream nats-server
     let upstream_port = free_port();
@@ -267,6 +271,7 @@ async fn leaf_to_upstream() {
 // --- Hub mode helpers ---
 
 /// Start a LeafServer in hub mode (with leafnode_port), returning the shutdown sender.
+#[cfg(feature = "hub")]
 fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
@@ -275,7 +280,6 @@ fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
     let config = LeafServerConfig {
         host: "127.0.0.1".to_string(),
         port: client_port,
-        hub_url: None,
         server_name: format!("test-hub-{}", client_port),
         leafnode_port: Some(leafnode_port),
         ..Default::default()
@@ -293,6 +297,7 @@ fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
 
 impl NatsServer {
     /// Start a Go nats-server configured as a leaf connecting to the given hub leafnode port.
+    #[cfg(feature = "hub")]
     fn start_as_leaf(client_port: u16, hub_leafnode_port: u16) -> Self {
         let bin = nats_server_bin();
 
@@ -328,6 +333,7 @@ impl NatsServer {
 // --- Hub mode tests ---
 
 #[tokio::test]
+#[cfg(feature = "hub")]
 async fn hub_mode_local_pub_sub() {
     let hub_client_port = free_port();
     let hub_leaf_port = free_port();
@@ -364,6 +370,7 @@ async fn hub_mode_local_pub_sub() {
 }
 
 #[tokio::test]
+#[cfg(feature = "hub")]
 async fn hub_mode_leaf_to_hub() {
     // Start Rust hub
     let hub_client_port = free_port();
@@ -412,6 +419,7 @@ async fn hub_mode_leaf_to_hub() {
 }
 
 #[tokio::test]
+#[cfg(feature = "hub")]
 async fn hub_mode_hub_to_leaf() {
     // Start Rust hub
     let hub_client_port = free_port();

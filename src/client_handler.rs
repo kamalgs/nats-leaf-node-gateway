@@ -15,10 +15,11 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
-use crate::handler::{
-    bytes_to_str, deliver_to_subs, forward_to_upstream, propagate_leaf_sub, propagate_leaf_unsub,
-    ConnCtx, HandleResult, WorkerCtx,
-};
+#[cfg(feature = "leaf")]
+use crate::handler::forward_to_upstream;
+use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, HandleResult, WorkerCtx};
+#[cfg(feature = "hub")]
+use crate::handler::{propagate_leaf_sub, propagate_leaf_unsub};
 use crate::nats_proto::{self, ClientOp};
 use crate::sub_list::Subscription;
 
@@ -111,7 +112,9 @@ impl ClientHandler {
         let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
 
         // Clone for upstream + leaf propagation before moving into Subscription
+        #[cfg(feature = "leaf")]
         let upstream_queue = queue_str.clone();
+        #[cfg(feature = "hub")]
         let leaf_queue = queue_str.clone();
 
         let sub = Subscription {
@@ -132,6 +135,7 @@ impl ClientHandler {
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
+        #[cfg(feature = "leaf")]
         {
             let mut upstream = wctx.state.upstream.write().unwrap();
             if let Some(ref mut up) = *upstream {
@@ -144,6 +148,7 @@ impl ClientHandler {
         *conn.sub_count += 1;
 
         // Propagate LS+ to inbound leaf connections.
+        #[cfg(feature = "hub")]
         propagate_leaf_sub(
             wctx.state,
             subject_str.as_bytes(),
@@ -180,15 +185,19 @@ impl ClientHandler {
                         .has_subs
                         .store(!subs.is_empty(), Ordering::Relaxed);
                     *conn.sub_count = conn.sub_count.saturating_sub(1);
-                    let mut upstream = wctx.state.upstream.write().unwrap();
-                    if let Some(ref mut up) = *upstream {
-                        up.remove_interest(&removed.subject, removed.queue.as_deref());
+                    #[cfg(feature = "leaf")]
+                    {
+                        let mut upstream = wctx.state.upstream.write().unwrap();
+                        if let Some(ref mut up) = *upstream {
+                            up.remove_interest(&removed.subject, removed.queue.as_deref());
+                        }
                     }
                     gauge!(
                         "subscriptions_active",
                         "worker" => wctx.worker_label.to_string()
                     )
                     .decrement(1.0);
+                    #[cfg(feature = "hub")]
                     propagate_leaf_unsub(
                         wctx.state,
                         removed.subject.as_bytes(),
@@ -215,15 +224,19 @@ impl ClientHandler {
 
             if let Some(ref removed) = removed {
                 *conn.sub_count = conn.sub_count.saturating_sub(1);
-                let mut upstream = wctx.state.upstream.write().unwrap();
-                if let Some(ref mut up) = *upstream {
-                    up.remove_interest(&removed.subject, removed.queue.as_deref());
+                #[cfg(feature = "leaf")]
+                {
+                    let mut upstream = wctx.state.upstream.write().unwrap();
+                    if let Some(ref mut up) = *upstream {
+                        up.remove_interest(&removed.subject, removed.queue.as_deref());
+                    }
                 }
                 gauge!(
                     "subscriptions_active",
                     "worker" => wctx.worker_label.to_string()
                 )
                 .decrement(1.0);
+                #[cfg(feature = "hub")]
                 propagate_leaf_unsub(
                     wctx.state,
                     removed.subject.as_bytes(),
@@ -290,6 +303,7 @@ impl ClientHandler {
             !conn.echo,
         );
 
+        #[cfg(feature = "leaf")]
         forward_to_upstream(
             conn.upstream_tx,
             wctx.state,

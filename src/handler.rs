@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
+#[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -21,10 +22,12 @@ use bytes::{Bytes, BytesMut};
 use metrics::gauge;
 use tracing::debug;
 
+#[cfg(feature = "hub")]
 use crate::nats_proto;
 use crate::server::{Permissions, ServerState};
 use crate::sub_list::DirectWriter;
 use crate::types::HeaderMap;
+#[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
 
 /// Per-connection state view. Borrows disjointly from `ClientState` fields
@@ -36,6 +39,7 @@ pub(crate) struct ConnCtx<'a> {
     pub direct_writer: &'a DirectWriter,
     pub echo: bool,
     pub sub_count: &'a mut usize,
+    #[cfg(feature = "leaf")]
     pub upstream_tx: &'a mut Option<mpsc::Sender<UpstreamCmd>>,
     pub permissions: &'a Option<Permissions>,
     pub ext: &'a mut ConnExt,
@@ -49,6 +53,7 @@ pub(crate) enum ConnExt {
     /// Normal NATS client connection (uses MSG/HMSG for delivery).
     Client,
     /// Inbound leaf node connection (uses LMSG for delivery, LS+/LS- for interest).
+    #[cfg(feature = "hub")]
     Leaf {
         leaf_sid_counter: u64,
         leaf_sids: HashMap<(Bytes, Option<Bytes>), u64>,
@@ -57,8 +62,15 @@ pub(crate) enum ConnExt {
 
 impl ConnExt {
     /// Returns `true` for inbound leaf connections.
+    #[cfg(feature = "hub")]
     pub fn is_leaf(&self) -> bool {
         matches!(self, Self::Leaf { .. })
+    }
+
+    /// Returns `true` for inbound leaf connections.
+    #[cfg(not(feature = "hub"))]
+    pub fn is_leaf(&self) -> bool {
+        false
     }
 }
 
@@ -114,12 +126,16 @@ pub(crate) fn deliver_to_subs(
         if skip_echo && sub.conn_id == skip_conn_id {
             return;
         }
+        #[cfg(feature = "hub")]
         if sub.is_leaf {
             sub.writer.write_lmsg(subject, reply, headers, payload);
         } else {
             sub.writer
                 .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         }
+        #[cfg(not(feature = "hub"))]
+        sub.writer
+            .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         *wctx.msgs_delivered += 1;
         *wctx.msgs_delivered_bytes += payload_len;
         // Skip notification for our own worker — flush_pending
@@ -146,6 +162,7 @@ pub(crate) fn deliver_to_subs(
 /// Unlike `deliver_to_subs`, this variant collects dirty writers for batch
 /// notification (since the upstream reader runs outside the worker event loop)
 /// and does not track worker-level metrics.
+#[cfg(feature = "leaf")]
 pub(crate) fn deliver_to_subs_upstream(
     state: &ServerState,
     subject: &[u8],
@@ -157,12 +174,16 @@ pub(crate) fn deliver_to_subs_upstream(
 ) -> Vec<(u64, u64)> {
     let subs = state.subs.read().unwrap();
     let (_count, expired) = subs.for_each_match(subject_str, |sub| {
+        #[cfg(feature = "hub")]
         if sub.is_leaf {
             sub.writer.write_lmsg(subject, reply, headers, payload);
         } else {
             sub.writer
                 .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         }
+        #[cfg(not(feature = "hub"))]
+        sub.writer
+            .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         dirty_writers.push(sub.writer.clone());
     });
     drop(subs);
@@ -189,10 +210,14 @@ pub(crate) fn handle_expired_subs(
             if let Some(client) = conns.get_mut(exp_conn_id) {
                 client.sub_count = client.sub_count.saturating_sub(1);
             }
-            let mut upstream = state.upstream.write().unwrap();
-            if let Some(ref mut up) = *upstream {
-                up.remove_interest(&removed.subject, removed.queue.as_deref());
+            #[cfg(feature = "leaf")]
+            {
+                let mut upstream = state.upstream.write().unwrap();
+                if let Some(ref mut up) = *upstream {
+                    up.remove_interest(&removed.subject, removed.queue.as_deref());
+                }
             }
+            let _ = &removed;
             gauge!(
                 "subscriptions_active",
                 "worker" => worker_label.to_string()
@@ -213,6 +238,7 @@ pub(crate) fn handle_expired_subs(
 ///
 /// Similar to `handle_expired_subs` but without access to worker connections
 /// (upstream runs in its own thread).
+#[cfg(feature = "leaf")]
 pub(crate) fn handle_expired_subs_upstream(expired: &[(u64, u64)], state: &ServerState) {
     if expired.is_empty() {
         return;
@@ -230,6 +256,7 @@ pub(crate) fn handle_expired_subs_upstream(expired: &[(u64, u64)], state: &Serve
 }
 
 /// Propagate LS+ to all inbound leaf connections (interest advertisement).
+#[cfg(feature = "hub")]
 pub(crate) fn propagate_leaf_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
     let writers = state.leaf_writers.read().unwrap();
     if writers.is_empty() {
@@ -248,6 +275,7 @@ pub(crate) fn propagate_leaf_sub(state: &ServerState, subject: &[u8], queue: Opt
 }
 
 /// Propagate LS- to all inbound leaf connections (interest removal).
+#[cfg(feature = "hub")]
 pub(crate) fn propagate_leaf_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
     let writers = state.leaf_writers.read().unwrap();
     if writers.is_empty() {
@@ -266,6 +294,7 @@ pub(crate) fn propagate_leaf_unsub(state: &ServerState, subject: &[u8], queue: O
 }
 
 /// Send LS+ for all existing client subscriptions to a given leaf's DirectWriter.
+#[cfg(feature = "hub")]
 pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
     let subs = state.subs.read().unwrap();
     let mut builder = nats_proto::MsgBuilder::new();
@@ -291,6 +320,7 @@ pub(crate) fn bytes_to_str(b: &Bytes) -> &str {
 
 /// Forward a publish to the upstream hub. If the writer thread has gone,
 /// refresh the sender from global state.
+#[cfg(feature = "leaf")]
 pub(crate) fn forward_to_upstream(
     upstream_tx: &mut Option<mpsc::Sender<UpstreamCmd>>,
     state: &ServerState,

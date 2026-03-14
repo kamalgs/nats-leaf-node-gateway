@@ -13,11 +13,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use metrics::gauge;
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(feature = "leaf")]
+use tracing::warn;
 
-use crate::handler::{
-    bytes_to_str, deliver_to_subs, forward_to_upstream, ConnCtx, ConnExt, HandleResult, WorkerCtx,
-};
+#[cfg(feature = "leaf")]
+use crate::handler::forward_to_upstream;
+use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
 use crate::nats_proto;
 use crate::protocol::LeafOp;
 use crate::sub_list::Subscription;
@@ -85,6 +87,7 @@ impl LeafHandler {
             ConnExt::Client => unreachable!("leaf op on client connection"),
         };
 
+        #[cfg(feature = "leaf")]
         let upstream_queue = queue_str.clone();
 
         let sub = Subscription {
@@ -105,6 +108,7 @@ impl LeafHandler {
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
+        #[cfg(feature = "leaf")]
         {
             let mut upstream = wctx.state.upstream.write().unwrap();
             if let Some(ref mut up) = *upstream {
@@ -153,9 +157,12 @@ impl LeafHandler {
 
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
-            let mut upstream = wctx.state.upstream.write().unwrap();
-            if let Some(ref mut up) = *upstream {
-                up.remove_interest(&removed.subject, removed.queue.as_deref());
+            #[cfg(feature = "leaf")]
+            {
+                let mut upstream = wctx.state.upstream.write().unwrap();
+                if let Some(ref mut up) = *upstream {
+                    up.remove_interest(&removed.subject, removed.queue.as_deref());
+                }
             }
             gauge!(
                 "subscriptions_active",
@@ -198,6 +205,7 @@ impl LeafHandler {
             true, // always suppress echo for leaf connections
         );
 
+        #[cfg(feature = "leaf")]
         forward_to_upstream(
             conn.upstream_tx,
             wctx.state,

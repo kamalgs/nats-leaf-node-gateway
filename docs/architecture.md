@@ -1,10 +1,13 @@
 # Architecture
 
-A high-performance NATS leaf node server written in Rust. It accepts client
-connections over TCP, routes messages between local subscribers, and optionally
-forwards traffic to an upstream NATS hub via the leaf node protocol. The design
-prioritises throughput and low latency over feature completeness — there is no
-JetStream, clustering, auth, or TLS.
+A high-performance NATS-compatible message relay written in Rust. It accepts
+client connections over TCP, routes messages between local subscribers, and
+optionally forwards traffic to an upstream NATS hub via the leaf node protocol.
+It can also accept inbound leaf connections from other servers (hub mode).
+
+Both upstream (`leaf` feature) and inbound leaf (`hub` feature) capabilities are
+Cargo feature-gated and default-enabled. Deployments can compile with neither
+(pure local relay), one, or both. See [ADR-009](adr/009-leaf-hub-feature-flags.md).
 
 ## System Diagram
 
@@ -16,7 +19,7 @@ JetStream, clustering, auth, or TLS.
                                      │ leaf node protocol
                                      │ (LS+/LS-/LMSG)
                           ┌──────────┴──────────────────┐
-                          │       Upstream Module        │
+                          │    Upstream Module [leaf]    │
                           │  reader thread  writer thread│
                           └──────────┬──────────────────┘
                                      │ Arc<ServerState>
@@ -27,23 +30,39 @@ JetStream, clustering, auth, or TLS.
     │  └────┬─────┘          └────────────┘          └────┬─────┘   │
     │       │ epoll                                        │ epoll   │
     │  ┌────┴────────────┐                         ┌──────┴──────┐  │
-    │  │ C0  C1  C2  ... │                         │ Cm ... Cn   │  │
-    │  │ (client sockets) │                         │             │  │
+    │  │ C0  C1  L0  ... │                         │ Cm  Ln  Cn  │  │
+    │  │ (clients + leafs)│                         │             │  │
     │  └─────────────────┘                         └─────────────┘  │
-    └───────────────────────────────────────────────────────────────┘
+    └──────────────────────────────┬──────────────────────────────────┘
+                                   │ leafnode listener [hub]
+                          ┌────────┴───────────────────┐
+                          │   Inbound Leaf Connections  │
+                          │  (other leaf node servers)  │
+                          └────────────────────────────┘
 ```
+
+Features marked `[leaf]` require the `leaf` Cargo feature; `[hub]` requires
+`hub`. Both are default-enabled.
 
 ## Module Map
 
-| File | Purpose | Key Types |
-|------|---------|-----------|
-| `lib.rs` | Public API re-exports | `LeafServer`, `LeafServerConfig` |
-| `server.rs` | Accept loop, worker spawning, shutdown | `LeafServer`, `ServerState` |
-| `worker.rs` | Per-thread epoll event loop | `Worker`, `ClientState`, `ConnPhase`, `WorkerHandle` |
-| `protocol.rs` | Connection I/O wrappers, adaptive buffers | `ServerConn`, `LeafConn`, `AdaptiveBuf`, `BufConfig` |
-| `nats_proto.rs` | Zero-copy protocol parser and message builder | `ClientOp`, `LeafOp`, `MsgBuilder` |
-| `sub_list.rs` | Subscription storage and fan-out | `SubList`, `Subscription`, `DirectWriter` |
-| `upstream.rs` | Hub connection (reader + writer threads) | `Upstream`, `UpstreamCmd` |
+| File | Purpose | Key Types | Feature |
+|------|---------|-----------|---------|
+| `lib.rs` | Public API re-exports | `LeafServer`, `LeafServerConfig` | — |
+| `server.rs` | Accept loop, worker spawning, shutdown | `LeafServer`, `ServerState` | — |
+| `worker.rs` | Per-thread epoll event loop | `Worker`, `ClientState`, `ConnPhase` | — |
+| `handler.rs` | Shared handler types and delivery | `ConnCtx`, `WorkerCtx`, `ConnExt` | — |
+| `client_handler.rs` | Client protocol dispatch | `ClientHandler` | — |
+| `leaf_handler.rs` | Inbound leaf protocol dispatch | `LeafHandler` | `hub` |
+| `protocol.rs` | Connection I/O wrappers, adaptive buffers | `ServerConn`, `LeafConn`, `AdaptiveBuf` | `leaf`* |
+| `nats_proto.rs` | Zero-copy protocol parser and message builder | `ClientOp`, `LeafOp`, `MsgBuilder` | `leaf\|hub`* |
+| `sub_list.rs` | Subscription storage and fan-out | `SubList`, `Subscription`, `DirectWriter` | — |
+| `upstream.rs` | Hub connection (reader + writer threads) | `Upstream`, `UpstreamCmd` | `leaf` |
+| `interest.rs` | Interest collapse + subject mapping pipeline | `InterestPipeline` | `leaf` |
+| `config.rs` | Go nats-server `.conf` file parser | `load_config` | — |
+
+\* These modules are always compiled but individual types/functions within
+them are gated behind the indicated features.
 
 ## Connection Lifecycle
 

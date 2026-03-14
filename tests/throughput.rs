@@ -189,6 +189,7 @@ mod proto_bench {
             });
         });
 
+        #[cfg(any(feature = "leaf", feature = "hub"))]
         group.bench_function("lmsg_128b", |b| {
             let mut builder = nats_proto::MsgBuilder::new();
             b.iter(|| {
@@ -200,40 +201,43 @@ mod proto_bench {
     }
 
     /// Bench LMSG parsing (hub → leaf path).
-    pub fn bench_parse_lmsg(c: &mut Criterion) {
-        let mut group = c.benchmark_group("parse_leaf");
+    pub fn bench_parse_lmsg(_c: &mut Criterion) {
+        #[cfg(any(feature = "leaf", feature = "hub"))]
+        {
+            let mut group = _c.benchmark_group("parse_leaf");
 
-        let payload = vec![0u8; 128];
-        let mut raw = Vec::new();
-        raw.extend_from_slice(b"LMSG test.subject 128\r\n");
-        raw.extend_from_slice(&payload);
-        raw.extend_from_slice(b"\r\n");
-        let template = raw.clone();
+            let payload = vec![0u8; 128];
+            let mut raw = Vec::new();
+            raw.extend_from_slice(b"LMSG test.subject 128\r\n");
+            raw.extend_from_slice(&payload);
+            raw.extend_from_slice(b"\r\n");
+            let template = raw.clone();
 
-        group.throughput(Throughput::Bytes(template.len() as u64));
-        group.bench_function("lmsg_128b", |b| {
-            b.iter(|| {
-                let mut buf = BytesMut::from(&template[..]);
-                let _ = nats_proto::try_parse_leaf_op(&mut buf).unwrap();
+            group.throughput(Throughput::Bytes(template.len() as u64));
+            group.bench_function("lmsg_128b", |b| {
+                b.iter(|| {
+                    let mut buf = BytesMut::from(&template[..]);
+                    let _ = nats_proto::try_parse_leaf_op(&mut buf).unwrap();
+                });
             });
-        });
 
-        // LMSG with reply
-        let mut raw_reply = Vec::new();
-        raw_reply.extend_from_slice(b"LMSG test.subject reply.to 128\r\n");
-        raw_reply.extend_from_slice(&payload);
-        raw_reply.extend_from_slice(b"\r\n");
-        let template_reply = raw_reply.clone();
+            // LMSG with reply
+            let mut raw_reply = Vec::new();
+            raw_reply.extend_from_slice(b"LMSG test.subject reply.to 128\r\n");
+            raw_reply.extend_from_slice(&payload);
+            raw_reply.extend_from_slice(b"\r\n");
+            let template_reply = raw_reply.clone();
 
-        group.throughput(Throughput::Bytes(template_reply.len() as u64));
-        group.bench_function("lmsg_128b_reply", |b| {
-            b.iter(|| {
-                let mut buf = BytesMut::from(&template_reply[..]);
-                let _ = nats_proto::try_parse_leaf_op(&mut buf).unwrap();
+            group.throughput(Throughput::Bytes(template_reply.len() as u64));
+            group.bench_function("lmsg_128b_reply", |b| {
+                b.iter(|| {
+                    let mut buf = BytesMut::from(&template_reply[..]);
+                    let _ = nats_proto::try_parse_leaf_op(&mut buf).unwrap();
+                });
             });
-        });
 
-        group.finish();
+            group.finish();
+        }
     }
 }
 
