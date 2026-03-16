@@ -18,6 +18,8 @@ use tracing::{debug, warn};
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, HandleResult, WorkerCtx};
+#[cfg(feature = "gateway")]
+use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
 #[cfg(feature = "hub")]
 use crate::handler::{propagate_leaf_sub, propagate_leaf_unsub};
 #[cfg(feature = "cluster")]
@@ -131,6 +133,8 @@ impl ClientHandler {
             is_leaf: false,
             #[cfg(feature = "cluster")]
             is_route: false,
+            #[cfg(feature = "gateway")]
+            is_gateway: false,
         };
 
         {
@@ -162,6 +166,10 @@ impl ClientHandler {
         // Propagate RS+ to inbound route connections.
         #[cfg(feature = "cluster")]
         propagate_route_sub(wctx.state, subject_str.as_bytes(), queue_group.as_deref());
+
+        // Propagate RS+ to gateway connections.
+        #[cfg(feature = "gateway")]
+        propagate_gateway_sub(wctx.state, subject_str.as_bytes(), queue_group.as_deref());
 
         gauge!(
             "subscriptions_active",
@@ -217,6 +225,12 @@ impl ClientHandler {
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
                     );
+                    #[cfg(feature = "gateway")]
+                    propagate_gateway_unsub(
+                        wctx.state,
+                        removed.subject.as_bytes(),
+                        removed.queue.as_deref().map(|q| q.as_bytes()),
+                    );
                     debug!(
                         conn_id = conn.conn_id,
                         sid,
@@ -258,6 +272,12 @@ impl ClientHandler {
                 );
                 #[cfg(feature = "cluster")]
                 propagate_route_unsub(
+                    wctx.state,
+                    removed.subject.as_bytes(),
+                    removed.queue.as_deref().map(|q| q.as_bytes()),
+                );
+                #[cfg(feature = "gateway")]
+                propagate_gateway_unsub(
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
@@ -323,6 +343,8 @@ impl ClientHandler {
             !conn.echo,
             #[cfg(feature = "cluster")]
             false, // don't skip routes — client pubs forward to route peers
+            #[cfg(feature = "gateway")]
+            false, // don't skip gateways — client pubs forward to gateway peers
         );
 
         #[cfg(feature = "leaf")]

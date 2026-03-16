@@ -824,6 +824,10 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             #[cfg(feature = "cluster")]
             "cluster" => apply_cluster(&mut config, value)?,
 
+            // --- gateway block ---
+            #[cfg(feature = "gateway")]
+            "gateway" => apply_gateway(&mut config, value)?,
+
             // --- websocket block ---
             "websocket" => {
                 if let Some(entries) = value.as_map() {
@@ -969,6 +973,73 @@ fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
             }
             _ => {
                 tracing::debug!("ignoring cluster key: {ckey}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `gateway { ... }` block.
+#[cfg(feature = "gateway")]
+fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+    use crate::server::GatewayRemote;
+
+    let entries = match value.as_map() {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    for (gkey, gval) in entries {
+        match gkey.as_str() {
+            "listen" => {
+                let s = as_string(gval)?;
+                let (_host, port) = parse_listen(&s)?;
+                if let Some(p) = port {
+                    config.gateway_port = Some(p);
+                }
+            }
+            "port" => config.gateway_port = Some(as_u16(gval)?),
+            "name" => {
+                config.gateway_name = Some(as_string(gval)?);
+            }
+            "gateways" => {
+                if let Some(arr) = gval.as_array() {
+                    for entry in arr {
+                        if let Some(map) = entry.as_map() {
+                            let mut name = String::new();
+                            let mut urls = Vec::new();
+                            for (k, v) in map {
+                                match k.as_str() {
+                                    "name" => {
+                                        if let Ok(s) = as_string(v) {
+                                            name = s;
+                                        }
+                                    }
+                                    "urls" | "url" => {
+                                        if let Some(arr) = v.as_array() {
+                                            for u in arr {
+                                                if let Ok(s) = as_string(u) {
+                                                    urls.push(s);
+                                                }
+                                            }
+                                        } else if let Ok(s) = as_string(v) {
+                                            urls.push(s);
+                                        }
+                                    }
+                                    _ => {
+                                        tracing::debug!("ignoring gateway entry key: {k}");
+                                    }
+                                }
+                            }
+                            if !name.is_empty() && !urls.is_empty() {
+                                config.gateway_remotes.push(GatewayRemote { name, urls });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("ignoring gateway key: {gkey}");
             }
         }
     }

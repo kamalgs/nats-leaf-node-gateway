@@ -25,15 +25,19 @@ use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
 use crate::client_handler::ClientHandler;
+#[cfg(feature = "gateway")]
+use crate::gateway_handler::GatewayHandler;
 #[cfg(feature = "hub")]
 use crate::handler::send_existing_subs;
+#[cfg(feature = "gateway")]
+use crate::handler::send_existing_subs_to_gateway;
 #[cfg(feature = "cluster")]
 use crate::handler::send_existing_subs_to_route;
 use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 use crate::protocol::RouteOp;
 use crate::protocol::{AdaptiveBuf, ClientOp};
 #[cfg(feature = "cluster")]
@@ -68,6 +72,13 @@ pub(crate) enum WorkerCmd {
     /// Accept an inbound route connection (cluster mode).
     #[cfg(feature = "cluster")]
     NewRouteConn {
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+    },
+    /// Accept an inbound gateway connection (gateway mode).
+    #[cfg(feature = "gateway")]
+    NewGatewayConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
@@ -109,6 +120,13 @@ impl WorkerHandle {
     #[cfg(feature = "cluster")]
     pub fn send_route_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewRouteConn { id, stream, addr });
+        self.wake();
+    }
+
+    /// Send a new inbound gateway connection to this worker and wake it.
+    #[cfg(feature = "gateway")]
+    pub fn send_gateway_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let _ = self.tx.send(WorkerCmd::NewGatewayConn { id, stream, addr });
         self.wake();
     }
 
@@ -462,6 +480,10 @@ impl Worker {
                 WorkerCmd::NewRouteConn { id, stream, addr } => {
                     self.add_route_conn(id, stream, addr);
                 }
+                #[cfg(feature = "gateway")]
+                WorkerCmd::NewGatewayConn { id, stream, addr } => {
+                    self.add_gateway_conn(id, stream, addr);
+                }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
                 }
@@ -716,6 +738,78 @@ impl Worker {
         self.try_flush_conn(id);
     }
 
+    /// Add an inbound gateway connection (gateway mode).
+    /// Sends INFO immediately and waits for CONNECT from the gateway peer.
+    #[cfg(feature = "gateway")]
+    fn add_gateway_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(true).ok();
+        stream.set_nodelay(true).ok();
+        let fd = stream.as_raw_fd();
+
+        // Register with epoll (EPOLLIN, level-triggered)
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: id,
+        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if ret != 0 {
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for gateway conn");
+            return;
+        }
+
+        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let direct_writer = DirectWriter::new(
+            Arc::clone(&direct_buf),
+            Arc::clone(&has_pending),
+            Arc::clone(&self.event_fd),
+        );
+
+        // Queue INFO in write_buf — use dynamic gateway INFO.
+        let mut write_buf = BytesMut::with_capacity(4096);
+        let info_str = crate::gateway_conn::build_gateway_info(&self.state);
+        write_buf.extend_from_slice(info_str.as_bytes());
+
+        let client = ClientState {
+            fd,
+            _stream: stream,
+            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
+            write_buf,
+            direct_writer,
+            direct_buf,
+            has_pending,
+            phase: ConnPhase::SendInfo,
+            transport: Transport::Raw,
+            conn_id: id,
+            ext: ConnExt::Gateway {
+                gateway_sid_counter: 0,
+                gateway_sids: std::collections::HashMap::new(),
+                peer_gateway_name: None,
+            },
+            #[cfg(feature = "leaf")]
+            upstream_tx: None,
+            epoll_has_out: false,
+            echo: true,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        counter!("gateway_connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+
+        debug!(id, addr = %addr, "accepted inbound gateway connection on worker");
+        // Try to flush INFO immediately
+        self.try_flush_conn(id);
+    }
+
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
             unsafe {
@@ -746,6 +840,24 @@ impl Worker {
                 } = client.ext
                 {
                     self.state.route_peers.lock().unwrap().connected.remove(sid);
+                }
+            }
+            // Unregister gateway DirectWriter and peer from shared registries.
+            #[cfg(feature = "gateway")]
+            if client.ext.is_gateway() {
+                self.state.gateway_writers.write().unwrap().remove(&conn_id);
+                if let ConnExt::Gateway {
+                    peer_gateway_name: Some(ref name),
+                    ..
+                } = client.ext
+                {
+                    let mut peers = self.state.gateway_peers.lock().unwrap();
+                    if let Some(ids) = peers.connected.get_mut(name) {
+                        ids.remove(&conn_id);
+                        if ids.is_empty() {
+                            peers.connected.remove(name);
+                        }
+                    }
                 }
             }
 
@@ -1808,6 +1920,115 @@ impl Worker {
                     continue;
                 }
 
+                // Gateway connections use the gateway protocol parser (INFO+CONNECT+PING).
+                #[cfg(feature = "gateway")]
+                let is_gateway_conn = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_gateway())
+                    .unwrap_or(false);
+
+                #[cfg(feature = "gateway")]
+                if is_gateway_conn {
+                    let gw_op = {
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
+                            Ok(op) => op,
+                            Err(_) => {
+                                self.remove_conn(conn_id);
+                                return;
+                            }
+                        }
+                    };
+                    match gw_op {
+                        Some(nats_proto::GatewayOp::Info(peer_info)) => {
+                            // Process gateway_urls from peer's INFO for gossip.
+                            if let Some(ref urls) = peer_info.gateway_urls {
+                                if !urls.is_empty() {
+                                    let tx = self.state.gateway_connect_tx.lock().unwrap();
+                                    let mut peers = self.state.gateway_peers.lock().unwrap();
+                                    for url in urls {
+                                        if peers.known_urls.insert(url.clone()) {
+                                            if let Some(ref sender) = *tx {
+                                                let _ = sender.send(url.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Some(nats_proto::GatewayOp::Connect(connect_info)) => {
+                            // Extract gateway name from CONNECT.
+                            let peer_gw_name = connect_info.gateway.clone();
+
+                            // Peer's CONNECT — go Active, register, exchange subs.
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            client.phase = ConnPhase::Active;
+                            client.echo = false;
+                            #[cfg(feature = "leaf")]
+                            {
+                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            }
+                            client.write_buf.extend_from_slice(b"PONG\r\n");
+
+                            // Store peer gateway name for cleanup.
+                            if let ConnExt::Gateway {
+                                ref mut peer_gateway_name,
+                                ..
+                            } = client.ext
+                            {
+                                *peer_gateway_name = peer_gw_name.clone();
+                            }
+
+                            // Register gateway DirectWriter.
+                            let dw = client.direct_writer.clone();
+                            self.state
+                                .gateway_writers
+                                .write()
+                                .unwrap()
+                                .insert(conn_id, dw);
+
+                            // Register in gateway_peers.
+                            if let Some(ref name) = peer_gw_name {
+                                let mut peers = self.state.gateway_peers.lock().unwrap();
+                                peers
+                                    .connected
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .insert(conn_id);
+                            }
+
+                            // Send existing local subscriptions as RS+ to the
+                            // new gateway (interest-only mode).
+                            send_existing_subs_to_gateway(&self.state, &client.direct_writer);
+
+                            // Broadcast updated INFO to all gateways (gossip).
+                            crate::gateway_conn::broadcast_gateway_info(&self.state);
+
+                            info!(
+                                conn_id,
+                                peer_gateway = ?peer_gw_name,
+                                "inbound gateway connected"
+                            );
+                        }
+                        Some(nats_proto::GatewayOp::Ping) => {
+                            // Peer sent PING during handshake — respond with PONG.
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.write_buf.extend_from_slice(b"PONG\r\n");
+                            }
+                            continue;
+                        }
+                        Some(_) => {
+                            self.remove_conn(conn_id);
+                            return;
+                        }
+                        None => return, // need more data
+                    }
+                    // After gateway handshake ops, continue the outer loop.
+                    continue;
+                }
+
                 let op = {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     match nats_proto::try_parse_client_op(&mut client.read_buf) {
@@ -1918,6 +2139,15 @@ impl Worker {
                     .unwrap_or(false);
                 #[cfg(not(feature = "cluster"))]
                 let is_route = false;
+
+                #[cfg(feature = "gateway")]
+                let is_gateway = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_gateway())
+                    .unwrap_or(false);
+                #[cfg(not(feature = "gateway"))]
+                let is_gateway = false;
 
                 if is_leaf {
                     // Leaf connection: parse leaf protocol ops (LS+, LS-, LMSG, PING, PONG).
@@ -2030,6 +2260,74 @@ impl Worker {
                                         worker_label: &self.worker_label,
                                     };
                                     RouteHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+                                };
+                                handle_expired_subs(
+                                    &expired,
+                                    &self.state,
+                                    &mut self.conns,
+                                    &self.worker_label,
+                                );
+                                match result {
+                                    HandleResult::Ok => {}
+                                    HandleResult::Flush => self.try_flush_conn(conn_id),
+                                    HandleResult::Disconnect => {
+                                        self.try_flush_conn(conn_id);
+                                        self.remove_conn(conn_id);
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Some(client) = self.conns.get_mut(&conn_id) {
+                                    client.read_buf.try_shrink();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                } else if is_gateway {
+                    // Gateway connection: parse gateway protocol ops.
+                    #[cfg(feature = "gateway")]
+                    {
+                        let op = {
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
+                                Ok(op) => op,
+                                Err(_) => {
+                                    self.remove_conn(conn_id);
+                                    return;
+                                }
+                            }
+                        };
+                        match op {
+                            Some(op) => {
+                                let (result, expired) = {
+                                    let client = self.conns.get_mut(&conn_id).unwrap();
+                                    let draining = matches!(client.phase, ConnPhase::Draining);
+                                    let mut conn_ctx = ConnCtx {
+                                        conn_id,
+                                        write_buf: &mut client.write_buf,
+                                        direct_writer: &client.direct_writer,
+                                        echo: client.echo,
+                                        sub_count: &mut client.sub_count,
+                                        #[cfg(feature = "leaf")]
+                                        upstream_tx: &mut client.upstream_tx,
+                                        permissions: &client.permissions,
+                                        ext: &mut client.ext,
+                                        draining,
+                                    };
+                                    let mut worker_ctx = WorkerCtx {
+                                        state: &self.state,
+                                        event_fd: self.event_fd.as_raw_fd(),
+                                        pending_notify: &mut self.pending_notify,
+                                        pending_notify_count: &mut self.pending_notify_count,
+                                        msgs_received: &mut self.msgs_received,
+                                        msgs_received_bytes: &mut self.msgs_received_bytes,
+                                        msgs_delivered: &mut self.msgs_delivered,
+                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                                        worker_label: &self.worker_label,
+                                    };
+                                    GatewayHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
                                 handle_expired_subs(
                                     &expired,

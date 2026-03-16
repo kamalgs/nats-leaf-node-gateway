@@ -843,7 +843,7 @@ fn leaf_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// A parsed route protocol operation (RS+, RS-, RMSG, INFO, CONNECT, PING, PONG).
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 #[derive(Debug)]
 pub enum RouteOp {
     Info(Box<ServerInfo>),
@@ -868,8 +868,19 @@ pub enum RouteOp {
     },
 }
 
+/// Gateway operations reuse the route wire format (RS+/RS-/RMSG).
+#[cfg(feature = "gateway")]
+pub type GatewayOp = RouteOp;
+
+/// Try to parse the next gateway protocol operation from `buf`.
+/// Gateways use the same wire format as routes.
+#[cfg(feature = "gateway")]
+pub fn try_parse_gateway_op(buf: &mut BytesMut) -> io::Result<Option<GatewayOp>> {
+    try_parse_route_op(buf)
+}
+
 /// Try to parse the next route protocol operation from `buf`.
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 pub fn try_parse_route_op(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     if buf.is_empty() {
         return Ok(None);
@@ -963,7 +974,7 @@ pub fn try_parse_route_op(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
 }
 
 /// Parse `RS+ account subject [queue [weight]]` or `RS- account subject`.
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     let nl = match find_newline(buf) {
         Some(i) => i,
@@ -1007,7 +1018,7 @@ fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
 }
 
 /// Parse `RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n`.
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     let nl = match find_newline(buf) {
         Some(i) => i,
@@ -1095,7 +1106,7 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     }
 }
 
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 fn route_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     if let Some(nl) = find_newline(buf) {
         buf.advance(nl + 1);
@@ -1381,7 +1392,7 @@ impl MsgBuilder {
     }
 
     /// Build `RMSG $G subject [reply] [hdr_len] total_len\r\npayload\r\n`.
-    #[cfg(feature = "cluster")]
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn build_rmsg(
         &mut self,
         subject: &[u8],
@@ -1432,7 +1443,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS+ $G subject\r\n`.
-    #[cfg(feature = "cluster")]
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn build_route_sub(&mut self, subject: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"RS+ $G ");
@@ -1442,7 +1453,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS- $G subject\r\n`.
-    #[cfg(feature = "cluster")]
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn build_route_unsub(&mut self, subject: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"RS- $G ");
@@ -1452,7 +1463,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS+ $G subject queue weight\r\n` for queue group route subscriptions.
-    #[cfg(feature = "cluster")]
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn build_route_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
         self.buf.clear();
         self.buf.extend_from_slice(b"RS+ $G ");
@@ -1464,7 +1475,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS- $G subject\r\n` for queue group route unsubscriptions.
-    #[cfg(feature = "cluster")]
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn build_route_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
         // RS- doesn't use queue — it unsubscribes the subject entirely
         // (Go nats-server just uses RS- $G subject)

@@ -20,6 +20,8 @@ use tracing::warn;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+#[cfg(feature = "gateway")]
+use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
 #[cfg(feature = "cluster")]
 use crate::handler::{propagate_route_sub, propagate_route_unsub};
 use crate::nats_proto;
@@ -89,6 +91,8 @@ impl LeafHandler {
             ConnExt::Client => unreachable!("leaf op on client connection"),
             #[cfg(feature = "cluster")]
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
+            #[cfg(feature = "gateway")]
+            ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
         };
 
         #[cfg(feature = "leaf")]
@@ -106,6 +110,8 @@ impl LeafHandler {
             is_leaf: true,
             #[cfg(feature = "cluster")]
             is_route: false,
+            #[cfg(feature = "gateway")]
+            is_gateway: false,
         };
 
         {
@@ -129,6 +135,10 @@ impl LeafHandler {
         // Propagate RS+ to route peers.
         #[cfg(feature = "cluster")]
         propagate_route_sub(wctx.state, subject.as_ref(), queue.as_deref());
+
+        // Propagate RS+ to gateway peers.
+        #[cfg(feature = "gateway")]
+        propagate_gateway_sub(wctx.state, subject.as_ref(), queue.as_deref());
 
         gauge!(
             "subscriptions_active",
@@ -156,6 +166,8 @@ impl LeafHandler {
             ConnExt::Client => unreachable!("leaf op on client connection"),
             #[cfg(feature = "cluster")]
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
+            #[cfg(feature = "gateway")]
+            ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
         };
 
         let removed = {
@@ -178,6 +190,12 @@ impl LeafHandler {
             }
             #[cfg(feature = "cluster")]
             propagate_route_unsub(
+                wctx.state,
+                removed.subject.as_bytes(),
+                removed.queue.as_deref().map(|q| q.as_bytes()),
+            );
+            #[cfg(feature = "gateway")]
+            propagate_gateway_unsub(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
@@ -223,6 +241,8 @@ impl LeafHandler {
             true, // always suppress echo for leaf connections
             #[cfg(feature = "cluster")]
             false, // don't skip routes — leaf msgs forward to route peers
+            #[cfg(feature = "gateway")]
+            false, // don't skip gateways — leaf msgs forward to gateway peers
         );
 
         #[cfg(feature = "leaf")]

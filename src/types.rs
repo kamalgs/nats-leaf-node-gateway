@@ -57,6 +57,14 @@ pub struct ServerInfo {
     #[cfg(feature = "hub")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leafnode_urls: Option<Vec<String>>,
+    /// Gateway name for this cluster (present in gateway INFO).
+    #[cfg(feature = "gateway")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    /// Advertised gateway URLs for gossip discovery.
+    #[cfg(feature = "gateway")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_urls: Option<Vec<String>>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -99,6 +107,9 @@ pub struct ConnectInfo {
     pub nkey: Option<String>,
     #[serde(default, rename = "sig")]
     pub signature: Option<String>,
+    /// Gateway name sent by gateway peer in CONNECT.
+    #[serde(default)]
+    pub gateway: Option<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────

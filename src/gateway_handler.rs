@@ -5,9 +5,12 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-//! Route protocol handler: RS+, RS-, RMSG, PING, PONG.
+//! Gateway protocol handler: RS+, RS-, RMSG, PING, PONG.
 //!
-//! Dispatched by the worker for connections with `ConnExt::Route`.
+//! Dispatched by the worker for connections with `ConnExt::Gateway`.
+//! Gateways reuse the route wire format (RS+/RS-/RMSG) but with different
+//! interest semantics: one outbound connection per remote cluster, and
+//! reply subject rewriting for cross-cluster request-reply.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,70 +20,73 @@ use tracing::debug;
 
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
-#[cfg(feature = "gateway")]
-use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
+use crate::handler::{
+    bytes_to_str, deliver_to_subs, unwrap_gateway_reply, ConnCtx, ConnExt, HandleResult, WorkerCtx,
+};
 use crate::nats_proto;
-use crate::protocol::RouteOp;
+use crate::nats_proto::GatewayOp;
 use crate::sub_list::Subscription;
 
-/// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
-pub(crate) struct RouteHandler;
+/// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
+pub(crate) struct GatewayHandler;
 
-impl RouteHandler {
-    /// Dispatch a parsed route protocol operation.
+impl GatewayHandler {
+    /// Dispatch a parsed gateway protocol operation.
     ///
     /// Returns `(HandleResult, expired_subs)`. Expired subs must be cleaned up
     /// by the worker after regaining `&mut self` access to the connections map.
     pub(crate) fn handle_op(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
-        op: RouteOp,
+        op: GatewayOp,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         match op {
-            RouteOp::Ping => {
+            GatewayOp::Ping => {
                 conn.write_buf.extend_from_slice(b"PONG\r\n");
                 (HandleResult::Flush, Vec::new())
             }
-            RouteOp::Pong => (HandleResult::Ok, Vec::new()),
-            RouteOp::RouteSub { subject, queue } => {
-                let result = Self::handle_route_sub(conn, wctx, subject, queue);
+            GatewayOp::Pong => (HandleResult::Ok, Vec::new()),
+            GatewayOp::RouteSub { subject, queue } => {
+                let result = Self::handle_gateway_sub(conn, wctx, subject, queue);
                 (result, Vec::new())
             }
-            RouteOp::RouteUnsub { subject } => {
-                let result = Self::handle_route_unsub(conn, wctx, subject);
+            GatewayOp::RouteUnsub { subject } => {
+                let result = Self::handle_gateway_unsub(conn, wctx, subject);
                 (result, Vec::new())
             }
-            RouteOp::RouteMsg {
+            GatewayOp::RouteMsg {
                 subject,
                 reply,
                 headers,
                 payload,
-            } => Self::handle_rmsg(conn, wctx, subject, reply, headers, payload),
-            RouteOp::Info(info) => {
-                // Gossip: process connect_urls from active-phase INFO updates.
-                if !info.connect_urls.is_empty() {
-                    let mut peers = wctx.state.route_peers.lock().unwrap();
-                    let tx = wctx.state.route_connect_tx.lock().unwrap();
-                    for url in &info.connect_urls {
-                        let normalized = crate::route_conn::normalize_route_url(url);
-                        if peers.known_urls.insert(normalized.clone()) {
-                            if let Some(ref sender) = *tx {
-                                let _ = sender.send(normalized);
+            } => Self::handle_gmsg(conn, wctx, subject, reply, headers, payload),
+            GatewayOp::Info(info) => {
+                // Process gateway_urls for gossip discovery.
+                #[cfg(feature = "gateway")]
+                if let Some(ref urls) = info.gateway_urls {
+                    if !urls.is_empty() {
+                        let tx = wctx.state.gateway_connect_tx.lock().unwrap();
+                        let mut peers = wctx.state.gateway_peers.lock().unwrap();
+                        for url in urls {
+                            if peers.known_urls.insert(url.clone()) {
+                                if let Some(ref sender) = *tx {
+                                    let _ = sender.send(url.clone());
+                                }
                             }
                         }
                     }
                 }
+                let _ = info;
                 (HandleResult::Ok, Vec::new())
             }
-            RouteOp::Connect(_) => {
-                // Ignore CONNECT from inbound route in Active phase.
+            GatewayOp::Connect(_) => {
+                // Ignore CONNECT from inbound gateway in Active phase.
                 (HandleResult::Ok, Vec::new())
             }
         }
     }
 
-    fn handle_route_sub(
+    fn handle_gateway_sub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
@@ -89,19 +95,19 @@ impl RouteHandler {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Generate synthetic SID for this route subscription.
+        // Generate synthetic SID for this gateway subscription.
         let sid = match conn.ext {
-            ConnExt::Route {
-                ref mut route_sid_counter,
-                ref mut route_sids,
+            ConnExt::Gateway {
+                ref mut gateway_sid_counter,
+                ref mut gateway_sids,
                 ..
             } => {
-                *route_sid_counter += 1;
-                let sid = *route_sid_counter;
-                route_sids.insert((subject.clone(), queue.clone()), sid);
+                *gateway_sid_counter += 1;
+                let sid = *gateway_sid_counter;
+                gateway_sids.insert((subject.clone(), queue.clone()), sid);
                 sid
             }
-            _ => unreachable!("route op on non-route connection"),
+            _ => unreachable!("gateway op on non-gateway connection"),
         };
 
         let sub = Subscription {
@@ -114,9 +120,9 @@ impl RouteHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            is_route: true,
-            #[cfg(feature = "gateway")]
-            is_gateway: false,
+            #[cfg(feature = "cluster")]
+            is_route: false,
+            is_gateway: true,
         };
 
         {
@@ -127,44 +133,40 @@ impl RouteHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate RS+ to gateway peers.
-        #[cfg(feature = "gateway")]
-        propagate_gateway_sub(wctx.state, subject_str.as_bytes(), queue.as_deref());
-
         gauge!(
             "subscriptions_active",
             "worker" => wctx.worker_label.to_string()
         )
         .increment(1.0);
-        debug!(conn_id = conn.conn_id, sid, subject = %subject_str, "route subscribed");
+        debug!(conn_id = conn.conn_id, sid, subject = %subject_str, "gateway subscribed");
 
         HandleResult::Ok
     }
 
-    fn handle_route_unsub(
+    fn handle_gateway_unsub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
     ) -> HandleResult {
         // RS- doesn't include queue in the wire format, so look up by subject only.
-        // We try to find the SID for this subject with any queue value.
         let sid = match conn.ext {
-            ConnExt::Route {
-                ref mut route_sids, ..
+            ConnExt::Gateway {
+                ref mut gateway_sids,
+                ..
             } => {
                 // First try exact match with no queue
-                if let Some(s) = route_sids.remove(&(subject.clone(), None)) {
+                if let Some(s) = gateway_sids.remove(&(subject.clone(), None)) {
                     s
                 } else {
                     // Try to find any entry with this subject
-                    let key = route_sids.keys().find(|(s, _)| *s == subject).cloned();
+                    let key = gateway_sids.keys().find(|(s, _)| *s == subject).cloned();
                     match key {
-                        Some(k) => route_sids.remove(&k).unwrap(),
+                        Some(k) => gateway_sids.remove(&k).unwrap(),
                         None => return HandleResult::Ok,
                     }
                 }
             }
-            _ => unreachable!("route op on non-route connection"),
+            _ => unreachable!("gateway op on non-gateway connection"),
         };
 
         let removed = {
@@ -178,12 +180,6 @@ impl RouteHandler {
 
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
-            #[cfg(feature = "gateway")]
-            propagate_gateway_unsub(
-                wctx.state,
-                removed.subject.as_bytes(),
-                removed.queue.as_deref().map(|q| q.as_bytes()),
-            );
             gauge!(
                 "subscriptions_active",
                 "worker" => wctx.worker_label.to_string()
@@ -193,14 +189,14 @@ impl RouteHandler {
                 conn_id = conn.conn_id,
                 sid,
                 subject = %removed.subject,
-                "route unsubscribed"
+                "gateway unsubscribed"
             );
         }
 
         HandleResult::Ok
     }
 
-    fn handle_rmsg(
+    fn handle_gmsg(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
@@ -213,20 +209,32 @@ impl RouteHandler {
         *wctx.msgs_received_bytes += payload_len;
 
         let subject_str = bytes_to_str(&subject);
-        // One-hop rule: skip_routes = true — messages from routes are never re-forwarded
-        // to other routes. Only deliver to local client subs and leaf subs.
+
+        // Unwrap _GR_ reply prefix if present (cross-cluster reply rewriting).
+        let unwrapped_reply = reply.as_ref().map(|r| {
+            let unwrapped = unwrap_gateway_reply(r);
+            if unwrapped.len() != r.len() {
+                Bytes::copy_from_slice(unwrapped)
+            } else {
+                r.clone()
+            }
+        });
+        let reply_ref = unwrapped_reply.as_deref();
+
+        // One-hop: skip_routes = true and skip_gateways = true — messages from a gateway
+        // are never re-forwarded to other routes or gateways.
         let expired = deliver_to_subs(
             wctx,
             &subject,
             subject_str,
-            reply.as_deref(),
+            reply_ref,
             headers.as_ref(),
             &payload,
             conn.conn_id,
-            true, // suppress echo back to originating route
+            true, // suppress echo back to originating gateway
+            #[cfg(feature = "cluster")]
             true, // skip_routes — one-hop enforcement
-            #[cfg(feature = "gateway")]
-            false, // don't skip gateways — route msgs forward to gateway peers
+            true, // skip_gateways — one-hop enforcement
         );
 
         // Also forward to upstream hub if configured
@@ -235,7 +243,7 @@ impl RouteHandler {
             conn.upstream_tx,
             wctx.state,
             subject,
-            reply,
+            unwrapped_reply,
             headers,
             payload,
         );
