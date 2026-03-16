@@ -30,6 +30,10 @@ pub(crate) mod websocket;
 pub(crate) mod worker;
 
 pub(crate) mod client_handler;
+#[cfg(feature = "gateway")]
+pub(crate) mod gateway_conn;
+#[cfg(feature = "gateway")]
+pub(crate) mod gateway_handler;
 pub(crate) mod handler;
 #[cfg(feature = "hub")]
 pub(crate) mod leaf_handler;
@@ -40,6 +44,8 @@ pub(crate) mod route_handler;
 
 #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
 pub use interest::SubjectMapping;
+#[cfg(feature = "gateway")]
+pub use server::GatewayRemote;
 #[cfg(feature = "leaf")]
 pub use server::HubCredentials;
 pub use server::{ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig};

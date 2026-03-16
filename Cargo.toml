@@ -13,6 +13,7 @@ subject-mapping = []
 leaf = []      # Upstream hub connection support
 hub = []       # Inbound leaf node connection support
 cluster = []   # Full mesh route clustering support
+gateway = []   # Gateway inter-cluster traffic support
 
 [dependencies]
 bytes = "1.4.0"

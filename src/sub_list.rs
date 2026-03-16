@@ -107,8 +107,8 @@ impl DirectWriter {
         self.has_pending.store(true, Ordering::Release);
     }
 
-    /// Format and append an RMSG to the shared buffer (for route delivery).
-    #[cfg(feature = "cluster")]
+    /// Format and append an RMSG to the shared buffer (for route/gateway delivery).
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub(crate) fn write_rmsg(
         &self,
         subject: &[u8],
@@ -124,8 +124,8 @@ impl DirectWriter {
         self.has_pending.store(true, Ordering::Release);
     }
 
-    /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS- lines).
-    #[cfg(any(feature = "hub", feature = "cluster"))]
+    /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS-/RS+ lines).
+    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
     pub(crate) fn write_raw(&self, data: &[u8]) {
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
@@ -148,7 +148,7 @@ impl DirectWriter {
     }
 
     /// Drain all buffered data. Returns `None` if buffer was empty.
-    #[cfg(any(test, feature = "cluster"))]
+    #[cfg(any(test, feature = "cluster", feature = "gateway"))]
     pub(crate) fn drain(&self) -> Option<BytesMut> {
         let mut buf = self.buf.lock().unwrap();
         if buf.is_empty() {
@@ -206,6 +206,9 @@ pub struct Subscription {
     /// True for route peer subscriptions (deliver via RMSG, not MSG).
     #[cfg(feature = "cluster")]
     pub is_route: bool,
+    /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
+    #[cfg(feature = "gateway")]
+    pub is_gateway: bool,
 }
 
 impl Clone for Subscription {
@@ -222,6 +225,8 @@ impl Clone for Subscription {
             is_leaf: self.is_leaf,
             #[cfg(feature = "cluster")]
             is_route: self.is_route,
+            #[cfg(feature = "gateway")]
+            is_gateway: self.is_gateway,
         }
     }
 }
@@ -243,6 +248,8 @@ impl Subscription {
             is_leaf: false,
             #[cfg(feature = "cluster")]
             is_route: false,
+            #[cfg(feature = "gateway")]
+            is_gateway: false,
         }
     }
 }
@@ -498,8 +505,8 @@ impl SubList {
         subjects
     }
 
-    /// Returns unique non-leaf, non-route (subject, queue) pairs for leaf interest propagation.
-    /// Only includes subscriptions from client connections (not leaf or route connections).
+    /// Returns unique non-leaf, non-route, non-gateway (subject, queue) pairs for leaf interest
+    /// propagation. Only includes subscriptions from client connections.
     #[cfg(feature = "hub")]
     pub fn client_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
@@ -508,6 +515,10 @@ impl SubList {
                 if !sub.is_leaf {
                     #[cfg(feature = "cluster")]
                     if sub.is_route {
+                        continue;
+                    }
+                    #[cfg(feature = "gateway")]
+                    if sub.is_gateway {
                         continue;
                     }
                     set.insert((subj.as_str(), sub.queue.as_deref()));
@@ -520,28 +531,44 @@ impl SubList {
                 if sub.is_route {
                     continue;
                 }
+                #[cfg(feature = "gateway")]
+                if sub.is_gateway {
+                    continue;
+                }
                 set.insert((sub.subject.as_str(), sub.queue.as_deref()));
             }
         }
         set.into_iter().collect()
     }
 
-    /// Returns unique local (client + leaf) (subject, queue) pairs for route interest propagation.
-    /// Excludes route subscriptions (avoids loops).
-    #[cfg(feature = "cluster")]
+    /// Returns unique local (client + leaf) (subject, queue) pairs for route/gateway interest
+    /// propagation. Excludes route and gateway subscriptions (avoids loops).
+    #[cfg(any(feature = "cluster", feature = "gateway"))]
     pub fn local_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
-                if !sub.is_route {
-                    set.insert((subj.as_str(), sub.queue.as_deref()));
+                #[cfg(feature = "cluster")]
+                if sub.is_route {
+                    continue;
                 }
+                #[cfg(feature = "gateway")]
+                if sub.is_gateway {
+                    continue;
+                }
+                set.insert((subj.as_str(), sub.queue.as_deref()));
             }
         }
         for sub in &self.wild {
-            if !sub.is_route {
-                set.insert((sub.subject.as_str(), sub.queue.as_deref()));
+            #[cfg(feature = "cluster")]
+            if sub.is_route {
+                continue;
             }
+            #[cfg(feature = "gateway")]
+            if sub.is_gateway {
+                continue;
+            }
+            set.insert((sub.subject.as_str(), sub.queue.as_deref()));
         }
         set.into_iter().collect()
     }

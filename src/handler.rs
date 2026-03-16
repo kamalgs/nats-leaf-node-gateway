@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 use metrics::gauge;
 use tracing::debug;
 
-#[cfg(any(feature = "hub", feature = "cluster"))]
+#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use crate::nats_proto;
 use crate::server::{Permissions, ServerState};
 use crate::sub_list::DirectWriter;
@@ -66,6 +66,14 @@ pub(crate) enum ConnExt {
         /// Peer's server_id, stored for cleanup deregistration from RoutePeerRegistry.
         peer_server_id: Option<String>,
     },
+    /// Inbound gateway connection (uses RMSG for delivery, RS+/RS- for interest).
+    #[cfg(feature = "gateway")]
+    Gateway {
+        gateway_sid_counter: u64,
+        gateway_sids: HashMap<(Bytes, Option<Bytes>), u64>,
+        /// Remote cluster's gateway name.
+        peer_gateway_name: Option<String>,
+    },
 }
 
 impl ConnExt {
@@ -90,6 +98,18 @@ impl ConnExt {
     /// Returns `true` for inbound route connections.
     #[cfg(not(feature = "cluster"))]
     pub fn is_route(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` for inbound gateway connections.
+    #[cfg(feature = "gateway")]
+    pub fn is_gateway(&self) -> bool {
+        matches!(self, Self::Gateway { .. })
+    }
+
+    /// Returns `true` for inbound gateway connections.
+    #[cfg(not(feature = "gateway"))]
+    pub fn is_gateway(&self) -> bool {
         false
     }
 }
@@ -117,6 +137,32 @@ pub(crate) enum HandleResult {
     Disconnect,
 }
 
+/// Inner dispatch for writing a message to a single subscription based on its type.
+#[inline]
+fn deliver_to_sub_inner(
+    sub: &crate::sub_list::Subscription,
+    subject: &[u8],
+    reply: Option<&[u8]>,
+    headers: Option<&HeaderMap>,
+    payload: &[u8],
+) {
+    #[cfg(feature = "cluster")]
+    if sub.is_route {
+        sub.writer.write_rmsg(subject, reply, headers, payload);
+        return;
+    }
+    #[cfg(feature = "hub")]
+    if sub.is_leaf {
+        sub.writer.write_lmsg(subject, reply, headers, payload);
+    } else {
+        sub.writer
+            .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+    }
+    #[cfg(not(feature = "hub"))]
+    sub.writer
+        .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+}
+
 /// Deliver a message to all matching subscriptions in the global sub list.
 ///
 /// Writes MSG (for client subs) or LMSG (for leaf subs) directly to each
@@ -136,6 +182,7 @@ pub(crate) fn deliver_to_subs(
     skip_conn_id: u64,
     skip_echo: bool,
     #[cfg(feature = "cluster")] skip_routes: bool,
+    #[cfg(feature = "gateway")] skip_gateways: bool,
 ) -> Vec<(u64, u64)> {
     let payload_len = payload.len() as u64;
 
@@ -152,33 +199,23 @@ pub(crate) fn deliver_to_subs(
         if skip_routes && sub.is_route {
             return;
         }
-        #[cfg(feature = "cluster")]
-        if sub.is_route {
-            sub.writer.write_rmsg(subject, reply, headers, payload);
-        } else {
-            #[cfg(feature = "hub")]
-            if sub.is_leaf {
-                sub.writer.write_lmsg(subject, reply, headers, payload);
-            } else {
-                sub.writer
-                    .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
-            }
-            #[cfg(not(feature = "hub"))]
-            sub.writer
-                .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+        // One-hop rule: messages from gateways are never re-forwarded to other gateways.
+        #[cfg(feature = "gateway")]
+        if skip_gateways && sub.is_gateway {
+            return;
         }
-        #[cfg(not(feature = "cluster"))]
-        {
-            #[cfg(feature = "hub")]
-            if sub.is_leaf {
-                sub.writer.write_lmsg(subject, reply, headers, payload);
-            } else {
-                sub.writer
-                    .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
-            }
-            #[cfg(not(feature = "hub"))]
+        #[cfg(feature = "gateway")]
+        if sub.is_gateway {
+            // Rewrite reply with _GR_ prefix before forwarding across gateway
+            let gw_reply = rewrite_gateway_reply(reply, wctx.state);
             sub.writer
-                .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+                .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
+        } else {
+            deliver_to_sub_inner(sub, subject, reply, headers, payload);
+        }
+        #[cfg(not(feature = "gateway"))]
+        {
+            deliver_to_sub_inner(sub, subject, reply, headers, payload);
         }
         *wctx.msgs_delivered += 1;
         *wctx.msgs_delivered_bytes += payload_len;
@@ -226,6 +263,8 @@ pub(crate) fn deliver_to_subs_upstream(
         dirty_writers,
         #[cfg(feature = "cluster")]
         false,
+        #[cfg(feature = "gateway")]
+        false,
     )
 }
 
@@ -241,6 +280,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     payload: &[u8],
     dirty_writers: &mut Vec<DirectWriter>,
     #[cfg(feature = "cluster")] skip_routes: bool,
+    #[cfg(feature = "gateway")] skip_gateways: bool,
 ) -> Vec<(u64, u64)> {
     let subs = state.subs.read().unwrap();
     let (_count, expired) = subs.for_each_match(subject_str, |sub| {
@@ -250,6 +290,17 @@ pub(crate) fn deliver_to_subs_upstream_inner(
                 return;
             }
             sub.writer.write_rmsg(subject, reply, headers, payload);
+            dirty_writers.push(sub.writer.clone());
+            return;
+        }
+        #[cfg(feature = "gateway")]
+        if sub.is_gateway {
+            if skip_gateways {
+                return;
+            }
+            let gw_reply = rewrite_gateway_reply(reply, state);
+            sub.writer
+                .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
             dirty_writers.push(sub.writer.clone());
             return;
         }
@@ -442,6 +493,103 @@ pub(crate) fn send_existing_subs_to_route(state: &ServerState, writer: &DirectWr
     }
     drop(subs);
     writer.notify();
+}
+
+/// Propagate RS+ to all gateway connections (interest advertisement).
+#[cfg(feature = "gateway")]
+pub(crate) fn propagate_gateway_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    let writers = state.gateway_writers.read().unwrap();
+    if writers.is_empty() {
+        return;
+    }
+    let mut builder = nats_proto::MsgBuilder::new();
+    let data = if let Some(q) = queue {
+        builder.build_route_sub_queue(subject, q)
+    } else {
+        builder.build_route_sub(subject)
+    };
+    for writer in writers.values() {
+        writer.write_raw(data);
+        writer.notify();
+    }
+}
+
+/// Propagate RS- to all gateway connections (interest removal).
+#[cfg(feature = "gateway")]
+pub(crate) fn propagate_gateway_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    let writers = state.gateway_writers.read().unwrap();
+    if writers.is_empty() {
+        return;
+    }
+    let mut builder = nats_proto::MsgBuilder::new();
+    let data = if let Some(q) = queue {
+        builder.build_route_unsub_queue(subject, q)
+    } else {
+        builder.build_route_unsub(subject)
+    };
+    for writer in writers.values() {
+        writer.write_raw(data);
+        writer.notify();
+    }
+}
+
+/// Send RS+ for all existing local subscriptions to a given gateway's DirectWriter.
+#[cfg(feature = "gateway")]
+pub(crate) fn send_existing_subs_to_gateway(state: &ServerState, writer: &DirectWriter) {
+    let subs = state.subs.read().unwrap();
+    let mut builder = nats_proto::MsgBuilder::new();
+    for (subject, queue) in subs.local_interests() {
+        let data = if let Some(q) = queue {
+            builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+        } else {
+            builder.build_route_sub(subject.as_bytes())
+        };
+        writer.write_raw(data);
+    }
+    drop(subs);
+    writer.notify();
+}
+
+/// Rewrite outbound reply: `reply` → `_GR_.<cluster_hash>.<server_hash>.reply`.
+/// Returns `None` if the input reply is `None`.
+#[cfg(feature = "gateway")]
+fn rewrite_gateway_reply(reply: Option<&[u8]>, state: &ServerState) -> Option<bytes::Bytes> {
+    let reply = reply?;
+    // Don't double-rewrite
+    if reply.starts_with(b"_GR_.") {
+        return Some(bytes::Bytes::copy_from_slice(reply));
+    }
+    let mut buf = Vec::with_capacity(5 + 6 + 1 + 6 + 1 + reply.len());
+    buf.extend_from_slice(b"_GR_.");
+    buf.extend_from_slice(state.gateway_cluster_hash.as_bytes());
+    buf.push(b'.');
+    buf.extend_from_slice(state.gateway_server_hash.as_bytes());
+    buf.push(b'.');
+    buf.extend_from_slice(reply);
+    Some(bytes::Bytes::from(buf))
+}
+
+/// Unwrap inbound reply: `_GR_.<cluster_hash>.<server_hash>.reply` → `reply`.
+/// If the reply does not have the `_GR_.` prefix, returns it unchanged.
+#[cfg(feature = "gateway")]
+pub(crate) fn unwrap_gateway_reply(reply: &[u8]) -> &[u8] {
+    if !reply.starts_with(b"_GR_.") {
+        return reply;
+    }
+    // Skip _GR_. (5 bytes), then skip cluster_hash.server_hash. (6+1+6+1 = 14 bytes)
+    let after_prefix = &reply[5..];
+    // Find first dot (end of cluster_hash)
+    let dot1 = match memchr::memchr(b'.', after_prefix) {
+        Some(i) => i,
+        None => return reply,
+    };
+    // Find second dot (end of server_hash)
+    let rest = &after_prefix[dot1 + 1..];
+    let dot2 = match memchr::memchr(b'.', rest) {
+        Some(i) => i,
+        None => return reply,
+    };
+    &rest[dot2 + 1..]
 }
 
 /// Convert `Bytes` to `&str` without UTF-8 validation.

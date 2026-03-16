@@ -540,6 +540,8 @@ fn handle_route_op(
                 delivered: AtomicU64::new(0),
                 is_leaf: false,
                 is_route: true,
+                #[cfg(feature = "gateway")]
+                is_gateway: false,
             };
 
             let mut subs = state.subs.write().unwrap();
@@ -576,6 +578,8 @@ fn handle_route_op(
                 &payload,
                 dirty_writers,
                 true, // skip_routes
+                #[cfg(feature = "gateway")]
+                false, // don't skip gateways — route msgs forward to gateway peers
             );
             handle_expired_subs_upstream(&expired, state);
         }

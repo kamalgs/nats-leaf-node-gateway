@@ -5,9 +5,9 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-#[cfg(any(feature = "hub", feature = "cluster"))]
+#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use std::collections::HashMap;
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 use std::collections::HashSet;
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 #[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
-#[cfg(feature = "cluster")]
+#[cfg(any(feature = "cluster", feature = "gateway"))]
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -27,7 +27,7 @@ use tracing::{error, info, warn};
 use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::protocol::BufConfig;
-#[cfg(any(feature = "hub", feature = "cluster"))]
+#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use crate::sub_list::DirectWriter;
 use crate::sub_list::SubList;
 #[cfg(feature = "leaf")]
@@ -200,6 +200,32 @@ fn generate_nonce() -> String {
     data_encoding::BASE64URL_NOPAD.encode(&data)
 }
 
+/// Compute a 6-character base36 hash from a string using FNV-1a.
+#[cfg(feature = "gateway")]
+fn fnv_hash_base36(s: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    // Convert to base36, take first 6 chars
+    let mut buf = String::with_capacity(6);
+    let mut val = h;
+    for _ in 0..6 {
+        let digit = (val % 36) as u8;
+        let c = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        buf.push(c as char);
+        val /= 36;
+    }
+    buf
+}
+
 /// Configuration for the leaf node server.
 #[derive(Debug, Clone)]
 pub struct LeafServerConfig {
@@ -296,6 +322,25 @@ pub struct LeafServerConfig {
     /// Cluster name. All nodes in a cluster must use the same name.
     #[cfg(feature = "cluster")]
     pub cluster_name: Option<String>,
+    /// Port for gateway connections. When set, the server listens for
+    /// inbound gateway connections from other clusters.
+    #[cfg(feature = "gateway")]
+    pub gateway_port: Option<u16>,
+    /// This cluster's gateway name (required for gateway mode).
+    #[cfg(feature = "gateway")]
+    pub gateway_name: Option<String>,
+    /// Remote clusters to connect to via gateways.
+    #[cfg(feature = "gateway")]
+    pub gateway_remotes: Vec<GatewayRemote>,
+}
+
+/// A remote cluster for gateway connections.
+#[derive(Debug, Clone)]
+pub struct GatewayRemote {
+    /// Remote cluster name.
+    pub name: String,
+    /// Seed URLs for that cluster.
+    pub urls: Vec<String>,
 }
 
 impl Default for LeafServerConfig {
@@ -346,6 +391,12 @@ impl Default for LeafServerConfig {
             cluster_seeds: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_name: None,
+            #[cfg(feature = "gateway")]
+            gateway_port: None,
+            #[cfg(feature = "gateway")]
+            gateway_name: None,
+            #[cfg(feature = "gateway")]
+            gateway_remotes: Vec::new(),
         }
     }
 }
@@ -581,6 +632,15 @@ pub(crate) struct RoutePeerRegistry {
     pub known_urls: HashSet<String>,
 }
 
+/// Registry of connected gateway peers and known gateway URLs for gossip discovery.
+#[cfg(feature = "gateway")]
+pub(crate) struct GatewayPeerRegistry {
+    /// cluster_name → set of conn_ids for that cluster.
+    pub connected: HashMap<String, HashSet<u64>>,
+    /// All known gateway URLs (own endpoint + discovered).
+    pub known_urls: HashSet<String>,
+}
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
@@ -642,6 +702,30 @@ pub(crate) struct ServerState {
     /// are sent here to trigger outbound connections.
     #[cfg(feature = "cluster")]
     pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    /// Registry of DirectWriters for inbound gateway connections.
+    #[cfg(feature = "gateway")]
+    pub gateway_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    /// Port for inbound gateway connections.
+    #[cfg(feature = "gateway")]
+    pub gateway_port: Option<u16>,
+    /// This cluster's gateway name.
+    #[cfg(feature = "gateway")]
+    pub gateway_name: Option<String>,
+    /// Remote clusters to connect to via gateways.
+    #[cfg(feature = "gateway")]
+    pub gateway_remotes: Vec<GatewayRemote>,
+    /// Registry of connected gateway peers and known gateway URLs.
+    #[cfg(feature = "gateway")]
+    pub gateway_peers: Mutex<GatewayPeerRegistry>,
+    /// Channel sender for the gateway coordinator thread.
+    #[cfg(feature = "gateway")]
+    pub gateway_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    /// Pre-computed 6-char cluster hash for reply rewriting.
+    #[cfg(feature = "gateway")]
+    pub gateway_cluster_hash: String,
+    /// Pre-computed 6-char server hash for reply rewriting.
+    #[cfg(feature = "gateway")]
+    pub gateway_server_hash: String,
 }
 
 impl ServerState {
@@ -662,6 +746,9 @@ impl ServerState {
         #[cfg(feature = "cluster")] cluster_port: Option<u16>,
         #[cfg(feature = "cluster")] cluster_name: Option<String>,
         #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
+        #[cfg(feature = "gateway")] gateway_port: Option<u16>,
+        #[cfg(feature = "gateway")] gateway_name: Option<String>,
+        #[cfg(feature = "gateway")] gateway_remotes: Vec<GatewayRemote>,
     ) -> Self {
         #[cfg(feature = "cluster")]
         let cluster_self_host = if info.host.is_empty() || info.host == "0.0.0.0" {
@@ -669,6 +756,14 @@ impl ServerState {
         } else {
             info.host.clone()
         };
+
+        #[cfg(feature = "gateway")]
+        let gateway_cluster_hash = {
+            let name = gateway_name.as_deref().unwrap_or("default");
+            fnv_hash_base36(name)
+        };
+        #[cfg(feature = "gateway")]
+        let gateway_server_hash = fnv_hash_base36(&info.server_id);
 
         Self {
             info,
@@ -722,6 +817,25 @@ impl ServerState {
             route_connect_tx: Mutex::new(None),
             #[cfg(feature = "cluster")]
             cluster_seeds,
+            #[cfg(feature = "gateway")]
+            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "gateway")]
+            gateway_port,
+            #[cfg(feature = "gateway")]
+            gateway_name: gateway_name.clone(),
+            #[cfg(feature = "gateway")]
+            gateway_remotes,
+            #[cfg(feature = "gateway")]
+            gateway_peers: Mutex::new(GatewayPeerRegistry {
+                connected: HashMap::new(),
+                known_urls: HashSet::new(),
+            }),
+            #[cfg(feature = "gateway")]
+            gateway_connect_tx: Mutex::new(None),
+            #[cfg(feature = "gateway")]
+            gateway_cluster_hash,
+            #[cfg(feature = "gateway")]
+            gateway_server_hash,
         }
     }
 
@@ -805,6 +919,12 @@ impl LeafServer {
                 config.cluster_name.clone(),
                 #[cfg(feature = "cluster")]
                 config.cluster_seeds.clone(),
+                #[cfg(feature = "gateway")]
+                config.gateway_port,
+                #[cfg(feature = "gateway")]
+                config.gateway_name.clone(),
+                #[cfg(feature = "gateway")]
+                config.gateway_remotes.clone(),
             )),
         }
     }
@@ -931,6 +1051,20 @@ impl LeafServer {
         workers[idx].send_route_conn(cid, tcp_stream, addr);
     }
 
+    #[cfg(feature = "gateway")]
+    fn accept_gateway_tcp(
+        &self,
+        tcp_stream: TcpStream,
+        addr: std::net::SocketAddr,
+        workers: &[WorkerHandle],
+        next_worker: &mut usize,
+    ) {
+        let cid = self.state.next_client_id();
+        let idx = *next_worker % workers.len();
+        *next_worker = idx + 1;
+        workers[idx].send_gateway_conn(cid, tcp_stream, addr);
+    }
+
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -997,8 +1131,33 @@ impl LeafServer {
         #[cfg(not(feature = "cluster"))]
         let cluster_listener: Option<TcpListener> = None;
 
-        let has_extra_listeners =
-            ws_listener.is_some() || leaf_listener.is_some() || cluster_listener.is_some();
+        #[cfg(feature = "gateway")]
+        let gateway_listener = if let Some(gw_port) = self.config.gateway_port {
+            let gw_addr = format!("{}:{}", self.config.host, gw_port);
+            let gl = TcpListener::bind(&gw_addr)?;
+            info!(addr = %gw_addr, "leaf server listening (gateway)");
+            Some(gl)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gateway"))]
+        let gateway_listener: Option<TcpListener> = None;
+
+        // Spawn outbound gateway connections to remote clusters
+        #[cfg(feature = "gateway")]
+        let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
+            info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
+            Some(crate::gateway_conn::GatewayConnManager::spawn(Arc::clone(
+                &self.state,
+            )))
+        } else {
+            None
+        };
+
+        let has_extra_listeners = ws_listener.is_some()
+            || leaf_listener.is_some()
+            || cluster_listener.is_some()
+            || gateway_listener.is_some();
         if has_extra_listeners {
             // Poll multiple listeners
             listener.set_nonblocking(true)?;
@@ -1010,6 +1169,9 @@ impl LeafServer {
             }
             if let Some(ref cl) = cluster_listener {
                 cl.set_nonblocking(true)?;
+            }
+            if let Some(ref gl) = gateway_listener {
+                gl.set_nonblocking(true)?;
             }
 
             let mut pfds = [
@@ -1036,13 +1198,22 @@ impl LeafServer {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: gateway_listener
+                        .as_ref()
+                        .map(|l| l.as_raw_fd())
+                        .unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             loop {
                 pfds[0].revents = 0;
                 pfds[1].revents = 0;
                 pfds[2].revents = 0;
                 pfds[3].revents = 0;
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, -1) };
+                pfds[4].revents = 0;
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, -1) };
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -1075,6 +1246,14 @@ impl LeafServer {
                     if let Some(ref cl) = cluster_listener {
                         while let Ok((stream, addr)) = cl.accept() {
                             self.accept_route_tcp(stream, addr, &workers, &mut next_worker);
+                        }
+                    }
+                }
+                #[cfg(feature = "gateway")]
+                if pfds[4].revents & libc::POLLIN != 0 {
+                    if let Some(ref gl) = gateway_listener {
+                        while let Ok((stream, addr)) = gl.accept() {
+                            self.accept_gateway_tcp(stream, addr, &workers, &mut next_worker);
                         }
                     }
                 }
@@ -1171,6 +1350,30 @@ impl LeafServer {
         #[cfg(not(feature = "cluster"))]
         let cluster_listener: Option<TcpListener> = None;
 
+        #[cfg(feature = "gateway")]
+        let gateway_listener = if let Some(gw_port) = self.config.gateway_port {
+            let gw_addr = format!("{}:{}", self.config.host, gw_port);
+            let gl = TcpListener::bind(&gw_addr)?;
+            gl.set_nonblocking(true)?;
+            info!(addr = %gw_addr, "leaf server listening (gateway)");
+            Some(gl)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gateway"))]
+        let gateway_listener: Option<TcpListener> = None;
+
+        // Spawn outbound gateway connections to remote clusters
+        #[cfg(feature = "gateway")]
+        let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
+            info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
+            Some(crate::gateway_conn::GatewayConnManager::spawn(Arc::clone(
+                &self.state,
+            )))
+        } else {
+            None
+        };
+
         let mut pfds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -1189,6 +1392,14 @@ impl LeafServer {
             },
             libc::pollfd {
                 fd: cluster_listener
+                    .as_ref()
+                    .map(|l| l.as_raw_fd())
+                    .unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: gateway_listener
                     .as_ref()
                     .map(|l| l.as_raw_fd())
                     .unwrap_or(-1),
@@ -1217,7 +1428,8 @@ impl LeafServer {
             pfds[1].revents = 0;
             pfds[2].revents = 0;
             pfds[3].revents = 0;
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 1000) };
+            pfds[4].revents = 0;
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -1255,6 +1467,15 @@ impl LeafServer {
                 if let Some(ref cl) = cluster_listener {
                     while let Ok((stream, addr)) = cl.accept() {
                         self.accept_route_tcp(stream, addr, &workers, &mut next_worker);
+                    }
+                }
+            }
+
+            #[cfg(feature = "gateway")]
+            if ret > 0 && pfds[4].revents & libc::POLLIN != 0 {
+                if let Some(ref gl) = gateway_listener {
+                    while let Ok((stream, addr)) = gl.accept() {
+                        self.accept_gateway_tcp(stream, addr, &workers, &mut next_worker);
                     }
                 }
             }

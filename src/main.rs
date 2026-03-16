@@ -231,6 +231,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.cluster_name = Some(args[i].clone());
             }
+            #[cfg(feature = "gateway")]
+            "--gateway-port" => {
+                i += 1;
+                config.gateway_port = Some(args[i].parse().expect("invalid gateway-port"));
+            }
+            #[cfg(feature = "gateway")]
+            "--gateway-name" => {
+                i += 1;
+                config.gateway_name = Some(args[i].clone());
+            }
+            #[cfg(feature = "gateway")]
+            "--gateway-remotes" => {
+                // Format: "cluster-b=host1:7222,host2:7222;cluster-c=host3:7222"
+                i += 1;
+                for cluster_spec in args[i].split(';') {
+                    let cluster_spec = cluster_spec.trim();
+                    if cluster_spec.is_empty() {
+                        continue;
+                    }
+                    if let Some((name, urls_str)) = cluster_spec.split_once('=') {
+                        let urls: Vec<String> =
+                            urls_str.split(',').map(|s| s.trim().to_string()).collect();
+                        config
+                            .gateway_remotes
+                            .push(open_wire::server::GatewayRemote {
+                                name: name.trim().to_string(),
+                                urls,
+                            });
+                    }
+                }
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
