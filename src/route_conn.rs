@@ -569,7 +569,7 @@ fn handle_route_op(
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             // One-hop: skip route subs — messages from a route peer are never
             // re-forwarded to other route peers.
-            let expired = deliver_to_subs_upstream_inner(
+            let (_delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &subject,
                 subject_str,

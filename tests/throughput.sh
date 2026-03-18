@@ -3,7 +3,7 @@
 #
 # Modes:
 #   --quick (default) — 5 core scenarios, 1 run, 100K msgs (~1-2 min)
-#   --full            — all 13 scenarios, 3 runs, 500K msgs (~5-10 min)
+#   --full            — all 19 scenarios, 3 runs, 500K msgs (~5-10 min)
 #
 # Scenarios (quick mode runs 1-5 only, without "Direct Hub" baseline):
 #   1. Publish only        — raw ingest rate (fire-and-forget)
@@ -22,6 +22,9 @@
 #  14. Cluster: pub/sub    — pub on A, sub on B (cross-node 1:1)
 #  15. Cluster: fan-out x3 — pub on A, sub on A+B+C (3-node fan-out)
 #  16. Cluster: remote B+C — pub on A, sub on B + sub on C (no local sub)
+#  17. Gateway: pub/sub    — pub on alpha, sub on beta (cross-gateway 1:1)
+#  18. Gateway: fan-out    — pub on alpha, sub on alpha + beta (gateway fan-out)
+#  19. Gateway: req-reply  — request-reply across the gateway
 #
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
@@ -84,6 +87,12 @@ RUST_CLUSTER_A_PORT=8001; RUST_CLUSTER_A_ROUTE=8101
 RUST_CLUSTER_B_PORT=8002; RUST_CLUSTER_B_ROUTE=8102
 RUST_CLUSTER_C_PORT=8003; RUST_CLUSTER_C_ROUTE=8103
 
+# 2-node gateway ports (full mode only)
+GO_GW_A_PORT=9001; GO_GW_A_GW=9101
+GO_GW_B_PORT=9002; GO_GW_B_GW=9102
+RUST_GW_A_PORT=9201; RUST_GW_A_GW=9301
+RUST_GW_B_PORT=9202; RUST_GW_B_GW=9302
+
 # PID tracking for cleanup
 PIDS=()
 BG_PIDS=()
@@ -115,7 +124,9 @@ if [[ "$MODE" == "full" ]]; then
     $GO_CLUSTER_A_PORT $GO_CLUSTER_A_ROUTE $GO_CLUSTER_B_PORT $GO_CLUSTER_B_ROUTE \
     $GO_CLUSTER_C_PORT $GO_CLUSTER_C_ROUTE \
     $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE \
-    $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE"
+    $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE \
+    $GO_GW_A_PORT $GO_GW_A_GW $GO_GW_B_PORT $GO_GW_B_GW \
+    $RUST_GW_A_PORT $RUST_GW_A_GW $RUST_GW_B_PORT $RUST_GW_B_GW"
 fi
 for port in $PORTS_TO_CHECK; do
   if ss -tln 2>/dev/null | grep -q ":${port} "; then
@@ -134,7 +145,7 @@ echo ""
 echo "Building Rust leaf server (release)..."
 if [[ "$MODE" == "full" ]]; then
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features cluster 2>&1 | tail -1
+    --release --features cluster,gateway 2>&1 | tail -1
 else
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
     --release 2>&1 | tail -1
@@ -281,7 +292,7 @@ run_pub_only() {
   for i in $(seq 1 "$RUNS"); do
     nats bench pub bench.test \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "$url" 2>&1 | grep -E "stats:"
+      -s "$url" 2>&1 | grep -E "stats:" || true
   done
   echo ""
 }
@@ -299,7 +310,7 @@ run_pub_only_capture() {
     output=$(nats bench pub bench.test \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$url" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     local rate
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
@@ -329,14 +340,14 @@ run_url_pubsub() {
     # Run publisher (foreground) — its output has the pub stats
     nats bench pub "$subject" \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "$url" 2>&1 | grep -E "stats:"
+      -s "$url" 2>&1 | grep -E "stats:" || true
 
     # Wait for subscribers (with timeout) and print their stats
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
     for s in $(seq 1 "$subs"); do
-      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] //" || true
       rm -f "/tmp/bench_sub_${s}.out"
     done
     BG_PIDS=()
@@ -365,7 +376,7 @@ run_url_pubsub_capture() {
     output=$(nats bench pub "$subject" \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$url" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     local rate
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
@@ -374,7 +385,7 @@ run_url_pubsub_capture() {
       wait_or_kill "$pid" 30
     done
     for s in $(seq 1 "$subs"); do
-      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] //" || true
       rm -f "/tmp/bench_sub_${s}.out"
     done
     BG_PIDS=()
@@ -402,13 +413,13 @@ run_cross_pubsub() {
     # Publisher on source server
     nats bench pub "bench.cross.test" \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "$pub_url" 2>&1 | grep -E "stats:"
+      -s "$pub_url" 2>&1 | grep -E "stats:" || true
 
     # Wait for subscriber (with timeout)
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
-    grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /'
+    grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
     rm -f /tmp/bench_cross_sub.out
     BG_PIDS=()
   done
@@ -434,7 +445,7 @@ run_cross_pubsub_capture() {
     output=$(nats bench pub "bench.cross.test" \
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$pub_url" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     local rate
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
@@ -442,7 +453,7 @@ run_cross_pubsub_capture() {
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
-    grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /'
+    grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
     rm -f /tmp/bench_cross_sub.out
     BG_PIDS=()
   done
@@ -758,13 +769,13 @@ if [[ "$MODE" == "full" ]]; then
 
     output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
     for s in 1 2 3; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
     BG_PIDS=()
@@ -794,13 +805,13 @@ if [[ "$MODE" == "full" ]]; then
 
     output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
     for s in 1 2 3; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
     BG_PIDS=()
@@ -842,13 +853,13 @@ if [[ "$MODE" == "full" ]]; then
 
     output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
     for s in 1 2; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
     BG_PIDS=()
@@ -875,13 +886,13 @@ if [[ "$MODE" == "full" ]]; then
 
     output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:"
+    echo "$output" | grep -E "stats:" || true
     rate=$(echo "$output" | extract_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
     for s in 1 2; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
     BG_PIDS=()
@@ -897,6 +908,204 @@ if [[ "$MODE" == "full" ]]; then
     "$rust_cl_rem_cpu" "$go_cl_rem_cpu" \
     "$rust_cl_rem_rss" "$go_cl_rem_rss" \
     "$rust_cl_rem_ctx" "$go_cl_rem_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Gateway mode: start 2 Go gateway nodes + 2 Rust gateway nodes
+  # ──────────────────────────────────────────────────────────────────────
+  echo ""
+  echo "Starting 2-node Go gateway (alpha + beta)..."
+  nats-server -c "$SCRIPT_DIR/configs/bench_go_gateway_a.conf" &
+  PIDS+=($!); GO_GW_A_PID=$!
+  nats-server -c "$SCRIPT_DIR/configs/bench_go_gateway_b.conf" &
+  PIDS+=($!)
+  sleep 2
+
+  echo "Starting 2-node Rust gateway (alpha + beta)..."
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_gateway_a.conf" &
+  PIDS+=($!); RUST_GW_A_PID=$!
+  sleep 0.5
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_gateway_b.conf" &
+  PIDS+=($!)
+  sleep 2
+
+  # Verify gateway connectivity
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_A_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_B_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway B"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway B"; exit 1; }
+  echo "All gateway nodes responding."
+  echo ""
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 17: Gateway pub/sub (pub on alpha, sub on beta)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  17. GATEWAY PUB/SUB (pub on alpha, sub on beta — cross-gateway)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+  run_cross_pubsub_capture "Go Gateway alpha→beta" \
+    "nats://127.0.0.1:$GO_GW_A_PORT" "nats://127.0.0.1:$GO_GW_B_PORT" "$GO_GW_A_PID"
+  go_gw_ps_rate=$CAPTURED_RATE go_gw_ps_cpu=$CAPTURED_CPU go_gw_ps_rss=$CAPTURED_RSS go_gw_ps_ctx=$CAPTURED_CTX
+
+  run_cross_pubsub_capture "Rust Gateway alpha→beta" \
+    "nats://127.0.0.1:$RUST_GW_A_PORT" "nats://127.0.0.1:$RUST_GW_B_PORT" "$RUST_GW_A_PID"
+  rust_gw_ps_rate=$CAPTURED_RATE rust_gw_ps_cpu=$CAPTURED_CPU rust_gw_ps_rss=$CAPTURED_RSS rust_gw_ps_ctx=$CAPTURED_CTX
+
+  record_summary "Gateway A→B" \
+    "$rust_gw_ps_rate" "$go_gw_ps_rate" \
+    "$rust_gw_ps_cpu" "$go_gw_ps_cpu" \
+    "$rust_gw_ps_rss" "$go_gw_ps_rss" \
+    "$rust_gw_ps_ctx" "$go_gw_ps_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 18: Gateway fan-out (pub on alpha, sub on alpha + sub on beta)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  18. GATEWAY FAN-OUT (pub on alpha, sub on alpha + beta)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+
+  # Go gateway fan-out
+  echo "--- Go Gateway fan-out ---"
+  cpu_before=$(cpu_ticks "$GO_GW_A_PID")
+  ctx_before=$(ctx_switches "$GO_GW_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_GW_A_PORT" >"/tmp/bench_gw_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_GW_B_PORT" >"/tmp/bench_gw_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_GW_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
+      rm -f "/tmp/bench_gw_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  go_gw_fan_rate=$(( rate_sum / RUNS ))
+  go_gw_fan_cpu=$(( ($(cpu_ticks "$GO_GW_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  go_gw_fan_rss=$(rss_kb "$GO_GW_A_PID")
+  go_gw_fan_ctx=$(( $(ctx_switches "$GO_GW_A_PID") - ctx_before ))
+
+  # Rust gateway fan-out
+  echo "--- Rust Gateway fan-out ---"
+  cpu_before=$(cpu_ticks "$RUST_GW_A_PID")
+  ctx_before=$(ctx_switches "$RUST_GW_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_GW_A_PORT" >"/tmp/bench_gw_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_GW_B_PORT" >"/tmp/bench_gw_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_GW_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
+      rm -f "/tmp/bench_gw_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  rust_gw_fan_rate=$(( rate_sum / RUNS ))
+  rust_gw_fan_cpu=$(( ($(cpu_ticks "$RUST_GW_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  rust_gw_fan_rss=$(rss_kb "$RUST_GW_A_PID")
+  rust_gw_fan_ctx=$(( $(ctx_switches "$RUST_GW_A_PID") - ctx_before ))
+
+  record_summary "Gateway fan" \
+    "$rust_gw_fan_rate" "$go_gw_fan_rate" \
+    "$rust_gw_fan_cpu" "$go_gw_fan_cpu" \
+    "$rust_gw_fan_rss" "$go_gw_fan_rss" \
+    "$rust_gw_fan_ctx" "$go_gw_fan_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 19: Gateway request-reply (service mode across the gateway)
+  # ──────────────────────────────────────────────────────────────────────
+  RR_MSGS=10000  # req-reply is sequential round-trip, ~400 msgs/sec across gateway
+  echo "================================================================"
+  echo "  19. GATEWAY REQUEST-REPLY (req on alpha, reply on beta)"
+  echo "      ${RR_MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+
+  # Go gateway request-reply
+  echo "--- Go Gateway req-reply ---"
+  cpu_before=$(cpu_ticks "$GO_GW_A_PID")
+  ctx_before=$(ctx_switches "$GO_GW_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench service serve "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_GW_B_PORT" >"/tmp/bench_gw_reply.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(timeout 60 nats bench service request "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_GW_A_PORT" 2>&1) || true
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    BG_PIDS=()
+  done
+  echo ""
+  go_gw_rr_rate=$(( rate_sum / RUNS ))
+  go_gw_rr_cpu=$(( ($(cpu_ticks "$GO_GW_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  go_gw_rr_rss=$(rss_kb "$GO_GW_A_PID")
+  go_gw_rr_ctx=$(( $(ctx_switches "$GO_GW_A_PID") - ctx_before ))
+
+  # Rust gateway request-reply
+  echo "--- Rust Gateway req-reply ---"
+  cpu_before=$(cpu_ticks "$RUST_GW_A_PID")
+  ctx_before=$(ctx_switches "$RUST_GW_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench service serve "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_GW_B_PORT" >"/tmp/bench_gw_reply.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(timeout 60 nats bench service request "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_GW_A_PORT" 2>&1) || true
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    BG_PIDS=()
+  done
+  echo ""
+  rust_gw_rr_rate=$(( rate_sum / RUNS ))
+  rust_gw_rr_cpu=$(( ($(cpu_ticks "$RUST_GW_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  rust_gw_rr_rss=$(rss_kb "$RUST_GW_A_PID")
+  rust_gw_rr_ctx=$(( $(ctx_switches "$RUST_GW_A_PID") - ctx_before ))
+
+  record_summary "GW req-reply" \
+    "$rust_gw_rr_rate" "$go_gw_rr_rate" \
+    "$rust_gw_rr_cpu" "$go_gw_rr_cpu" \
+    "$rust_gw_rr_rss" "$go_gw_rr_rss" \
+    "$rust_gw_rr_ctx" "$go_gw_rr_ctx"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

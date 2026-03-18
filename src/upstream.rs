@@ -569,7 +569,7 @@ fn handle_hub_op(
         } => {
             // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
-            let expired = deliver_to_subs_upstream(
+            let (_delivered, expired) = deliver_to_subs_upstream(
                 state,
                 &subject,
                 subject_str,

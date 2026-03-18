@@ -768,7 +768,7 @@ impl Worker {
 
         // Queue INFO in write_buf — use dynamic gateway INFO.
         let mut write_buf = BytesMut::with_capacity(4096);
-        let info_str = crate::gateway_conn::build_gateway_info(&self.state);
+        let info_str = crate::gateway_conn::get_gateway_info(&self.state);
         write_buf.extend_from_slice(info_str.as_bytes());
 
         let client = ClientState {
@@ -785,6 +785,7 @@ impl Worker {
             ext: ConnExt::Gateway {
                 gateway_sid_counter: 0,
                 gateway_sids: std::collections::HashMap::new(),
+                gateway_sids_by_subject: std::collections::HashMap::new(),
                 peer_gateway_name: None,
             },
             #[cfg(feature = "leaf")]
@@ -1367,6 +1368,7 @@ impl Worker {
 
     fn handle_read_raw(&mut self, conn_id: u64) {
         // Read from socket in a loop until WouldBlock to drain the kernel buffer.
+        let mut got_eof = false;
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
@@ -1374,8 +1376,8 @@ impl Worker {
             };
             match client.read_buf.read_from_fd(client.fd) {
                 Ok(0) => {
-                    self.remove_conn(conn_id);
-                    return;
+                    got_eof = true;
+                    break;
                 }
                 Ok(n) => {
                     client.read_buf.after_read(n);
@@ -1393,6 +1395,11 @@ impl Worker {
         }
         self.process_read_buf(conn_id);
         self.flush_notifications();
+
+        // Remove connection after processing any remaining data in the buffer.
+        if got_eof {
+            self.remove_conn(conn_id);
+        }
     }
 
     fn handle_read_ws(&mut self, conn_id: u64) {
@@ -2356,15 +2363,21 @@ impl Worker {
                 } else {
                     // Client connection: parse client protocol ops.
                     let can_skip = {
+                        #[cfg(feature = "gateway")]
+                        let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
+                        #[cfg(not(feature = "gateway"))]
+                        let has_gw = false;
+
                         #[cfg(feature = "leaf")]
                         {
                             let client = self.conns.get(&conn_id).unwrap();
                             client.upstream_tx.is_none()
                                 && !self.state.has_subs.load(Ordering::Relaxed)
+                                && !has_gw
                         }
                         #[cfg(not(feature = "leaf"))]
                         {
-                            !self.state.has_subs.load(Ordering::Relaxed)
+                            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
                         }
                     };
 

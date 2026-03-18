@@ -332,7 +332,7 @@ impl ClientHandler {
         *wctx.msgs_received_bytes += payload_len;
 
         let subject_str = bytes_to_str(&subject);
-        let expired = deliver_to_subs(
+        let (_delivered, expired) = deliver_to_subs(
             wctx,
             &subject,
             subject_str,
@@ -345,6 +345,17 @@ impl ClientHandler {
             false, // don't skip routes — client pubs forward to route peers
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — client pubs forward to gateway peers
+        );
+
+        // Forward to optimistic gateways when no gateway sub matched.
+        #[cfg(feature = "gateway")]
+        crate::handler::forward_to_optimistic_gateways(
+            wctx,
+            &subject,
+            subject_str,
+            respond.as_deref(),
+            headers.as_ref(),
+            &payload,
         );
 
         #[cfg(feature = "leaf")]

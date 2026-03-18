@@ -215,7 +215,7 @@ impl RouteHandler {
         let subject_str = bytes_to_str(&subject);
         // One-hop rule: skip_routes = true — messages from routes are never re-forwarded
         // to other routes. Only deliver to local client subs and leaf subs.
-        let expired = deliver_to_subs(
+        let (_delivered, expired) = deliver_to_subs(
             wctx,
             &subject,
             subject_str,
@@ -227,6 +227,17 @@ impl RouteHandler {
             true, // skip_routes — one-hop enforcement
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — route msgs forward to gateway peers
+        );
+
+        // Forward to optimistic gateways when no gateway sub matched.
+        #[cfg(feature = "gateway")]
+        crate::handler::forward_to_optimistic_gateways(
+            wctx,
+            &subject,
+            subject_str,
+            reply.as_deref(),
+            headers.as_ref(),
+            &payload,
         );
 
         // Also forward to upstream hub if configured
