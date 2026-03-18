@@ -17,6 +17,8 @@
 use std::fmt;
 use std::path::Path;
 
+#[cfg(feature = "accounts")]
+use crate::server::AccountConfig;
 #[cfg(feature = "leaf")]
 use crate::server::HubCredentials;
 use crate::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
@@ -684,6 +686,7 @@ const IGNORED_KEYS: &[&str] = &[
     "jetstream",
     "cluster",
     "gateway",
+    #[cfg(not(feature = "accounts"))]
     "accounts",
     "operator",
     "resolver",
@@ -816,6 +819,10 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             // --- gateway block ---
             #[cfg(feature = "gateway")]
             "gateway" => apply_gateway(&mut config, value)?,
+
+            // --- accounts block ---
+            #[cfg(feature = "accounts")]
+            "accounts" => apply_accounts(&mut config, value)?,
 
             // --- websocket block ---
             "websocket" => {
@@ -1031,6 +1038,48 @@ fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
                 tracing::debug!("ignoring gateway key: {gkey}");
             }
         }
+    }
+    Ok(())
+}
+
+/// Parse an `accounts { ... }` block.
+///
+/// Format:
+/// ```text
+/// accounts {
+///     team_a { users = ["alice", "bob"] }
+///     team_b { users = ["carol", "dave"] }
+/// }
+/// ```
+#[cfg(feature = "accounts")]
+fn apply_accounts(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+    let entries = match value.as_map() {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    for (acct_name, acct_val) in entries {
+        let mut users = Vec::new();
+        if let Some(acct_entries) = acct_val.as_map() {
+            for (akey, aval) in acct_entries {
+                match akey.as_str() {
+                    "users" => {
+                        if let Some(arr) = aval.as_array() {
+                            for item in arr {
+                                users.push(as_string(item)?);
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("ignoring accounts.{}.{}", acct_name, akey);
+                    }
+                }
+            }
+        }
+        config.accounts.push(AccountConfig {
+            name: acct_name.clone(),
+            users,
+        });
     }
     Ok(())
 }

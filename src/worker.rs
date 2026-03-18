@@ -243,6 +243,9 @@ pub(crate) struct ClientState {
     pub(crate) sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
     permissions: Option<crate::server::Permissions>,
+    /// Account this connection belongs to. 0 = `$G` (global/default).
+    #[cfg(feature = "accounts")]
+    account_id: crate::server::AccountId,
 }
 
 // --- Worker ---
@@ -570,6 +573,8 @@ impl Worker {
             pings_outstanding: 0,
             sub_count: 0,
             permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -644,6 +649,8 @@ impl Worker {
             pings_outstanding: 0,
             sub_count: 0,
             permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -717,6 +724,8 @@ impl Worker {
             pings_outstanding: 0,
             sub_count: 0,
             permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -790,6 +799,8 @@ impl Worker {
             pings_outstanding: 0,
             sub_count: 0,
             permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -2096,10 +2107,16 @@ impl Worker {
                                 return;
                             }
                             let perms = self.state.auth.lookup_permissions(&connect_info);
+                            #[cfg(feature = "accounts")]
+                            let acct_id = self.state.lookup_account(connect_info.user.as_deref());
                             let client = self.conns.get_mut(&conn_id).unwrap();
                             client.phase = ConnPhase::Active;
                             client.echo = connect_info.echo;
                             client.permissions = perms;
+                            #[cfg(feature = "accounts")]
+                            {
+                                client.account_id = acct_id;
+                            }
                             #[cfg(feature = "leaf")]
                             {
                                 client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
@@ -2179,6 +2196,8 @@ impl Worker {
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
+                                        #[cfg(feature = "accounts")]
+                                        account_id: client.account_id,
                                     };
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
@@ -2193,12 +2212,19 @@ impl Worker {
                                     };
                                     LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
-                                handle_expired_subs(
-                                    &expired,
-                                    &self.state,
-                                    &mut self.conns,
-                                    &self.worker_label,
-                                );
+                                {
+                                    #[cfg(feature = "accounts")]
+                                    let acct =
+                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
+                                    handle_expired_subs(
+                                        &expired,
+                                        &self.state,
+                                        &mut self.conns,
+                                        &self.worker_label,
+                                        #[cfg(feature = "accounts")]
+                                        acct,
+                                    );
+                                }
                                 match result {
                                     HandleResult::Ok => {}
                                     HandleResult::Flush => self.try_flush_conn(conn_id),
@@ -2247,6 +2273,8 @@ impl Worker {
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
+                                        #[cfg(feature = "accounts")]
+                                        account_id: client.account_id,
                                     };
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
@@ -2261,12 +2289,19 @@ impl Worker {
                                     };
                                     RouteHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
-                                handle_expired_subs(
-                                    &expired,
-                                    &self.state,
-                                    &mut self.conns,
-                                    &self.worker_label,
-                                );
+                                {
+                                    #[cfg(feature = "accounts")]
+                                    let acct =
+                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
+                                    handle_expired_subs(
+                                        &expired,
+                                        &self.state,
+                                        &mut self.conns,
+                                        &self.worker_label,
+                                        #[cfg(feature = "accounts")]
+                                        acct,
+                                    );
+                                }
                                 match result {
                                     HandleResult::Ok => {}
                                     HandleResult::Flush => self.try_flush_conn(conn_id),
@@ -2315,6 +2350,8 @@ impl Worker {
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
+                                        #[cfg(feature = "accounts")]
+                                        account_id: client.account_id,
                                     };
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
@@ -2329,12 +2366,19 @@ impl Worker {
                                     };
                                     GatewayHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
-                                handle_expired_subs(
-                                    &expired,
-                                    &self.state,
-                                    &mut self.conns,
-                                    &self.worker_label,
-                                );
+                                {
+                                    #[cfg(feature = "accounts")]
+                                    let acct =
+                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
+                                    handle_expired_subs(
+                                        &expired,
+                                        &self.state,
+                                        &mut self.conns,
+                                        &self.worker_label,
+                                        #[cfg(feature = "accounts")]
+                                        acct,
+                                    );
+                                }
                                 match result {
                                     HandleResult::Ok => {}
                                     HandleResult::Flush => self.try_flush_conn(conn_id),
@@ -2416,6 +2460,8 @@ impl Worker {
                                     permissions: &client.permissions,
                                     ext: &mut client.ext,
                                     draining,
+                                    #[cfg(feature = "accounts")]
+                                    account_id: client.account_id,
                                 };
                                 let mut worker_ctx = WorkerCtx {
                                     state: &self.state,
@@ -2430,12 +2476,19 @@ impl Worker {
                                 };
                                 ClientHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                             };
-                            handle_expired_subs(
-                                &expired,
-                                &self.state,
-                                &mut self.conns,
-                                &self.worker_label,
-                            );
+                            {
+                                #[cfg(feature = "accounts")]
+                                let acct =
+                                    self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
+                                handle_expired_subs(
+                                    &expired,
+                                    &self.state,
+                                    &mut self.conns,
+                                    &self.worker_label,
+                                    #[cfg(feature = "accounts")]
+                                    acct,
+                                );
+                            }
                             match result {
                                 HandleResult::Ok => {}
                                 HandleResult::Flush => self.try_flush_conn(conn_id),
@@ -2482,10 +2535,29 @@ fn epoll_mod(epoll_fd: RawFd, client_fd: RawFd, conn_id: u64, enable_out: bool) 
 
 fn cleanup_conn(id: u64, state: &ServerState) {
     let removed = {
-        let mut subs = state.subs.write().unwrap();
-        let r = subs.remove_conn(id);
-        state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
-        r
+        #[cfg(feature = "accounts")]
+        {
+            let mut all_removed = Vec::new();
+            for account_sub in &state.account_subs {
+                let mut subs = account_sub.write().unwrap();
+                all_removed.extend(subs.remove_conn(id));
+            }
+            state.has_subs.store(
+                state
+                    .account_subs
+                    .iter()
+                    .any(|s| !s.read().unwrap().is_empty()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            all_removed
+        }
+        #[cfg(not(feature = "accounts"))]
+        {
+            let mut subs = state.subs.write().unwrap();
+            let r = subs.remove_conn(id);
+            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            r
+        }
     };
 
     #[cfg(feature = "leaf")]

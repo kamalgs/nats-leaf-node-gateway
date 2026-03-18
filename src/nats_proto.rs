@@ -845,15 +845,21 @@ pub enum RouteOp {
     Pong,
     /// RS+ account subject [queue [weight]]
     RouteSub {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
         subject: Bytes,
         queue: Option<Bytes>,
     },
     /// RS- account subject
     RouteUnsub {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
         subject: Bytes,
     },
     /// RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n
     RouteMsg {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
         subject: Bytes,
         reply: Option<Bytes>,
         headers: Option<HeaderMap>,
@@ -987,11 +993,15 @@ fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
         match argc {
             // RS+ account subject
             2 => RouteOp::RouteSub {
+                #[cfg(feature = "accounts")]
+                account: Bytes::copy_from_slice(args[0]),
                 subject: Bytes::copy_from_slice(args[1]),
                 queue: None,
             },
             // RS+ account subject queue weight
             3 | 4 => RouteOp::RouteSub {
+                #[cfg(feature = "accounts")]
+                account: Bytes::copy_from_slice(args[0]),
                 subject: Bytes::copy_from_slice(args[1]),
                 queue: Some(Bytes::copy_from_slice(args[2])),
             },
@@ -1001,6 +1011,8 @@ fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
         match argc {
             // RS- account subject
             2 => RouteOp::RouteUnsub {
+                #[cfg(feature = "accounts")]
+                account: Bytes::copy_from_slice(args[0]),
                 subject: Bytes::copy_from_slice(args[1]),
             },
             _ => return route_proto_err(buf, "invalid RS- arguments"),
@@ -1027,7 +1039,11 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
 
     // Compute offsets for zero-copy slicing (same approach as parse_lmsg).
     let buf_ptr = buf.as_ptr() as usize;
-    // args[0] = account (skip), args[1] = subject
+    // args[0] = account, args[1] = subject
+    #[cfg(feature = "accounts")]
+    let acct_off = args[0].as_ptr() as usize - buf_ptr;
+    #[cfg(feature = "accounts")]
+    let acct_len = args[0].len();
     let subj_off = args[1].as_ptr() as usize - buf_ptr;
     let subj_len = args[1].len();
 
@@ -1041,9 +1057,13 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
             }
             let payload_start = nl + 1;
             let frozen = buf.split_to(total).freeze();
+            #[cfg(feature = "accounts")]
+            let account = frozen.slice(acct_off..acct_off + acct_len);
             let subject = frozen.slice(subj_off..subj_off + subj_len);
             let payload = frozen.slice(payload_start..payload_start + size);
             Ok(Some(RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account,
                 subject,
                 reply: None,
                 headers: None,
@@ -1061,10 +1081,14 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
             }
             let payload_start = nl + 1;
             let frozen = buf.split_to(total).freeze();
+            #[cfg(feature = "accounts")]
+            let account = frozen.slice(acct_off..acct_off + acct_len);
             let subject = frozen.slice(subj_off..subj_off + subj_len);
             let reply = frozen.slice(reply_off..reply_off + reply_len);
             let payload = frozen.slice(payload_start..payload_start + size);
             Ok(Some(RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account,
                 subject,
                 reply: Some(reply),
                 headers: None,
@@ -1083,12 +1107,16 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
             }
             let payload_start = nl + 1;
             let frozen = buf.split_to(total).freeze();
+            #[cfg(feature = "accounts")]
+            let account = frozen.slice(acct_off..acct_off + acct_len);
             let subject = frozen.slice(subj_off..subj_off + subj_len);
             let reply = frozen.slice(reply_off..reply_off + reply_len);
             let hdr_data = &frozen[payload_start..payload_start + hdr_size];
             let headers = parse_headers(hdr_data)?;
             let payload = frozen.slice(payload_start + hdr_size..payload_start + total_size);
             Ok(Some(RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account,
                 subject,
                 reply: Some(reply),
                 headers: Some(headers),
@@ -1392,16 +1420,23 @@ impl MsgBuilder {
         reply: Option<&[u8]>,
         headers: Option<&HeaderMap>,
         payload: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
     ) -> &[u8] {
         self.buf.clear();
         let mut tmp = [0u8; 20];
+        #[cfg(feature = "accounts")]
+        let acct = account;
+        #[cfg(not(feature = "accounts"))]
+        let acct = b"$G".as_slice();
         match headers {
             Some(hdrs) if !hdrs.is_empty() => {
                 let hdr_bytes = hdrs.to_bytes();
                 let hdr_len = hdr_bytes.len();
                 let total_len = hdr_len + payload.len();
 
-                self.buf.extend_from_slice(b"RMSG $G ");
+                self.buf.extend_from_slice(b"RMSG ");
+                self.buf.extend_from_slice(acct);
+                self.buf.push(b' ');
                 self.buf.extend_from_slice(subject);
                 self.buf.push(b' ');
                 if let Some(r) = reply {
@@ -1418,7 +1453,9 @@ impl MsgBuilder {
                 self.buf.extend_from_slice(b"\r\n");
             }
             _ => {
-                self.buf.extend_from_slice(b"RMSG $G ");
+                self.buf.extend_from_slice(b"RMSG ");
+                self.buf.extend_from_slice(acct);
+                self.buf.push(b' ');
                 self.buf.extend_from_slice(subject);
                 self.buf.push(b' ');
                 if let Some(r) = reply {
@@ -1435,31 +1472,59 @@ impl MsgBuilder {
         &self.buf
     }
 
-    /// Build `RS+ $G subject\r\n`.
+    /// Build `RS+ account subject\r\n`.
     #[cfg(any(feature = "cluster", feature = "gateway"))]
-    pub fn build_route_sub(&mut self, subject: &[u8]) -> &[u8] {
+    pub fn build_route_sub(
+        &mut self,
+        subject: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) -> &[u8] {
         self.buf.clear();
-        self.buf.extend_from_slice(b"RS+ $G ");
+        self.buf.extend_from_slice(b"RS+ ");
+        #[cfg(feature = "accounts")]
+        self.buf.extend_from_slice(account);
+        #[cfg(not(feature = "accounts"))]
+        self.buf.extend_from_slice(b"$G");
+        self.buf.push(b' ');
         self.buf.extend_from_slice(subject);
         self.buf.extend_from_slice(b"\r\n");
         &self.buf
     }
 
-    /// Build `RS- $G subject\r\n`.
+    /// Build `RS- account subject\r\n`.
     #[cfg(any(feature = "cluster", feature = "gateway"))]
-    pub fn build_route_unsub(&mut self, subject: &[u8]) -> &[u8] {
+    pub fn build_route_unsub(
+        &mut self,
+        subject: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) -> &[u8] {
         self.buf.clear();
-        self.buf.extend_from_slice(b"RS- $G ");
+        self.buf.extend_from_slice(b"RS- ");
+        #[cfg(feature = "accounts")]
+        self.buf.extend_from_slice(account);
+        #[cfg(not(feature = "accounts"))]
+        self.buf.extend_from_slice(b"$G");
+        self.buf.push(b' ');
         self.buf.extend_from_slice(subject);
         self.buf.extend_from_slice(b"\r\n");
         &self.buf
     }
 
-    /// Build `RS+ $G subject queue weight\r\n` for queue group route subscriptions.
+    /// Build `RS+ account subject queue weight\r\n` for queue group route subscriptions.
     #[cfg(any(feature = "cluster", feature = "gateway"))]
-    pub fn build_route_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+    pub fn build_route_sub_queue(
+        &mut self,
+        subject: &[u8],
+        queue: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) -> &[u8] {
         self.buf.clear();
-        self.buf.extend_from_slice(b"RS+ $G ");
+        self.buf.extend_from_slice(b"RS+ ");
+        #[cfg(feature = "accounts")]
+        self.buf.extend_from_slice(account);
+        #[cfg(not(feature = "accounts"))]
+        self.buf.extend_from_slice(b"$G");
+        self.buf.push(b' ');
         self.buf.extend_from_slice(subject);
         self.buf.push(b' ');
         self.buf.extend_from_slice(queue);
@@ -1467,14 +1532,24 @@ impl MsgBuilder {
         &self.buf
     }
 
-    /// Build `RS- $G subject\r\n` for queue group route unsubscriptions.
+    /// Build `RS- account subject\r\n` for queue group route unsubscriptions.
     #[cfg(any(feature = "cluster", feature = "gateway"))]
-    pub fn build_route_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+    pub fn build_route_unsub_queue(
+        &mut self,
+        subject: &[u8],
+        queue: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) -> &[u8] {
         // RS- doesn't use queue — it unsubscribes the subject entirely
         // (Go nats-server just uses RS- $G subject)
         let _ = queue;
         self.buf.clear();
-        self.buf.extend_from_slice(b"RS- $G ");
+        self.buf.extend_from_slice(b"RS- ");
+        #[cfg(feature = "accounts")]
+        self.buf.extend_from_slice(account);
+        #[cfg(not(feature = "accounts"))]
+        self.buf.extend_from_slice(b"$G");
+        self.buf.push(b' ');
         self.buf.extend_from_slice(subject);
         self.buf.extend_from_slice(b"\r\n");
         &self.buf
@@ -2133,7 +2208,7 @@ mod tests {
         let mut buf = BytesMut::from("RS+ $G test.subject\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
         match op {
-            RouteOp::RouteSub { subject, queue } => {
+            RouteOp::RouteSub { subject, queue, .. } => {
                 assert_eq!(&subject[..], b"test.subject");
                 assert!(queue.is_none());
             }
@@ -2148,7 +2223,7 @@ mod tests {
         let mut buf = BytesMut::from("RS+ $G test.subject myqueue 1\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
         match op {
-            RouteOp::RouteSub { subject, queue } => {
+            RouteOp::RouteSub { subject, queue, .. } => {
                 assert_eq!(&subject[..], b"test.subject");
                 assert_eq!(&queue.unwrap()[..], b"myqueue");
             }
@@ -2162,7 +2237,7 @@ mod tests {
         let mut buf = BytesMut::from("RS- $G test.subject\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
         match op {
-            RouteOp::RouteUnsub { subject } => {
+            RouteOp::RouteUnsub { subject, .. } => {
                 assert_eq!(&subject[..], b"test.subject");
             }
             _ => panic!("expected RouteUnsub"),
@@ -2180,6 +2255,7 @@ mod tests {
                 reply,
                 headers,
                 payload,
+                ..
             } => {
                 assert_eq!(&subject[..], b"test.sub");
                 assert!(reply.is_none());
@@ -2250,7 +2326,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_build_rmsg() {
         let mut b = MsgBuilder::new();
-        let data = b.build_rmsg(b"test.sub", None, None, b"hello");
+        let data = b.build_rmsg(
+            b"test.sub",
+            None,
+            None,
+            b"hello",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         assert_eq!(data, b"RMSG $G test.sub 5\r\nhello\r\n");
     }
 
@@ -2258,7 +2341,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_build_rmsg_with_reply() {
         let mut b = MsgBuilder::new();
-        let data = b.build_rmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+        let data = b.build_rmsg(
+            b"test.sub",
+            Some(b"reply.to"),
+            None,
+            b"hi",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         assert_eq!(data, b"RMSG $G test.sub reply.to 2\r\nhi\r\n");
     }
 
@@ -2266,7 +2356,11 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_build_route_sub() {
         let mut b = MsgBuilder::new();
-        let data = b.build_route_sub(b"test.subject");
+        let data = b.build_route_sub(
+            b"test.subject",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         assert_eq!(data, b"RS+ $G test.subject\r\n");
     }
 
@@ -2274,7 +2368,11 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_build_route_unsub() {
         let mut b = MsgBuilder::new();
-        let data = b.build_route_unsub(b"test.subject");
+        let data = b.build_route_unsub(
+            b"test.subject",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         assert_eq!(data, b"RS- $G test.subject\r\n");
     }
 
@@ -2282,7 +2380,12 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_build_route_sub_queue() {
         let mut b = MsgBuilder::new();
-        let data = b.build_route_sub_queue(b"test.subject", b"q1");
+        let data = b.build_route_sub_queue(
+            b"test.subject",
+            b"q1",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         assert_eq!(data, b"RS+ $G test.subject q1 1\r\n");
     }
 
@@ -2290,7 +2393,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_rmsg_roundtrip() {
         let mut builder = MsgBuilder::new();
-        let wire = builder.build_rmsg(b"foo.bar", Some(b"reply"), None, b"payload");
+        let wire = builder.build_rmsg(
+            b"foo.bar",
+            Some(b"reply"),
+            None,
+            b"payload",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         let mut buf = BytesMut::from(wire);
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
         match op {

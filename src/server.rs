@@ -325,6 +325,9 @@ pub struct LeafServerConfig {
     /// Remote clusters to connect to via gateways.
     #[cfg(feature = "gateway")]
     pub gateway_remotes: Vec<GatewayRemote>,
+    /// Account configurations for multi-tenant isolation.
+    #[cfg(feature = "accounts")]
+    pub accounts: Vec<AccountConfig>,
 }
 
 /// A remote cluster for gateway connections.
@@ -334,6 +337,76 @@ pub struct GatewayRemote {
     pub name: String,
     /// Seed URLs for that cluster.
     pub urls: Vec<String>,
+}
+
+/// Numeric account identifier. 0 = `$G` (global/default account).
+#[cfg(feature = "accounts")]
+pub type AccountId = u16;
+
+/// Configuration for a single named account.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    /// Account name (e.g., "team_a").
+    pub name: String,
+    /// Usernames assigned to this account.
+    pub users: Vec<String>,
+}
+
+/// Maps account names to numeric IDs and vice versa.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct AccountRegistry {
+    name_to_id: HashMap<String, AccountId>,
+    id_to_name: Vec<String>,
+}
+
+#[cfg(feature = "accounts")]
+impl AccountRegistry {
+    /// Build a registry from account configs. Index 0 is always `$G`.
+    pub fn new(accounts: &[AccountConfig]) -> Self {
+        let mut name_to_id = HashMap::new();
+        let mut id_to_name = vec!["$G".to_string()];
+        name_to_id.insert("$G".to_string(), 0);
+
+        for (i, acct) in accounts.iter().enumerate() {
+            let id = (i + 1) as AccountId;
+            name_to_id.insert(acct.name.clone(), id);
+            id_to_name.push(acct.name.clone());
+        }
+        Self {
+            name_to_id,
+            id_to_name,
+        }
+    }
+
+    /// Look up the account ID for a username. Returns 0 (`$G`) if not found.
+    pub fn lookup_user(&self, username: &str, accounts: &[AccountConfig]) -> AccountId {
+        for (i, acct) in accounts.iter().enumerate() {
+            if acct.users.iter().any(|u| u == username) {
+                return (i + 1) as AccountId;
+            }
+        }
+        0 // default to $G
+    }
+
+    /// Get the account name for a given ID.
+    pub fn name(&self, id: AccountId) -> &str {
+        self.id_to_name
+            .get(id as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("$G")
+    }
+
+    /// Look up an account ID by name. Returns `None` if not found.
+    pub fn id_by_name(&self, name: &str) -> Option<AccountId> {
+        self.name_to_id.get(name).copied()
+    }
+
+    /// Total number of accounts (including `$G`).
+    pub fn count(&self) -> usize {
+        self.id_to_name.len()
+    }
 }
 
 impl Default for LeafServerConfig {
@@ -390,6 +463,8 @@ impl Default for LeafServerConfig {
             gateway_name: None,
             #[cfg(feature = "gateway")]
             gateway_remotes: Vec::new(),
+            #[cfg(feature = "accounts")]
+            accounts: Vec::new(),
         }
     }
 }
@@ -462,8 +537,19 @@ fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io:
         "/varz" => {
             let uptime = state.stats.start_time.elapsed();
             let subs_count = {
-                let subs = state.subs.read().unwrap();
-                subs.unique_subjects().len()
+                #[cfg(feature = "accounts")]
+                {
+                    state
+                        .account_subs
+                        .iter()
+                        .map(|s| s.read().unwrap().unique_subjects().len())
+                        .sum::<usize>()
+                }
+                #[cfg(not(feature = "accounts"))]
+                {
+                    let subs = state.subs.read().unwrap();
+                    subs.unique_subjects().len()
+                }
             };
             let body = format!(
                 concat!(
@@ -674,7 +760,17 @@ pub(crate) struct ServerState {
     pub ping_interval_ms: AtomicU64,
     pub auth_timeout_ms: AtomicU64,
     pub max_pings_outstanding: AtomicU32,
+    #[cfg(not(feature = "accounts"))]
     pub subs: std::sync::RwLock<SubList>,
+    /// Per-account subscription lists, indexed by AccountId.
+    #[cfg(feature = "accounts")]
+    pub account_subs: Vec<std::sync::RwLock<SubList>>,
+    /// Maps account names ↔ numeric IDs.
+    #[cfg(feature = "accounts")]
+    pub account_registry: AccountRegistry,
+    /// Account configurations (for username → account lookup).
+    #[cfg(feature = "accounts")]
+    pub account_configs: Vec<AccountConfig>,
     #[cfg(feature = "leaf")]
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
@@ -787,6 +883,7 @@ impl ServerState {
         #[cfg(feature = "gateway")] gateway_port: Option<u16>,
         #[cfg(feature = "gateway")] gateway_name: Option<String>,
         #[cfg(feature = "gateway")] gateway_remotes: Vec<GatewayRemote>,
+        #[cfg(feature = "accounts")] accounts: Vec<AccountConfig>,
     ) -> Self {
         #[cfg(feature = "cluster")]
         let cluster_self_host = if info.host.is_empty() || info.host == "0.0.0.0" {
@@ -821,7 +918,20 @@ impl ServerState {
             ping_interval_ms: AtomicU64::new(ping_interval.as_millis() as u64),
             auth_timeout_ms: AtomicU64::new(auth_timeout.as_millis() as u64),
             max_pings_outstanding: AtomicU32::new(max_pings_outstanding),
+            #[cfg(not(feature = "accounts"))]
             subs: std::sync::RwLock::new(SubList::new()),
+            #[cfg(feature = "accounts")]
+            account_subs: {
+                let registry = AccountRegistry::new(&accounts);
+                let count = registry.count();
+                (0..count)
+                    .map(|_| std::sync::RwLock::new(SubList::new()))
+                    .collect()
+            },
+            #[cfg(feature = "accounts")]
+            account_registry: AccountRegistry::new(&accounts),
+            #[cfg(feature = "accounts")]
+            account_configs: accounts,
             #[cfg(feature = "leaf")]
             upstream: std::sync::RwLock::new(None),
             #[cfg(feature = "leaf")]
@@ -895,6 +1005,50 @@ impl ServerState {
 
     pub(crate) fn next_client_id(&self) -> u64 {
         self.next_cid.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Get the subscription list for the given account.
+    /// When the `accounts` feature is disabled, always returns the global SubList.
+    #[inline]
+    pub(crate) fn get_subs(
+        &self,
+        #[cfg(feature = "accounts")] account_id: AccountId,
+    ) -> &std::sync::RwLock<SubList> {
+        #[cfg(feature = "accounts")]
+        {
+            &self.account_subs[account_id as usize]
+        }
+        #[cfg(not(feature = "accounts"))]
+        {
+            &self.subs
+        }
+    }
+
+    /// Look up account ID for a username during CONNECT.
+    #[cfg(feature = "accounts")]
+    pub(crate) fn lookup_account(&self, username: Option<&str>) -> AccountId {
+        match username {
+            Some(user) => self
+                .account_registry
+                .lookup_user(user, &self.account_configs),
+            None => 0,
+        }
+    }
+
+    /// Get the account name for a given AccountId.
+    /// Returns `$G` for the global account (id 0 when no named account is configured).
+    #[cfg(feature = "accounts")]
+    #[inline]
+    pub(crate) fn account_name(&self, account_id: AccountId) -> &str {
+        self.account_registry.name(account_id)
+    }
+
+    /// Resolve an account name (from wire protocol) to an AccountId.
+    /// Returns 0 ($G) for unknown account names.
+    #[cfg(feature = "accounts")]
+    #[inline]
+    pub(crate) fn resolve_account(&self, name: &str) -> AccountId {
+        self.account_registry.id_by_name(name).unwrap_or(0)
     }
 }
 
@@ -979,6 +1133,8 @@ impl LeafServer {
                 config.gateway_name.clone(),
                 #[cfg(feature = "gateway")]
                 config.gateway_remotes.clone(),
+                #[cfg(feature = "accounts")]
+                config.accounts.clone(),
             )),
         }
     }
@@ -1583,8 +1739,18 @@ impl LeafServer {
 
         // Cleanup: clear all subscriptions.
         {
-            let mut subs = self.state.subs.write().unwrap();
-            *subs = SubList::new();
+            #[cfg(feature = "accounts")]
+            {
+                for account_subs in &self.state.account_subs {
+                    let mut subs = account_subs.write().unwrap();
+                    *subs = SubList::new();
+                }
+            }
+            #[cfg(not(feature = "accounts"))]
+            {
+                let mut subs = self.state.subs.write().unwrap();
+                *subs = SubList::new();
+            }
         }
 
         // Drop upstream

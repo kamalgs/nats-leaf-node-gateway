@@ -40,11 +40,11 @@ impl GatewayHandler {
                 (HandleResult::Flush, Vec::new())
             }
             GatewayOp::Pong => (HandleResult::Ok, Vec::new()),
-            GatewayOp::RouteSub { subject, queue } => {
+            GatewayOp::RouteSub { subject, queue, .. } => {
                 let result = Self::handle_gateway_sub(conn, wctx, subject, queue);
                 (result, Vec::new())
             }
-            GatewayOp::RouteUnsub { subject } => {
+            GatewayOp::RouteUnsub { subject, .. } => {
                 let result = Self::handle_gateway_unsub(conn, wctx, subject);
                 (result, Vec::new())
             }
@@ -53,6 +53,7 @@ impl GatewayHandler {
                 reply,
                 headers,
                 payload,
+                ..
             } => Self::handle_gmsg(conn, wctx, subject, reply, headers, payload),
             GatewayOp::Info(info) => {
                 // Process gateway_urls for gossip discovery.
@@ -129,10 +130,19 @@ impl GatewayHandler {
             #[cfg(feature = "cluster")]
             is_route: false,
             is_gateway: true,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -180,7 +190,14 @@ impl GatewayHandler {
         };
 
         let removed = {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .write()
+                .unwrap();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -239,12 +256,18 @@ impl GatewayHandler {
             #[cfg(feature = "cluster")]
             true, // skip_routes — one-hop enforcement
             true, // skip_gateways — one-hop enforcement
+            #[cfg(feature = "accounts")]
+            conn.account_id,
         );
 
         // Send RS- back when no local subs matched (negative interest signal).
         if delivered == 0 {
             let mut builder = nats_proto::MsgBuilder::new();
-            let rs_minus = builder.build_route_unsub(&subject);
+            let rs_minus = builder.build_route_unsub(
+                &subject,
+                #[cfg(feature = "accounts")]
+                b"$G".as_slice(),
+            );
             conn.write_buf.extend_from_slice(rs_minus);
         }
 

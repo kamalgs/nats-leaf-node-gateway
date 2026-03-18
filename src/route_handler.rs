@@ -36,20 +36,73 @@ impl RouteHandler {
                 (HandleResult::Flush, Vec::new())
             }
             RouteOp::Pong => (HandleResult::Ok, Vec::new()),
-            RouteOp::RouteSub { subject, queue } => {
-                let result = Self::handle_route_sub(conn, wctx, subject, queue);
+            RouteOp::RouteSub {
+                #[cfg(feature = "accounts")]
+                account,
+                subject,
+                queue,
+                ..
+            } => {
+                #[cfg(feature = "accounts")]
+                let account_id = {
+                    let acct_str = crate::handler::bytes_to_str(&account);
+                    wctx.state.resolve_account(acct_str)
+                };
+                let result = Self::handle_route_sub(
+                    conn,
+                    wctx,
+                    subject,
+                    queue,
+                    #[cfg(feature = "accounts")]
+                    account_id,
+                );
                 (result, Vec::new())
             }
-            RouteOp::RouteUnsub { subject } => {
-                let result = Self::handle_route_unsub(conn, wctx, subject);
+            RouteOp::RouteUnsub {
+                #[cfg(feature = "accounts")]
+                account,
+                subject,
+                ..
+            } => {
+                #[cfg(feature = "accounts")]
+                let account_id = {
+                    let acct_str = crate::handler::bytes_to_str(&account);
+                    wctx.state.resolve_account(acct_str)
+                };
+                let result = Self::handle_route_unsub(
+                    conn,
+                    wctx,
+                    subject,
+                    #[cfg(feature = "accounts")]
+                    account_id,
+                );
                 (result, Vec::new())
             }
             RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account,
                 subject,
                 reply,
                 headers,
                 payload,
-            } => Self::handle_rmsg(conn, wctx, subject, reply, headers, payload),
+                ..
+            } => {
+                #[cfg(feature = "accounts")]
+                let account_id = {
+                    let acct_str = crate::handler::bytes_to_str(&account);
+                    wctx.state.resolve_account(acct_str)
+                };
+                Self::handle_rmsg(
+                    conn,
+                    wctx,
+                    subject,
+                    reply,
+                    headers,
+                    payload,
+                    #[cfg(feature = "accounts")]
+                    account_id,
+                )
+            }
             RouteOp::Info(info) => {
                 // Gossip: process connect_urls from active-phase INFO updates.
                 if !info.connect_urls.is_empty() {
@@ -78,6 +131,7 @@ impl RouteHandler {
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
+        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
     ) -> HandleResult {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
@@ -110,10 +164,19 @@ impl RouteHandler {
             is_route: true,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "accounts")]
+            account_id,
         };
 
         {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    account_id,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -122,7 +185,13 @@ impl RouteHandler {
 
         // Propagate RS+ to gateway peers.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(wctx.state, subject_str.as_bytes(), queue.as_deref());
+        propagate_gateway_sub(
+            wctx.state,
+            subject_str.as_bytes(),
+            queue.as_deref(),
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(account_id).as_bytes(),
+        );
 
         gauge!(
             "subscriptions_active",
@@ -138,6 +207,7 @@ impl RouteHandler {
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
+        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
     ) -> HandleResult {
         // RS- doesn't include queue in the wire format, so look up by subject only.
         // We try to find the SID for this subject with any queue value.
@@ -161,7 +231,14 @@ impl RouteHandler {
         };
 
         let removed = {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    account_id,
+                )
+                .write()
+                .unwrap();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -176,6 +253,8 @@ impl RouteHandler {
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                #[cfg(feature = "accounts")]
+                wctx.state.account_name(account_id).as_bytes(),
             );
             gauge!(
                 "subscriptions_active",
@@ -200,6 +279,7 @@ impl RouteHandler {
         reply: Option<Bytes>,
         headers: Option<crate::types::HeaderMap>,
         payload: Bytes,
+        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         let payload_len = payload.len() as u64;
         *wctx.msgs_received += 1;
@@ -220,6 +300,8 @@ impl RouteHandler {
             true, // skip_routes — one-hop enforcement
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — route msgs forward to gateway peers
+            #[cfg(feature = "accounts")]
+            account_id,
         );
 
         // Forward to optimistic gateways when no gateway sub matched.
@@ -231,6 +313,8 @@ impl RouteHandler {
             reply.as_deref(),
             headers.as_ref(),
             &payload,
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(account_id).as_bytes(),
         );
 
         // Also forward to upstream hub if configured

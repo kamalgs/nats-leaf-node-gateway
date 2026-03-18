@@ -108,9 +108,17 @@ impl DirectWriter {
         reply: Option<&[u8]>,
         headers: Option<&HeaderMap>,
         payload: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
     ) {
         let mut builder = self.msg_builder.lock().unwrap();
-        let data = builder.build_rmsg(subject, reply, headers, payload);
+        let data = builder.build_rmsg(
+            subject,
+            reply,
+            headers,
+            payload,
+            #[cfg(feature = "accounts")]
+            account,
+        );
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
         drop(buf);
@@ -202,6 +210,9 @@ pub struct Subscription {
     /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
     #[cfg(feature = "gateway")]
     pub is_gateway: bool,
+    /// Account this subscription belongs to. 0 = `$G` (global/default).
+    #[cfg(feature = "accounts")]
+    pub account_id: crate::server::AccountId,
 }
 
 impl Clone for Subscription {
@@ -220,6 +231,8 @@ impl Clone for Subscription {
             is_route: self.is_route,
             #[cfg(feature = "gateway")]
             is_gateway: self.is_gateway,
+            #[cfg(feature = "accounts")]
+            account_id: self.account_id,
         }
     }
 }
@@ -243,6 +256,8 @@ impl Subscription {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         }
     }
 }
@@ -1323,7 +1338,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_direct_writer_formats_rmsg() {
         let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(b"test.sub", None, None, b"hello");
+        writer.write_rmsg(
+            b"test.sub",
+            None,
+            None,
+            b"hello",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         let data = writer.drain().expect("should have data");
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "RMSG $G test.sub 5\r\nhello\r\n");
@@ -1333,7 +1355,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_direct_writer_formats_rmsg_with_reply() {
         let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+        writer.write_rmsg(
+            b"test.sub",
+            Some(b"reply.to"),
+            None,
+            b"hi",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "RMSG $G test.sub reply.to 2\r\nhi\r\n");

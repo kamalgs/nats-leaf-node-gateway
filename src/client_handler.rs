@@ -128,10 +128,19 @@ impl ClientHandler {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "accounts")]
+            account_id: conn.account_id,
         };
 
         {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -158,11 +167,23 @@ impl ClientHandler {
 
         // Propagate RS+ to inbound route connections.
         #[cfg(feature = "cluster")]
-        propagate_route_sub(wctx.state, subject_str.as_bytes(), queue_group.as_deref());
+        propagate_route_sub(
+            wctx.state,
+            subject_str.as_bytes(),
+            queue_group.as_deref(),
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
+        );
 
         // Propagate RS+ to gateway connections.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(wctx.state, subject_str.as_bytes(), queue_group.as_deref());
+        propagate_gateway_sub(
+            wctx.state,
+            subject_str.as_bytes(),
+            queue_group.as_deref(),
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
+        );
 
         gauge!(
             "subscriptions_active",
@@ -182,13 +203,27 @@ impl ClientHandler {
     ) -> HandleResult {
         if let Some(n) = max {
             // UNSUB with max: set delivery limit, auto-remove when reached.
-            let subs = wctx.state.subs.read().unwrap();
+            let subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .read()
+                .unwrap();
             let found = subs.set_unsub_max(conn.conn_id, sid, n);
             let already_expired = found && subs.is_expired(conn.conn_id, sid);
             drop(subs);
 
             if already_expired {
-                let mut subs = wctx.state.subs.write().unwrap();
+                let mut subs = wctx
+                    .state
+                    .get_subs(
+                        #[cfg(feature = "accounts")]
+                        conn.account_id,
+                    )
+                    .write()
+                    .unwrap();
                 if let Some(removed) = subs.remove(conn.conn_id, sid) {
                     wctx.state
                         .has_subs
@@ -217,12 +252,16 @@ impl ClientHandler {
                         wctx.state,
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
+                        #[cfg(feature = "accounts")]
+                        wctx.state.account_name(conn.account_id).as_bytes(),
                     );
                     #[cfg(feature = "gateway")]
                     propagate_gateway_unsub(
                         wctx.state,
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
+                        #[cfg(feature = "accounts")]
+                        wctx.state.account_name(conn.account_id).as_bytes(),
                     );
                     debug!(
                         conn_id = conn.conn_id,
@@ -235,7 +274,14 @@ impl ClientHandler {
         } else {
             // Immediate unsubscribe
             let removed = {
-                let mut subs = wctx.state.subs.write().unwrap();
+                let mut subs = wctx
+                    .state
+                    .get_subs(
+                        #[cfg(feature = "accounts")]
+                        conn.account_id,
+                    )
+                    .write()
+                    .unwrap();
                 let r = subs.remove(conn.conn_id, sid);
                 wctx.state
                     .has_subs
@@ -268,12 +314,16 @@ impl ClientHandler {
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
+                    #[cfg(feature = "accounts")]
+                    wctx.state.account_name(conn.account_id).as_bytes(),
                 );
                 #[cfg(feature = "gateway")]
                 propagate_gateway_unsub(
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
+                    #[cfg(feature = "accounts")]
+                    wctx.state.account_name(conn.account_id).as_bytes(),
                 );
                 debug!(
                     conn_id = conn.conn_id,
@@ -338,6 +388,8 @@ impl ClientHandler {
             false, // don't skip routes — client pubs forward to route peers
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — client pubs forward to gateway peers
+            #[cfg(feature = "accounts")]
+            conn.account_id,
         );
 
         // Forward to optimistic gateways when no gateway sub matched.
@@ -349,6 +401,8 @@ impl ClientHandler {
             respond.as_deref(),
             headers.as_ref(),
             &payload,
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
         );
 
         #[cfg(feature = "leaf")]

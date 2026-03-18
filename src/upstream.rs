@@ -308,7 +308,13 @@ fn connect_and_run(
     // Sync interests through the pipeline (mapping + collapse dedup)
     {
         let interests: Vec<(String, Option<String>)> = {
-            let subs = state.subs.read().unwrap();
+            let subs = state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    0,
+                )
+                .read()
+                .unwrap();
             subs.unique_interests()
                 .into_iter()
                 .map(|(s, q)| (s.to_string(), q.map(|q| q.to_string())))
@@ -570,8 +576,15 @@ fn handle_hub_op(
                 headers.as_ref(),
                 &payload,
                 dirty_writers,
+                #[cfg(feature = "accounts")]
+                0, // account_id — upstream hub uses $G
             );
-            handle_expired_subs_upstream(&expired, state);
+            handle_expired_subs_upstream(
+                &expired,
+                state,
+                #[cfg(feature = "accounts")]
+                0,
+            );
         }
         LeafOp::Ping => {
             // Send PONG via the writer thread

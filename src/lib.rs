@@ -36,4 +36,6 @@ pub use interest::SubjectMapping;
 pub use server::GatewayRemote;
 #[cfg(feature = "leaf")]
 pub use server::HubCredentials;
+#[cfg(feature = "accounts")]
+pub use server::{AccountConfig, AccountId, AccountRegistry};
 pub use server::{ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig};

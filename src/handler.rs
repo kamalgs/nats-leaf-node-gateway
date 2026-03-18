@@ -41,6 +41,9 @@ pub(crate) struct ConnCtx<'a> {
     pub ext: &'a mut ConnExt,
     /// Whether the connection is in Draining phase.
     pub draining: bool,
+    /// Account this connection belongs to. 0 = `$G` (global/default).
+    #[cfg(feature = "accounts")]
+    pub account_id: crate::server::AccountId,
 }
 
 /// Per-connection extension state, replacing the flat `ConnectionKind` enum
@@ -139,16 +142,25 @@ pub(crate) enum HandleResult {
 
 /// Inner dispatch for writing a message to a single subscription based on its type.
 #[inline]
+#[allow(unused_variables)]
 fn deliver_to_sub_inner(
     sub: &crate::sub_list::Subscription,
     subject: &[u8],
     reply: Option<&[u8]>,
     headers: Option<&HeaderMap>,
     payload: &[u8],
+    #[cfg(feature = "accounts")] account_name: &[u8],
 ) {
     #[cfg(feature = "cluster")]
     if sub.is_route {
-        sub.writer.write_rmsg(subject, reply, headers, payload);
+        sub.writer.write_rmsg(
+            subject,
+            reply,
+            headers,
+            payload,
+            #[cfg(feature = "accounts")]
+            account_name,
+        );
         return;
     }
     #[cfg(feature = "hub")]
@@ -185,11 +197,24 @@ pub(crate) fn deliver_to_subs(
     skip_echo: bool,
     #[cfg(feature = "cluster")] skip_routes: bool,
     #[cfg(feature = "gateway")] skip_gateways: bool,
+    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     let payload_len = payload.len() as u64;
     let mut delivered: usize = 0;
 
-    let subs = wctx.state.subs.read().unwrap();
+    #[cfg(feature = "accounts")]
+    let acct_name_str = wctx.state.account_name(account_id);
+    #[cfg(feature = "accounts")]
+    let acct_name = acct_name_str.as_bytes();
+
+    let subs = wctx
+        .state
+        .get_subs(
+            #[cfg(feature = "accounts")]
+            account_id,
+        )
+        .read()
+        .unwrap();
     let (_match_count, expired) = subs.for_each_match(subject_str, |sub| {
         // Suppress echo: don't deliver to the publisher itself
         // when the client set echo: false in CONNECT, or suppress
@@ -211,14 +236,36 @@ pub(crate) fn deliver_to_subs(
         if sub.is_gateway {
             // Rewrite reply with _GR_ prefix before forwarding across gateway
             let gw_reply = rewrite_gateway_reply(reply, wctx.state);
-            sub.writer
-                .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
+            sub.writer.write_rmsg(
+                subject,
+                gw_reply.as_deref(),
+                headers,
+                payload,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            );
         } else {
-            deliver_to_sub_inner(sub, subject, reply, headers, payload);
+            deliver_to_sub_inner(
+                sub,
+                subject,
+                reply,
+                headers,
+                payload,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            );
         }
         #[cfg(not(feature = "gateway"))]
         {
-            deliver_to_sub_inner(sub, subject, reply, headers, payload);
+            deliver_to_sub_inner(
+                sub,
+                subject,
+                reply,
+                headers,
+                payload,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            );
         }
         delivered += 1;
         *wctx.msgs_delivered += 1;
@@ -248,6 +295,7 @@ pub(crate) fn deliver_to_subs(
 /// notification (since the upstream reader runs outside the worker event loop)
 /// and does not track worker-level metrics.
 #[cfg(feature = "leaf")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_to_subs_upstream(
     state: &ServerState,
     subject: &[u8],
@@ -256,6 +304,7 @@ pub(crate) fn deliver_to_subs_upstream(
     headers: Option<&HeaderMap>,
     payload: &[u8],
     dirty_writers: &mut Vec<DirectWriter>,
+    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     deliver_to_subs_upstream_inner(
         state,
@@ -269,6 +318,8 @@ pub(crate) fn deliver_to_subs_upstream(
         false,
         #[cfg(feature = "gateway")]
         false,
+        #[cfg(feature = "accounts")]
+        account_id,
     )
 }
 
@@ -287,16 +338,38 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     dirty_writers: &mut Vec<DirectWriter>,
     #[cfg(feature = "cluster")] skip_routes: bool,
     #[cfg(feature = "gateway")] skip_gateways: bool,
+    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     let mut delivered: usize = 0;
-    let subs = state.subs.read().unwrap();
+
+    #[cfg(feature = "accounts")]
+    #[allow(unused)]
+    let acct_name_str = state.account_name(account_id);
+    #[cfg(feature = "accounts")]
+    #[allow(unused)]
+    let acct_name = acct_name_str.as_bytes();
+
+    let subs = state
+        .get_subs(
+            #[cfg(feature = "accounts")]
+            account_id,
+        )
+        .read()
+        .unwrap();
     let (_count, expired) = subs.for_each_match(subject_str, |sub| {
         #[cfg(feature = "cluster")]
         if sub.is_route {
             if skip_routes {
                 return;
             }
-            sub.writer.write_rmsg(subject, reply, headers, payload);
+            sub.writer.write_rmsg(
+                subject,
+                reply,
+                headers,
+                payload,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            );
             dirty_writers.push(sub.writer.clone());
             delivered += 1;
             return;
@@ -307,8 +380,14 @@ pub(crate) fn deliver_to_subs_upstream_inner(
                 return;
             }
             let gw_reply = rewrite_gateway_reply(reply, state);
-            sub.writer
-                .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
+            sub.writer.write_rmsg(
+                subject,
+                gw_reply.as_deref(),
+                headers,
+                payload,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            );
             dirty_writers.push(sub.writer.clone());
             delivered += 1;
             return;
@@ -340,11 +419,18 @@ pub(crate) fn handle_expired_subs(
     state: &ServerState,
     conns: &mut HashMap<u64, crate::worker::ClientState>,
     worker_label: &str,
+    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) {
     if expired.is_empty() {
         return;
     }
-    let mut subs = state.subs.write().unwrap();
+    let mut subs = state
+        .get_subs(
+            #[cfg(feature = "accounts")]
+            account_id,
+        )
+        .write()
+        .unwrap();
     for (exp_conn_id, exp_sid) in expired {
         if let Some(removed) = subs.remove(*exp_conn_id, *exp_sid) {
             if let Some(client) = conns.get_mut(exp_conn_id) {
@@ -379,11 +465,21 @@ pub(crate) fn handle_expired_subs(
 /// Similar to `handle_expired_subs` but without access to worker connections
 /// (upstream runs in its own thread).
 #[cfg(feature = "leaf")]
-pub(crate) fn handle_expired_subs_upstream(expired: &[(u64, u64)], state: &ServerState) {
+pub(crate) fn handle_expired_subs_upstream(
+    expired: &[(u64, u64)],
+    state: &ServerState,
+    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+) {
     if expired.is_empty() {
         return;
     }
-    let mut subs = state.subs.write().unwrap();
+    let mut subs = state
+        .get_subs(
+            #[cfg(feature = "accounts")]
+            account_id,
+        )
+        .write()
+        .unwrap();
     for (conn_id, sid) in expired {
         if let Some(removed) = subs.remove(*conn_id, *sid) {
             let mut upstream = state.upstream.write().unwrap();
@@ -436,32 +532,63 @@ pub(crate) fn propagate_leaf_unsub(state: &ServerState, subject: &[u8], queue: O
 /// Send LS+ for all existing client subscriptions to a given leaf's DirectWriter.
 #[cfg(feature = "hub")]
 pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
-    let subs = state.subs.read().unwrap();
     let mut builder = nats_proto::MsgBuilder::new();
-    for (subject, queue) in subs.client_interests() {
-        let data = if let Some(q) = queue {
-            builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
-        } else {
-            builder.build_leaf_sub(subject.as_bytes())
-        };
-        writer.write_raw(data);
+
+    #[cfg(feature = "accounts")]
+    {
+        for account_sub in &state.account_subs {
+            let subs = account_sub.read().unwrap();
+            for (subject, queue) in subs.client_interests() {
+                let data = if let Some(q) = queue {
+                    builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
+                } else {
+                    builder.build_leaf_sub(subject.as_bytes())
+                };
+                writer.write_raw(data);
+            }
+        }
     }
-    drop(subs);
+    #[cfg(not(feature = "accounts"))]
+    {
+        let subs = state.subs.read().unwrap();
+        for (subject, queue) in subs.client_interests() {
+            let data = if let Some(q) = queue {
+                builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
+            } else {
+                builder.build_leaf_sub(subject.as_bytes())
+            };
+            writer.write_raw(data);
+        }
+    }
     writer.notify();
 }
 
 /// Propagate RS+ to all inbound route connections (interest advertisement).
 #[cfg(feature = "cluster")]
-pub(crate) fn propagate_route_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+pub(crate) fn propagate_route_sub(
+    state: &ServerState,
+    subject: &[u8],
+    queue: Option<&[u8]>,
+    #[cfg(feature = "accounts")] account: &[u8],
+) {
     let writers = state.route_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
     let mut builder = nats_proto::MsgBuilder::new();
     let data = if let Some(q) = queue {
-        builder.build_route_sub_queue(subject, q)
+        builder.build_route_sub_queue(
+            subject,
+            q,
+            #[cfg(feature = "accounts")]
+            account,
+        )
     } else {
-        builder.build_route_sub(subject)
+        builder.build_route_sub(
+            subject,
+            #[cfg(feature = "accounts")]
+            account,
+        )
     };
     for writer in writers.values() {
         writer.write_raw(data);
@@ -471,16 +598,30 @@ pub(crate) fn propagate_route_sub(state: &ServerState, subject: &[u8], queue: Op
 
 /// Propagate RS- to all inbound route connections (interest removal).
 #[cfg(feature = "cluster")]
-pub(crate) fn propagate_route_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+pub(crate) fn propagate_route_unsub(
+    state: &ServerState,
+    subject: &[u8],
+    queue: Option<&[u8]>,
+    #[cfg(feature = "accounts")] account: &[u8],
+) {
     let writers = state.route_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
     let mut builder = nats_proto::MsgBuilder::new();
     let data = if let Some(q) = queue {
-        builder.build_route_unsub_queue(subject, q)
+        builder.build_route_unsub_queue(
+            subject,
+            q,
+            #[cfg(feature = "accounts")]
+            account,
+        )
     } else {
-        builder.build_route_unsub(subject)
+        builder.build_route_unsub(
+            subject,
+            #[cfg(feature = "accounts")]
+            account,
+        )
     };
     for writer in writers.values() {
         writer.write_raw(data);
@@ -491,17 +632,46 @@ pub(crate) fn propagate_route_unsub(state: &ServerState, subject: &[u8], queue: 
 /// Send RS+ for all existing local subscriptions to a given route's DirectWriter.
 #[cfg(feature = "cluster")]
 pub(crate) fn send_existing_subs_to_route(state: &ServerState, writer: &DirectWriter) {
-    let subs = state.subs.read().unwrap();
     let mut builder = nats_proto::MsgBuilder::new();
-    for (subject, queue) in subs.local_interests() {
-        let data = if let Some(q) = queue {
-            builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
-        } else {
-            builder.build_route_sub(subject.as_bytes())
-        };
-        writer.write_raw(data);
+
+    #[cfg(feature = "accounts")]
+    {
+        for (idx, account_sub) in state.account_subs.iter().enumerate() {
+            let acct = state
+                .account_name(idx as crate::server::AccountId)
+                .as_bytes();
+            let subs = account_sub.read().unwrap();
+            for (subject, queue) in subs.local_interests() {
+                let data = if let Some(q) = queue {
+                    builder.build_route_sub_queue(
+                        subject.as_bytes(),
+                        q.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        acct,
+                    )
+                } else {
+                    builder.build_route_sub(
+                        subject.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        acct,
+                    )
+                };
+                writer.write_raw(data);
+            }
+        }
     }
-    drop(subs);
+    #[cfg(not(feature = "accounts"))]
+    {
+        let subs = state.subs.read().unwrap();
+        for (subject, queue) in subs.local_interests() {
+            let data = if let Some(q) = queue {
+                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+            } else {
+                builder.build_route_sub(subject.as_bytes())
+            };
+            writer.write_raw(data);
+        }
+    }
     writer.notify();
 }
 
@@ -516,7 +686,12 @@ thread_local! {
 /// receives everything). Only inbound gateways (tracked in `gateway_writers`)
 /// and outbound gateways in InterestOnly mode receive RS+.
 #[cfg(feature = "gateway")]
-pub(crate) fn propagate_gateway_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+pub(crate) fn propagate_gateway_sub(
+    state: &ServerState,
+    subject: &[u8],
+    queue: Option<&[u8]>,
+    #[cfg(feature = "accounts")] account: &[u8],
+) {
     use crate::server::GatewayInterestMode;
 
     let writers = state.gateway_writers.read().unwrap();
@@ -530,9 +705,18 @@ pub(crate) fn propagate_gateway_sub(state: &ServerState, subject: &[u8], queue: 
     GW_BUILDER.with(|cell| {
         let mut builder = cell.borrow_mut();
         let data = if let Some(q) = queue {
-            builder.build_route_sub_queue(subject, q)
+            builder.build_route_sub_queue(
+                subject,
+                q,
+                #[cfg(feature = "accounts")]
+                account,
+            )
         } else {
-            builder.build_route_sub(subject)
+            builder.build_route_sub(
+                subject,
+                #[cfg(feature = "accounts")]
+                account,
+            )
         };
         for (conn_id, writer) in writers.iter() {
             // Skip outbound gateways in Optimistic mode (they forward everything already).
@@ -554,7 +738,12 @@ pub(crate) fn propagate_gateway_sub(state: &ServerState, subject: &[u8], queue: 
 /// Only sent to outbound gateways in InterestOnly mode. Optimistic gateways
 /// don't need RS- (they use negative interest in the opposite direction).
 #[cfg(feature = "gateway")]
-pub(crate) fn propagate_gateway_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+pub(crate) fn propagate_gateway_unsub(
+    state: &ServerState,
+    subject: &[u8],
+    queue: Option<&[u8]>,
+    #[cfg(feature = "accounts")] account: &[u8],
+) {
     use crate::server::GatewayInterestMode;
 
     let writers = state.gateway_writers.read().unwrap();
@@ -567,9 +756,18 @@ pub(crate) fn propagate_gateway_unsub(state: &ServerState, subject: &[u8], queue
     GW_BUILDER.with(|cell| {
         let mut builder = cell.borrow_mut();
         let data = if let Some(q) = queue {
-            builder.build_route_unsub_queue(subject, q)
+            builder.build_route_unsub_queue(
+                subject,
+                q,
+                #[cfg(feature = "accounts")]
+                account,
+            )
         } else {
-            builder.build_route_unsub(subject)
+            builder.build_route_unsub(
+                subject,
+                #[cfg(feature = "accounts")]
+                account,
+            )
         };
         for (conn_id, writer) in writers.iter() {
             // Skip outbound gateways in Optimistic mode.
@@ -589,17 +787,46 @@ pub(crate) fn propagate_gateway_unsub(state: &ServerState, subject: &[u8], queue
 /// Send RS+ for all existing local subscriptions to a given gateway's DirectWriter.
 #[cfg(feature = "gateway")]
 pub(crate) fn send_existing_subs_to_gateway(state: &ServerState, writer: &DirectWriter) {
-    let subs = state.subs.read().unwrap();
     let mut builder = nats_proto::MsgBuilder::new();
-    for (subject, queue) in subs.local_interests() {
-        let data = if let Some(q) = queue {
-            builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
-        } else {
-            builder.build_route_sub(subject.as_bytes())
-        };
-        writer.write_raw(data);
+
+    #[cfg(feature = "accounts")]
+    {
+        for (idx, account_sub) in state.account_subs.iter().enumerate() {
+            let acct = state
+                .account_name(idx as crate::server::AccountId)
+                .as_bytes();
+            let subs = account_sub.read().unwrap();
+            for (subject, queue) in subs.local_interests() {
+                let data = if let Some(q) = queue {
+                    builder.build_route_sub_queue(
+                        subject.as_bytes(),
+                        q.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        acct,
+                    )
+                } else {
+                    builder.build_route_sub(
+                        subject.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        acct,
+                    )
+                };
+                writer.write_raw(data);
+            }
+        }
     }
-    drop(subs);
+    #[cfg(not(feature = "accounts"))]
+    {
+        let subs = state.subs.read().unwrap();
+        for (subject, queue) in subs.local_interests() {
+            let data = if let Some(q) = queue {
+                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+            } else {
+                builder.build_route_sub(subject.as_bytes())
+            };
+            writer.write_raw(data);
+        }
+    }
     writer.notify();
 }
 
@@ -616,6 +843,7 @@ pub(crate) fn forward_to_optimistic_gateways(
     reply: Option<&[u8]>,
     headers: Option<&HeaderMap>,
     payload: &[u8],
+    #[cfg(feature = "accounts")] account: &[u8],
 ) {
     use crate::server::GatewayInterestMode;
 
@@ -644,8 +872,14 @@ pub(crate) fn forward_to_optimistic_gateways(
 
         // Rewrite reply with _GR_ prefix before forwarding across gateway.
         let gw_reply = rewrite_gateway_reply(reply, wctx.state);
-        gis.writer
-            .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
+        gis.writer.write_rmsg(
+            subject,
+            gw_reply.as_deref(),
+            headers,
+            payload,
+            #[cfg(feature = "accounts")]
+            account,
+        );
 
         // Batch-accumulate notification (same as deliver_to_subs) instead of
         // per-message notify() to avoid one eventfd write syscall per PUB.
