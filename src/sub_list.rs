@@ -505,6 +505,39 @@ impl SubList {
         subjects
     }
 
+    /// Returns true if any local (non-route, non-gateway) subscription matches the subject.
+    /// Cheap boolean check — no delivery, no queue routing.
+    #[cfg(feature = "gateway")]
+    pub fn has_local_interest(&self, subject: &str) -> bool {
+        // Check exact subs
+        if let Some(subs) = self.exact.get(subject) {
+            for sub in subs {
+                #[cfg(feature = "cluster")]
+                if sub.is_route {
+                    continue;
+                }
+                if sub.is_gateway {
+                    continue;
+                }
+                return true;
+            }
+        }
+        // Check wildcard subs
+        for sub in &self.wild {
+            #[cfg(feature = "cluster")]
+            if sub.is_route {
+                continue;
+            }
+            if sub.is_gateway {
+                continue;
+            }
+            if subject_matches(&sub.subject, subject) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Returns unique non-leaf, non-route, non-gateway (subject, queue) pairs for leaf interest
     /// propagation. Only includes subscriptions from client connections.
     #[cfg(feature = "hub")]
@@ -1234,6 +1267,45 @@ mod tests {
         // Verify leaf subs are still in the list for matching
         let matches = sl.match_subject("foo");
         assert_eq!(matches.len(), 2); // client + leaf
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_has_local_interest_exact() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo"));
+
+        assert!(sl.has_local_interest("foo"));
+        assert!(!sl.has_local_interest("bar"));
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_has_local_interest_wildcard() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
+        sl.insert(test_sub(1, 2, "bar.>"));
+
+        assert!(sl.has_local_interest("foo.baz"));
+        assert!(sl.has_local_interest("bar.a.b"));
+        assert!(!sl.has_local_interest("qux"));
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_has_local_interest_excludes_gateway_subs() {
+        let mut sl = SubList::new();
+
+        // Gateway sub only — should NOT count as local interest
+        let mut gw_sub = Subscription::new_dummy(10, 1, "foo".to_string(), None);
+        gw_sub.is_gateway = true;
+        sl.insert(gw_sub);
+
+        assert!(!sl.has_local_interest("foo"));
+
+        // Add a client sub — now should have local interest
+        sl.insert(test_sub(1, 1, "foo"));
+        assert!(sl.has_local_interest("foo"));
     }
 
     #[test]

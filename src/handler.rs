@@ -18,6 +18,9 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+#[cfg(feature = "gateway")]
+use std::cell::RefCell;
+
 use bytes::{Bytes, BytesMut};
 use metrics::gauge;
 use tracing::debug;
@@ -71,6 +74,8 @@ pub(crate) enum ConnExt {
     Gateway {
         gateway_sid_counter: u64,
         gateway_sids: HashMap<(Bytes, Option<Bytes>), u64>,
+        /// Secondary index: subject → list of (queue, sid) for O(1) unsub lookup.
+        gateway_sids_by_subject: HashMap<Bytes, Vec<(Option<Bytes>, u64)>>,
         /// Remote cluster's gateway name.
         peer_gateway_name: Option<String>,
     },
@@ -169,8 +174,10 @@ fn deliver_to_sub_inner(
 /// matching subscription's `DirectWriter`. Accumulates eventfd notifications
 /// for remote workers (deduplicating within the batch).
 ///
-/// Returns `(match_count, expired_subs)` where expired_subs contains
-/// `(conn_id, sid)` pairs for subscriptions that reached their delivery limit.
+/// Returns `(delivered_count, expired_subs)` where `delivered_count` is the
+/// number of subscriptions that actually received the message (excluding skipped
+/// subs), and expired_subs contains `(conn_id, sid)` pairs for subscriptions
+/// that reached their delivery limit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_to_subs(
     wctx: &mut WorkerCtx<'_>,
@@ -183,8 +190,9 @@ pub(crate) fn deliver_to_subs(
     skip_echo: bool,
     #[cfg(feature = "cluster")] skip_routes: bool,
     #[cfg(feature = "gateway")] skip_gateways: bool,
-) -> Vec<(u64, u64)> {
+) -> (usize, Vec<(u64, u64)>) {
     let payload_len = payload.len() as u64;
+    let mut delivered: usize = 0;
 
     let subs = wctx.state.subs.read().unwrap();
     let (_match_count, expired) = subs.for_each_match(subject_str, |sub| {
@@ -217,6 +225,7 @@ pub(crate) fn deliver_to_subs(
         {
             deliver_to_sub_inner(sub, subject, reply, headers, payload);
         }
+        delivered += 1;
         *wctx.msgs_delivered += 1;
         *wctx.msgs_delivered_bytes += payload_len;
         // Skip notification for our own worker — flush_pending
@@ -235,7 +244,7 @@ pub(crate) fn deliver_to_subs(
     });
     drop(subs);
 
-    expired
+    (delivered, expired)
 }
 
 /// Deliver a message to all matching subscriptions from the upstream reader thread.
@@ -252,7 +261,7 @@ pub(crate) fn deliver_to_subs_upstream(
     headers: Option<&HeaderMap>,
     payload: &[u8],
     dirty_writers: &mut Vec<DirectWriter>,
-) -> Vec<(u64, u64)> {
+) -> (usize, Vec<(u64, u64)>) {
     deliver_to_subs_upstream_inner(
         state,
         subject,
@@ -270,6 +279,8 @@ pub(crate) fn deliver_to_subs_upstream(
 
 /// Deliver to local subs from an upstream-like source (hub or route reader thread).
 /// When `skip_routes` is true (cluster feature), route subs are skipped (one-hop rule).
+///
+/// Returns `(delivered_count, expired_subs)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_to_subs_upstream_inner(
     state: &ServerState,
@@ -281,7 +292,8 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     dirty_writers: &mut Vec<DirectWriter>,
     #[cfg(feature = "cluster")] skip_routes: bool,
     #[cfg(feature = "gateway")] skip_gateways: bool,
-) -> Vec<(u64, u64)> {
+) -> (usize, Vec<(u64, u64)>) {
+    let mut delivered: usize = 0;
     let subs = state.subs.read().unwrap();
     let (_count, expired) = subs.for_each_match(subject_str, |sub| {
         #[cfg(feature = "cluster")]
@@ -291,6 +303,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
             }
             sub.writer.write_rmsg(subject, reply, headers, payload);
             dirty_writers.push(sub.writer.clone());
+            delivered += 1;
             return;
         }
         #[cfg(feature = "gateway")]
@@ -302,6 +315,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
             sub.writer
                 .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
             dirty_writers.push(sub.writer.clone());
+            delivered += 1;
             return;
         }
         #[cfg(feature = "hub")]
@@ -315,10 +329,11 @@ pub(crate) fn deliver_to_subs_upstream_inner(
         sub.writer
             .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         dirty_writers.push(sub.writer.clone());
+        delivered += 1;
     });
     drop(subs);
 
-    expired
+    (delivered, expired)
 }
 
 /// Handle expired subscriptions after delivery.
@@ -495,42 +510,85 @@ pub(crate) fn send_existing_subs_to_route(state: &ServerState, writer: &DirectWr
     writer.notify();
 }
 
+#[cfg(feature = "gateway")]
+thread_local! {
+    static GW_BUILDER: RefCell<nats_proto::MsgBuilder> = RefCell::new(nats_proto::MsgBuilder::new());
+}
+
 /// Propagate RS+ to all gateway connections (interest advertisement).
+///
+/// In optimistic mode, RS+ is skipped for outbound gateways (the remote already
+/// receives everything). Only inbound gateways (tracked in `gateway_writers`)
+/// and outbound gateways in InterestOnly mode receive RS+.
 #[cfg(feature = "gateway")]
 pub(crate) fn propagate_gateway_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    use crate::server::GatewayInterestMode;
+
     let writers = state.gateway_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
-    let mut builder = nats_proto::MsgBuilder::new();
-    let data = if let Some(q) = queue {
-        builder.build_route_sub_queue(subject, q)
-    } else {
-        builder.build_route_sub(subject)
-    };
-    for writer in writers.values() {
-        writer.write_raw(data);
-        writer.notify();
-    }
+
+    // Determine which outbound gateways are in InterestOnly mode.
+    let gi = state.gateway_interest.read().unwrap();
+
+    GW_BUILDER.with(|cell| {
+        let mut builder = cell.borrow_mut();
+        let data = if let Some(q) = queue {
+            builder.build_route_sub_queue(subject, q)
+        } else {
+            builder.build_route_sub(subject)
+        };
+        for (conn_id, writer) in writers.iter() {
+            // Skip outbound gateways in Optimistic mode (they forward everything already).
+            if let Some(gis) = gi.get(conn_id) {
+                if gis.mode == GatewayInterestMode::Optimistic
+                    || gis.mode == GatewayInterestMode::Transitioning
+                {
+                    continue;
+                }
+            }
+            writer.write_raw(data);
+            writer.notify();
+        }
+    });
 }
 
 /// Propagate RS- to all gateway connections (interest removal).
+///
+/// Only sent to outbound gateways in InterestOnly mode. Optimistic gateways
+/// don't need RS- (they use negative interest in the opposite direction).
 #[cfg(feature = "gateway")]
 pub(crate) fn propagate_gateway_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    use crate::server::GatewayInterestMode;
+
     let writers = state.gateway_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
-    let mut builder = nats_proto::MsgBuilder::new();
-    let data = if let Some(q) = queue {
-        builder.build_route_unsub_queue(subject, q)
-    } else {
-        builder.build_route_unsub(subject)
-    };
-    for writer in writers.values() {
-        writer.write_raw(data);
-        writer.notify();
-    }
+
+    let gi = state.gateway_interest.read().unwrap();
+
+    GW_BUILDER.with(|cell| {
+        let mut builder = cell.borrow_mut();
+        let data = if let Some(q) = queue {
+            builder.build_route_unsub_queue(subject, q)
+        } else {
+            builder.build_route_unsub(subject)
+        };
+        for (conn_id, writer) in writers.iter() {
+            // Skip outbound gateways in Optimistic mode.
+            if let Some(gis) = gi.get(conn_id) {
+                if gis.mode == GatewayInterestMode::Optimistic
+                    || gis.mode == GatewayInterestMode::Transitioning
+                {
+                    continue;
+                }
+            }
+            writer.write_raw(data);
+            writer.notify();
+        }
+    });
 }
 
 /// Send RS+ for all existing local subscriptions to a given gateway's DirectWriter.
@@ -550,6 +608,65 @@ pub(crate) fn send_existing_subs_to_gateway(state: &ServerState, writer: &Direct
     writer.notify();
 }
 
+/// Forward a message to outbound gateways in optimistic mode.
+///
+/// Called after `deliver_to_subs` when gateway subs may not exist in SubList
+/// (because the remote hasn't sent RS+ yet). In optimistic mode, we forward
+/// unless the subject is in the gateway's negative interest set.
+#[cfg(feature = "gateway")]
+pub(crate) fn forward_to_optimistic_gateways(
+    wctx: &mut WorkerCtx<'_>,
+    subject: &[u8],
+    subject_str: &str,
+    reply: Option<&[u8]>,
+    headers: Option<&HeaderMap>,
+    payload: &[u8],
+) {
+    use crate::server::GatewayInterestMode;
+
+    let gi = wctx.state.gateway_interest.read().unwrap();
+    if gi.is_empty() {
+        return;
+    }
+
+    let payload_len = payload.len() as u64;
+
+    for gis in gi.values() {
+        if gis.mode != GatewayInterestMode::Optimistic {
+            continue;
+        }
+        // Skip if subject is in the negative interest set.
+        if gis.ni.contains(subject_str) {
+            continue;
+        }
+        // Check if a gateway sub already matched (delivered via SubList).
+        // If the SubList already has a gateway sub for this subject, deliver_to_subs
+        // already wrote to the writer, so skip to avoid duplicate delivery.
+        // We check has_local_interest inverted — if a gateway sub exists in SubList
+        // for this conn_id, the message was already delivered.
+        // Actually, in optimistic mode we don't insert gateway subs into SubList,
+        // so there's no duplication risk. Forward unconditionally (unless ni'd).
+
+        // Rewrite reply with _GR_ prefix before forwarding across gateway.
+        let gw_reply = rewrite_gateway_reply(reply, wctx.state);
+        gis.writer
+            .write_rmsg(subject, gw_reply.as_deref(), headers, payload);
+
+        // Batch-accumulate notification (same as deliver_to_subs) instead of
+        // per-message notify() to avoid one eventfd write syscall per PUB.
+        let fd = gis.writer.event_raw_fd();
+        if !wctx.pending_notify[..*wctx.pending_notify_count].contains(&fd)
+            && *wctx.pending_notify_count < wctx.pending_notify.len()
+        {
+            wctx.pending_notify[*wctx.pending_notify_count] = fd;
+            *wctx.pending_notify_count += 1;
+        }
+
+        *wctx.msgs_delivered += 1;
+        *wctx.msgs_delivered_bytes += payload_len;
+    }
+}
+
 /// Rewrite outbound reply: `reply` → `_GR_.<cluster_hash>.<server_hash>.reply`.
 /// Returns `None` if the input reply is `None`.
 #[cfg(feature = "gateway")]
@@ -559,37 +676,32 @@ fn rewrite_gateway_reply(reply: Option<&[u8]>, state: &ServerState) -> Option<by
     if reply.starts_with(b"_GR_.") {
         return Some(bytes::Bytes::copy_from_slice(reply));
     }
-    let mut buf = Vec::with_capacity(5 + 6 + 1 + 6 + 1 + reply.len());
-    buf.extend_from_slice(b"_GR_.");
-    buf.extend_from_slice(state.gateway_cluster_hash.as_bytes());
-    buf.push(b'.');
-    buf.extend_from_slice(state.gateway_server_hash.as_bytes());
-    buf.push(b'.');
+    let prefix = &state.gateway_reply_prefix;
+    let mut buf = Vec::with_capacity(prefix.len() + reply.len());
+    buf.extend_from_slice(prefix);
     buf.extend_from_slice(reply);
     Some(bytes::Bytes::from(buf))
 }
 
-/// Unwrap inbound reply: `_GR_.<cluster_hash>.<server_hash>.reply` → `reply`.
-/// If the reply does not have the `_GR_.` prefix, returns it unchanged.
+/// Unwrap inbound reply as a zero-copy `Bytes` sub-slice.
+/// Returns a `Bytes::slice()` into the original buffer — no heap allocation.
 #[cfg(feature = "gateway")]
-pub(crate) fn unwrap_gateway_reply(reply: &[u8]) -> &[u8] {
+pub(crate) fn unwrap_gateway_reply_bytes(reply: &Bytes) -> Bytes {
     if !reply.starts_with(b"_GR_.") {
-        return reply;
+        return reply.clone();
     }
-    // Skip _GR_. (5 bytes), then skip cluster_hash.server_hash. (6+1+6+1 = 14 bytes)
     let after_prefix = &reply[5..];
-    // Find first dot (end of cluster_hash)
     let dot1 = match memchr::memchr(b'.', after_prefix) {
         Some(i) => i,
-        None => return reply,
+        None => return reply.clone(),
     };
-    // Find second dot (end of server_hash)
     let rest = &after_prefix[dot1 + 1..];
     let dot2 = match memchr::memchr(b'.', rest) {
         Some(i) => i,
-        None => return reply,
+        None => return reply.clone(),
     };
-    &rest[dot2 + 1..]
+    let start = 5 + dot1 + 1 + dot2 + 1;
+    reply.slice(start..)
 }
 
 /// Convert `Bytes` to `&str` without UTF-8 validation.

@@ -230,7 +230,7 @@ impl LeafHandler {
 
         let subject_str = bytes_to_str(&subject);
         // Echo suppression: always skip delivery back to the originating leaf.
-        let expired = deliver_to_subs(
+        let (_delivered, expired) = deliver_to_subs(
             wctx,
             &subject,
             subject_str,
@@ -243,6 +243,17 @@ impl LeafHandler {
             false, // don't skip routes — leaf msgs forward to route peers
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — leaf msgs forward to gateway peers
+        );
+
+        // Forward to optimistic gateways when no gateway sub matched.
+        #[cfg(feature = "gateway")]
+        crate::handler::forward_to_optimistic_gateways(
+            wctx,
+            &subject,
+            subject_str,
+            reply.as_deref(),
+            headers.as_ref(),
+            &payload,
         );
 
         #[cfg(feature = "leaf")]

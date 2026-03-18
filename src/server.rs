@@ -641,6 +641,40 @@ pub(crate) struct GatewayPeerRegistry {
     pub known_urls: HashSet<String>,
 }
 
+/// Interest mode for an outbound gateway connection.
+///
+/// Gateways start in **Optimistic** mode (forward everything unless the remote
+/// has signaled negative interest via RS-). After accumulating enough RS- signals,
+/// the gateway transitions through **Transitioning** (send all current local RS+)
+/// to **InterestOnly** (only forward when a matching RS+ sub exists in SubList).
+#[cfg(feature = "gateway")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayInterestMode {
+    /// Forward messages to this gateway unless the subject is in the negative interest set.
+    Optimistic,
+    /// Sending all current local RS+ subs before switching to InterestOnly.
+    Transitioning,
+    /// Only forward messages when a matching gateway RS+ subscription exists in SubList.
+    InterestOnly,
+}
+
+/// Per-outbound-gateway interest tracking state.
+#[cfg(feature = "gateway")]
+pub(crate) struct GatewayInterestState {
+    /// Current interest mode for this outbound gateway.
+    pub mode: GatewayInterestMode,
+    /// Subjects the remote has signaled "no interest" for (Optimistic mode only).
+    pub ni: HashSet<String>,
+    /// Total RS- signals received from this gateway peer.
+    pub ni_count: u64,
+    /// DirectWriter for this outbound gateway (for optimistic forwarding).
+    pub writer: DirectWriter,
+}
+
+/// Number of RS- signals before switching from Optimistic to InterestOnly mode.
+#[cfg(feature = "gateway")]
+pub(crate) const GATEWAY_MAX_NI_BEFORE_SWITCH: u64 = 1000;
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
@@ -720,12 +754,23 @@ pub(crate) struct ServerState {
     /// Channel sender for the gateway coordinator thread.
     #[cfg(feature = "gateway")]
     pub gateway_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-    /// Pre-computed 6-char cluster hash for reply rewriting.
+    /// Pre-computed `_GR_.<cluster_hash>.<server_hash>.` prefix for reply rewriting.
     #[cfg(feature = "gateway")]
-    pub gateway_cluster_hash: String,
-    /// Pre-computed 6-char server hash for reply rewriting.
+    pub gateway_reply_prefix: Vec<u8>,
+    /// Cached INFO JSON line for gateway handshake and gossip.
+    /// Rebuilt when gateway URLs change.
     #[cfg(feature = "gateway")]
-    pub gateway_server_hash: String,
+    pub cached_gateway_info: Mutex<String>,
+    /// Per-outbound-gateway interest mode state (optimistic → interest-only transition).
+    /// Keyed by outbound gateway conn_id. Used for optimistic forwarding and
+    /// negative interest tracking.
+    #[cfg(feature = "gateway")]
+    pub gateway_interest: std::sync::RwLock<HashMap<u64, GatewayInterestState>>,
+    /// Fast flag: true when any outbound gateway is in Optimistic mode.
+    /// Prevents the can_skip PUB optimization from discarding messages
+    /// that need to be forwarded across optimistic gateways.
+    #[cfg(feature = "gateway")]
+    pub has_gateway_interest: AtomicBool,
 }
 
 impl ServerState {
@@ -764,6 +809,18 @@ impl ServerState {
         };
         #[cfg(feature = "gateway")]
         let gateway_server_hash = fnv_hash_base36(&info.server_id);
+        #[cfg(feature = "gateway")]
+        let gateway_reply_prefix = {
+            let mut prefix = Vec::with_capacity(
+                5 + gateway_cluster_hash.len() + 1 + gateway_server_hash.len() + 1,
+            );
+            prefix.extend_from_slice(b"_GR_.");
+            prefix.extend_from_slice(gateway_cluster_hash.as_bytes());
+            prefix.push(b'.');
+            prefix.extend_from_slice(gateway_server_hash.as_bytes());
+            prefix.push(b'.');
+            prefix
+        };
 
         Self {
             info,
@@ -833,9 +890,13 @@ impl ServerState {
             #[cfg(feature = "gateway")]
             gateway_connect_tx: Mutex::new(None),
             #[cfg(feature = "gateway")]
-            gateway_cluster_hash,
+            gateway_reply_prefix,
             #[cfg(feature = "gateway")]
-            gateway_server_hash,
+            cached_gateway_info: Mutex::new(String::new()),
+            #[cfg(feature = "gateway")]
+            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "gateway")]
+            has_gateway_interest: AtomicBool::new(false),
         }
     }
 
@@ -1030,6 +1091,9 @@ impl LeafServer {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         let cid = self.state.next_client_id();
         let idx = *next_worker % workers.len();
         *next_worker = idx + 1;
@@ -1045,6 +1109,9 @@ impl LeafServer {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         let cid = self.state.next_client_id();
         let idx = *next_worker % workers.len();
         *next_worker = idx + 1;
@@ -1059,6 +1126,9 @@ impl LeafServer {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         let cid = self.state.next_client_id();
         let idx = *next_worker % workers.len();
         *next_worker = idx + 1;

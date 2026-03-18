@@ -21,7 +21,8 @@ use tracing::debug;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, unwrap_gateway_reply, ConnCtx, ConnExt, HandleResult, WorkerCtx,
+    bytes_to_str, deliver_to_subs, unwrap_gateway_reply_bytes, ConnCtx, ConnExt, HandleResult,
+    WorkerCtx,
 };
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
@@ -67,12 +68,19 @@ impl GatewayHandler {
                     if !urls.is_empty() {
                         let tx = wctx.state.gateway_connect_tx.lock().unwrap();
                         let mut peers = wctx.state.gateway_peers.lock().unwrap();
+                        let mut changed = false;
                         for url in urls {
                             if peers.known_urls.insert(url.clone()) {
+                                changed = true;
                                 if let Some(ref sender) = *tx {
                                     let _ = sender.send(url.clone());
                                 }
                             }
+                        }
+                        drop(peers);
+                        drop(tx);
+                        if changed {
+                            crate::gateway_conn::rebuild_gateway_info(wctx.state);
                         }
                     }
                 }
@@ -100,11 +108,16 @@ impl GatewayHandler {
             ConnExt::Gateway {
                 ref mut gateway_sid_counter,
                 ref mut gateway_sids,
+                ref mut gateway_sids_by_subject,
                 ..
             } => {
                 *gateway_sid_counter += 1;
                 let sid = *gateway_sid_counter;
                 gateway_sids.insert((subject.clone(), queue.clone()), sid);
+                gateway_sids_by_subject
+                    .entry(subject.clone())
+                    .or_default()
+                    .push((queue.clone(), sid));
                 sid
             }
             _ => unreachable!("gateway op on non-gateway connection"),
@@ -148,22 +161,26 @@ impl GatewayHandler {
         wctx: &mut WorkerCtx<'_>,
         subject: Bytes,
     ) -> HandleResult {
-        // RS- doesn't include queue in the wire format, so look up by subject only.
+        // RS- doesn't include queue in the wire format, so look up by subject via index.
         let sid = match conn.ext {
             ConnExt::Gateway {
                 ref mut gateway_sids,
+                ref mut gateway_sids_by_subject,
                 ..
             } => {
-                // First try exact match with no queue
-                if let Some(s) = gateway_sids.remove(&(subject.clone(), None)) {
-                    s
-                } else {
-                    // Try to find any entry with this subject
-                    let key = gateway_sids.keys().find(|(s, _)| *s == subject).cloned();
-                    match key {
-                        Some(k) => gateway_sids.remove(&k).unwrap(),
-                        None => return HandleResult::Ok,
+                if let Some(entries) = gateway_sids_by_subject.get_mut(&subject) {
+                    if let Some((queue, sid)) = entries.pop() {
+                        gateway_sids.remove(&(subject.clone(), queue));
+                        if entries.is_empty() {
+                            gateway_sids_by_subject.remove(&subject);
+                        }
+                        sid
+                    } else {
+                        gateway_sids_by_subject.remove(&subject);
+                        return HandleResult::Ok;
                     }
+                } else {
+                    return HandleResult::Ok;
                 }
             }
             _ => unreachable!("gateway op on non-gateway connection"),
@@ -211,19 +228,13 @@ impl GatewayHandler {
         let subject_str = bytes_to_str(&subject);
 
         // Unwrap _GR_ reply prefix if present (cross-cluster reply rewriting).
-        let unwrapped_reply = reply.as_ref().map(|r| {
-            let unwrapped = unwrap_gateway_reply(r);
-            if unwrapped.len() != r.len() {
-                Bytes::copy_from_slice(unwrapped)
-            } else {
-                r.clone()
-            }
-        });
+        // Uses Bytes::slice() for zero-copy sub-slicing.
+        let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
         let reply_ref = unwrapped_reply.as_deref();
 
         // One-hop: skip_routes = true and skip_gateways = true — messages from a gateway
         // are never re-forwarded to other routes or gateways.
-        let expired = deliver_to_subs(
+        let (delivered, expired) = deliver_to_subs(
             wctx,
             &subject,
             subject_str,
@@ -237,6 +248,13 @@ impl GatewayHandler {
             true, // skip_gateways — one-hop enforcement
         );
 
+        // Send RS- back when no local subs matched (negative interest signal).
+        if delivered == 0 {
+            let mut builder = nats_proto::MsgBuilder::new();
+            let rs_minus = builder.build_route_unsub(&subject);
+            conn.write_buf.extend_from_slice(rs_minus);
+        }
+
         // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]
         forward_to_upstream(
@@ -248,6 +266,11 @@ impl GatewayHandler {
             payload,
         );
 
-        (HandleResult::Ok, expired)
+        let result = if delivered == 0 {
+            HandleResult::Flush
+        } else {
+            HandleResult::Ok
+        };
+        (result, expired)
     }
 }

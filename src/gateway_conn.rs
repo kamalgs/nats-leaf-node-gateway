@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +25,14 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstream};
+use crate::handler::{
+    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, unwrap_gateway_reply_bytes,
+};
 use crate::nats_proto::{self, GatewayOp, MsgBuilder};
-use crate::server::{GatewayRemote, ServerState};
+use crate::server::{
+    GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
+    GATEWAY_MAX_NI_BEFORE_SWITCH,
+};
 use crate::sub_list::{DirectWriter, Subscription};
 use crate::upstream::Backoff;
 
@@ -201,12 +207,19 @@ fn connect_gateway(
         if !urls.is_empty() {
             let tx = state.gateway_connect_tx.lock().unwrap();
             let mut peers = state.gateway_peers.lock().unwrap();
+            let mut changed = false;
             for url in urls {
                 if peers.known_urls.insert(url.clone()) {
+                    changed = true;
                     if let Some(ref sender) = *tx {
                         let _ = sender.send(url.clone());
                     }
                 }
+            }
+            drop(peers);
+            drop(tx);
+            if changed {
+                rebuild_gateway_info(state);
             }
         }
     }
@@ -216,7 +229,7 @@ fn connect_gateway(
     // --- Send our INFO + CONNECT + PING ---
     {
         let mut w = io::BufWriter::new(&tcp_writer);
-        w.write_all(build_gateway_info(state).as_bytes())?;
+        w.write_all(get_gateway_info(state).as_bytes())?;
         w.write_all(build_gateway_connect(state, expected_name).as_bytes())?;
         w.write_all(b"PING\r\n")?;
         w.flush()?;
@@ -262,21 +275,22 @@ fn connect_gateway(
         writers.insert(conn_id, direct_writer.clone());
     }
 
-    // --- Send RS+ for existing local subs (interest-only mode) ---
+    // --- Register optimistic interest state (no RS+ sent upfront) ---
+    // In optimistic mode, messages are forwarded to the remote unless the remote
+    // has signaled negative interest (RS-). RS+ subs are only sent during the
+    // transition to interest-only mode.
     {
-        let mut w = io::BufWriter::new(&tcp_writer);
-        let subs = state.subs.read().unwrap();
-        let mut builder = MsgBuilder::new();
-        for (subject, queue) in subs.local_interests() {
-            let data = if let Some(q) = queue {
-                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
-            } else {
-                builder.build_route_sub(subject.as_bytes())
-            };
-            w.write_all(data)?;
-        }
-        drop(subs);
-        w.flush()?;
+        let mut gi = state.gateway_interest.write().unwrap();
+        gi.insert(
+            conn_id,
+            GatewayInterestState {
+                mode: GatewayInterestMode::Optimistic,
+                ni: std::collections::HashSet::new(),
+                ni_count: 0,
+                writer: direct_writer.clone(),
+            },
+        );
+        state.has_gateway_interest.store(true, Ordering::Release);
     }
 
     // --- Spawn writer thread ---
@@ -307,6 +321,15 @@ fn connect_gateway(
     {
         let mut writers = state.gateway_writers.write().unwrap();
         writers.remove(&conn_id);
+    }
+
+    // Remove from gateway_interest
+    {
+        let mut gi = state.gateway_interest.write().unwrap();
+        gi.remove(&conn_id);
+        if gi.is_empty() {
+            state.has_gateway_interest.store(false, Ordering::Release);
+        }
     }
 
     // Remove from GatewayPeerRegistry
@@ -389,7 +412,8 @@ fn run_gateway_reader(
     state: &ServerState,
     direct_writer: &DirectWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+    let mut pending_notify: [RawFd; 16] = [0; 16];
+    let mut pending_notify_count: usize = 0;
     let mut gateway_sid_counter: u64 = 0;
     let mut gateway_sids: HashMap<(bytes::Bytes, Option<bytes::Bytes>), u64> = HashMap::new();
     let mut tmp = [0u8; 65536];
@@ -403,16 +427,21 @@ fn run_gateway_reader(
                 state,
                 direct_writer,
                 tcp,
-                &mut dirty_writers,
+                &mut pending_notify,
+                &mut pending_notify_count,
                 &mut gateway_sid_counter,
                 &mut gateway_sids,
             )?;
         }
 
-        // Notify all dirty writers from this batch
-        for w in dirty_writers.drain(..) {
-            w.notify();
+        // Notify all accumulated eventfds from this batch
+        for fd in pending_notify.iter().take(pending_notify_count).copied() {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
+            }
         }
+        pending_notify_count = 0;
 
         // Read more data from TCP
         let n = (&*tcp).read(&mut tmp)?;
@@ -431,14 +460,29 @@ fn handle_gateway_op(
     state: &ServerState,
     direct_writer: &DirectWriter,
     tcp: &TcpStream,
-    dirty_writers: &mut Vec<DirectWriter>,
+    pending_notify: &mut [RawFd; 16],
+    pending_notify_count: &mut usize,
     gateway_sid_counter: &mut u64,
     gateway_sids: &mut HashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>,
 ) -> io::Result<()> {
-    use crate::handler::unwrap_gateway_reply;
-
     match op {
         GatewayOp::RouteSub { subject, queue, .. } => {
+            // Check if we're in optimistic mode — RS+ clears negative interest.
+            {
+                let mut gi = state.gateway_interest.write().unwrap();
+                if let Some(gis) = gi.get_mut(&conn_id) {
+                    if gis.mode == GatewayInterestMode::Optimistic {
+                        let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+                        gis.ni.remove(subject_str);
+                        // In optimistic mode, we don't need to track gateway subs in SubList.
+                        // The remote is telling us it now wants this subject (positive override).
+                        debug!(conn_id, subject = %subject_str, "optimistic: cleared negative interest");
+                        return Ok(());
+                    }
+                }
+            }
+
+            // InterestOnly mode: insert gateway subscription into SubList.
             *gateway_sid_counter += 1;
             let sid = *gateway_sid_counter;
             gateway_sids.insert((subject.clone(), queue.clone()), sid);
@@ -470,7 +514,38 @@ fn handle_gateway_op(
             debug!(conn_id, sid, subject = %subject_str, "outbound gateway sub");
         }
         GatewayOp::RouteUnsub { subject } => {
-            // RS- doesn't carry queue; remove matching (subject, None) entry
+            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+
+            // Check interest mode — RS- means different things per mode.
+            let transition = {
+                let mut gi = state.gateway_interest.write().unwrap();
+                if let Some(gis) = gi.get_mut(&conn_id) {
+                    if gis.mode == GatewayInterestMode::Optimistic {
+                        // Optimistic mode: RS- = negative interest signal.
+                        gis.ni.insert(subject_str.to_string());
+                        gis.ni_count += 1;
+                        debug!(
+                            conn_id,
+                            subject = %subject_str,
+                            ni_count = gis.ni_count,
+                            "optimistic: negative interest"
+                        );
+                        gis.ni_count >= GATEWAY_MAX_NI_BEFORE_SWITCH
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if transition {
+                // Transition: Optimistic → Transitioning → InterestOnly
+                transition_to_interest_only(conn_id, state, tcp, direct_writer)?;
+                return Ok(());
+            }
+
+            // InterestOnly mode: RS- = remove gateway subscription from SubList.
             let key = (subject.clone(), None);
             if let Some(sid) = gateway_sids.remove(&key) {
                 let mut subs = state.subs.write().unwrap();
@@ -488,30 +563,44 @@ fn handle_gateway_op(
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
 
             // Unwrap _GR_ reply prefix if present.
-            let unwrapped_reply = reply.as_ref().map(|r| {
-                let unwrapped = unwrap_gateway_reply(r);
-                if unwrapped.len() != r.len() {
-                    bytes::Bytes::copy_from_slice(unwrapped)
-                } else {
-                    r.clone()
-                }
-            });
+            // Uses Bytes::slice() for zero-copy sub-slicing.
+            let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
 
             // One-hop: skip route subs and gateway subs — messages from a gateway peer
             // are never re-forwarded.
-            let expired = deliver_to_subs_upstream_inner(
+            let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+            let (delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &subject,
                 subject_str,
                 unwrapped_reply.as_deref(),
                 headers.as_ref(),
                 &payload,
-                dirty_writers,
+                &mut dirty_writers,
                 #[cfg(feature = "cluster")]
                 true, // skip_routes
                 true, // skip_gateways
             );
             handle_expired_subs_upstream(&expired, state);
+
+            // Send RS- back when no local subs matched (negative interest signal).
+            if delivered == 0 {
+                let mut builder = MsgBuilder::new();
+                let rs_minus = builder.build_route_unsub(&subject);
+                let mut w = io::BufWriter::new(tcp);
+                let _ = w.write_all(rs_minus);
+                let _ = w.flush();
+            }
+            // Accumulate eventfds for batch notification (deduplicated).
+            for w in &dirty_writers {
+                let fd = w.event_raw_fd();
+                if !pending_notify[..*pending_notify_count].contains(&fd)
+                    && *pending_notify_count < pending_notify.len()
+                {
+                    pending_notify[*pending_notify_count] = fd;
+                    *pending_notify_count += 1;
+                }
+            }
         }
         GatewayOp::Ping => {
             let mut w = io::BufWriter::new(tcp);
@@ -526,12 +615,19 @@ fn handle_gateway_op(
                 if !urls.is_empty() {
                     let tx = state.gateway_connect_tx.lock().unwrap();
                     let mut peers = state.gateway_peers.lock().unwrap();
+                    let mut changed = false;
                     for url in urls {
                         if peers.known_urls.insert(url.clone()) {
+                            changed = true;
                             if let Some(ref sender) = *tx {
                                 let _ = sender.send(url.clone());
                             }
                         }
+                    }
+                    drop(peers);
+                    drop(tx);
+                    if changed {
+                        rebuild_gateway_info(state);
                     }
                 }
             }
@@ -545,8 +641,8 @@ fn handle_gateway_op(
     Ok(())
 }
 
-/// Build INFO JSON for gateway protocol.
-pub(crate) fn build_gateway_info(state: &ServerState) -> String {
+/// Build INFO JSON for gateway protocol (uncached, used for rebuild).
+fn build_gateway_info_inner(state: &ServerState) -> String {
     let gateway_name = state.gateway_name.as_deref().unwrap_or("default");
     let gateway_port = state.gateway_port.unwrap_or(0);
 
@@ -578,9 +674,25 @@ pub(crate) fn build_gateway_info(state: &ServerState) -> String {
     )
 }
 
+/// Get cached gateway INFO string, rebuilding if empty.
+pub(crate) fn get_gateway_info(state: &ServerState) -> String {
+    let mut cached = state.cached_gateway_info.lock().unwrap();
+    if cached.is_empty() {
+        *cached = build_gateway_info_inner(state);
+    }
+    cached.clone()
+}
+
+/// Rebuild the cached gateway INFO string (call when gateway URLs change).
+pub(crate) fn rebuild_gateway_info(state: &ServerState) {
+    let mut cached = state.cached_gateway_info.lock().unwrap();
+    *cached = build_gateway_info_inner(state);
+}
+
 /// Broadcast updated INFO to all connected gateway peers (gossip re-broadcast).
 pub(crate) fn broadcast_gateway_info(state: &ServerState) {
-    let info_line = build_gateway_info(state);
+    rebuild_gateway_info(state);
+    let info_line = get_gateway_info(state);
     let info_bytes = info_line.as_bytes();
     let writers = state.gateway_writers.read().unwrap();
     for writer in writers.values() {
@@ -597,6 +709,58 @@ fn build_gateway_connect(state: &ServerState, remote_name: &str) -> String {
          \"gateway\":\"{}\",\"remote_gateway\":\"{}\"}}\r\n",
         state.info.server_id, state.info.server_name, gateway_name, remote_name,
     )
+}
+
+/// Transition an outbound gateway from Optimistic to InterestOnly mode.
+///
+/// 1. Set mode to Transitioning
+/// 2. Send RS+ for all current local subs
+/// 3. Set mode to InterestOnly, clear negative interest set
+fn transition_to_interest_only(
+    conn_id: u64,
+    state: &ServerState,
+    tcp: &TcpStream,
+    _direct_writer: &DirectWriter,
+) -> io::Result<()> {
+    info!(conn_id, "gateway transitioning to interest-only mode");
+
+    // Step 1: Set mode to Transitioning
+    {
+        let mut gi = state.gateway_interest.write().unwrap();
+        if let Some(gis) = gi.get_mut(&conn_id) {
+            gis.mode = GatewayInterestMode::Transitioning;
+        }
+    }
+
+    // Step 2: Send RS+ for all existing local subscriptions
+    {
+        let mut w = io::BufWriter::new(tcp);
+        let subs = state.subs.read().unwrap();
+        let mut builder = MsgBuilder::new();
+        for (subject, queue) in subs.local_interests() {
+            let data = if let Some(q) = queue {
+                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+            } else {
+                builder.build_route_sub(subject.as_bytes())
+            };
+            w.write_all(data)?;
+        }
+        drop(subs);
+        w.flush()?;
+    }
+
+    // Step 3: Set mode to InterestOnly, clear ni set
+    {
+        let mut gi = state.gateway_interest.write().unwrap();
+        if let Some(gis) = gi.get_mut(&conn_id) {
+            gis.mode = GatewayInterestMode::InterestOnly;
+            gis.ni.clear();
+            gis.ni_count = 0;
+        }
+    }
+
+    info!(conn_id, "gateway now in interest-only mode");
+    Ok(())
 }
 
 /// Read from TCP into the buffer, blocking until data is available.
@@ -654,5 +818,73 @@ mod tests {
     fn gateway_conn_id_is_high() {
         let id = next_gateway_conn_id();
         assert!(id >= GATEWAY_CONN_ID_BASE);
+    }
+
+    #[test]
+    fn gateway_interest_state_defaults() {
+        let writer = DirectWriter::new_dummy();
+        let gis = GatewayInterestState {
+            mode: GatewayInterestMode::Optimistic,
+            ni: std::collections::HashSet::new(),
+            ni_count: 0,
+            writer,
+        };
+        assert_eq!(gis.mode, GatewayInterestMode::Optimistic);
+        assert!(gis.ni.is_empty());
+        assert_eq!(gis.ni_count, 0);
+    }
+
+    #[test]
+    fn gateway_interest_negative_interest_tracking() {
+        let writer = DirectWriter::new_dummy();
+        let mut gis = GatewayInterestState {
+            mode: GatewayInterestMode::Optimistic,
+            ni: std::collections::HashSet::new(),
+            ni_count: 0,
+            writer,
+        };
+
+        // Add negative interest
+        gis.ni.insert("foo.bar".to_string());
+        gis.ni_count += 1;
+        assert!(gis.ni.contains("foo.bar"));
+        assert_eq!(gis.ni_count, 1);
+
+        // RS+ clears negative interest
+        gis.ni.remove("foo.bar");
+        assert!(!gis.ni.contains("foo.bar"));
+
+        // ni_count still tracks total (not decremented on RS+)
+        assert_eq!(gis.ni_count, 1);
+    }
+
+    #[test]
+    fn gateway_interest_threshold() {
+        assert_eq!(GATEWAY_MAX_NI_BEFORE_SWITCH, 1000);
+    }
+
+    #[test]
+    fn gateway_interest_mode_transitions() {
+        let writer = DirectWriter::new_dummy();
+        let mut gis = GatewayInterestState {
+            mode: GatewayInterestMode::Optimistic,
+            ni: std::collections::HashSet::new(),
+            ni_count: 0,
+            writer,
+        };
+
+        // Start optimistic
+        assert_eq!(gis.mode, GatewayInterestMode::Optimistic);
+
+        // Transition to Transitioning
+        gis.mode = GatewayInterestMode::Transitioning;
+        assert_eq!(gis.mode, GatewayInterestMode::Transitioning);
+
+        // Transition to InterestOnly, clear ni
+        gis.mode = GatewayInterestMode::InterestOnly;
+        gis.ni.clear();
+        gis.ni_count = 0;
+        assert_eq!(gis.mode, GatewayInterestMode::InterestOnly);
+        assert!(gis.ni.is_empty());
     }
 }
