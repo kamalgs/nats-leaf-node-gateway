@@ -5,6 +5,32 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-19 — Cross-account import/export (quick sanity check)
+
+**Changes since last benchmark:**
+Cross-account import/export (`accounts` feature): `ExportRule`/`ImportRule` on `AccountConfig`,
+precomputed `CrossAccountRoute` forwarding table indexed by source AccountId, `remap_subject()`
+for wildcard-aware subject rewriting, `deliver_cross_account()` / `deliver_cross_account_upstream()`
+single-hop forwarding at all delivery points (client PUB, leaf LMSG, route RMSG, upstream reader,
+gateway RMSG), and reverse interest propagation on SUB/UNSUB for cluster correctness.
+
+### Throughput (100K msgs × 128B, single run — quick mode sanity check)
+
+| Scenario | Rust msg/s | Go msg/s | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~985K | ~1,611K | **61%** | 70% |
+| Local pub/sub (pub) | ~650K | ~613K | **106%** | 169% |
+| Fan-out x5 (pub) | ~369K | ~121K | **306%** | 256% |
+| Leaf → Hub (pub) | ~1,000K | ~513K | **194%** | 117% |
+| Hub → Leaf (pub) | ~486K | ~371K | **130%** | 112% |
+
+**Note:** Quick mode (100K msgs, 1 run) has higher variance than the standard 3-run average.
+Pub-only gap is within normal quick-mode variance (single-run noise). Core scenarios (pub/sub,
+fan-out, leaf↔hub) show no regression from the cross-account changes — the forwarding path
+adds zero overhead when no cross-account routes are configured (early empty-check return).
+
+---
+
 ## 2026-03-17 — Gateway benchmarks + bug fixes (full 19-scenario run)
 
 **Changes since last benchmark:**

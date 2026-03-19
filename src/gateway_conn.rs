@@ -18,6 +18,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{
     deliver_to_subs_upstream_inner, handle_expired_subs_upstream, unwrap_gateway_reply_bytes,
 };
@@ -305,9 +307,26 @@ fn connect_gateway(
 
     // Remove all gateway subs for this connection from SubList
     {
-        let mut subs = state.subs.write().unwrap();
-        subs.remove_conn(conn_id);
-        state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+        #[cfg(feature = "accounts")]
+        {
+            for account_subs in &state.account_subs {
+                let mut subs = account_subs.write().unwrap();
+                subs.remove_conn(conn_id);
+            }
+            state.has_subs.store(
+                state
+                    .account_subs
+                    .iter()
+                    .any(|s| !s.read().unwrap().is_empty()),
+                Ordering::Relaxed,
+            );
+        }
+        #[cfg(not(feature = "accounts"))]
+        {
+            let mut subs = state.subs.write().unwrap();
+            subs.remove_conn(conn_id);
+            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+        }
     }
 
     // Remove from gateway_writers
@@ -498,15 +517,23 @@ fn handle_gateway_op(
                 #[cfg(feature = "cluster")]
                 is_route: false,
                 is_gateway: true,
+                #[cfg(feature = "accounts")]
+                account_id: 0,
             };
 
-            let mut subs = state.subs.write().unwrap();
+            let mut subs = state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    0,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Relaxed);
 
             debug!(conn_id, sid, subject = %subject_str, "outbound gateway sub");
         }
-        GatewayOp::RouteUnsub { subject } => {
+        GatewayOp::RouteUnsub { subject, .. } => {
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
 
             // Check interest mode — RS- means different things per mode.
@@ -541,7 +568,13 @@ fn handle_gateway_op(
             // InterestOnly mode: RS- = remove gateway subscription from SubList.
             let key = (subject.clone(), None);
             if let Some(sid) = gateway_sids.remove(&key) {
-                let mut subs = state.subs.write().unwrap();
+                let mut subs = state
+                    .get_subs(
+                        #[cfg(feature = "accounts")]
+                        0,
+                    )
+                    .write()
+                    .unwrap();
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
             }
@@ -573,13 +606,41 @@ fn handle_gateway_op(
                 #[cfg(feature = "cluster")]
                 true, // skip_routes
                 true, // skip_gateways
+                #[cfg(feature = "accounts")]
+                0, // account_id — will use actual account from wire in Phase 4
             );
-            handle_expired_subs_upstream(&expired, state);
+            // Cross-account forwarding from gateway reader.
+            #[cfg(feature = "accounts")]
+            let expired = {
+                let mut expired = expired;
+                let cross_expired = deliver_cross_account_upstream(
+                    state,
+                    &subject,
+                    subject_str,
+                    unwrapped_reply.as_deref(),
+                    headers.as_ref(),
+                    &payload,
+                    &mut dirty_writers,
+                    0, // gateway uses $G for now
+                );
+                expired.extend(cross_expired);
+                expired
+            };
+            handle_expired_subs_upstream(
+                &expired,
+                state,
+                #[cfg(feature = "accounts")]
+                0,
+            );
 
             // Send RS- back when no local subs matched (negative interest signal).
             if delivered == 0 {
                 let mut builder = MsgBuilder::new();
-                let rs_minus = builder.build_route_unsub(&subject);
+                let rs_minus = builder.build_route_unsub(
+                    &subject,
+                    #[cfg(feature = "accounts")]
+                    b"$G".as_slice(),
+                );
                 let mut w = io::BufWriter::new(tcp);
                 let _ = w.write_all(rs_minus);
                 let _ = w.flush();
@@ -728,17 +789,45 @@ fn transition_to_interest_only(
     // Step 2: Send RS+ for all existing local subscriptions
     {
         let mut w = io::BufWriter::new(tcp);
-        let subs = state.subs.read().unwrap();
         let mut builder = MsgBuilder::new();
-        for (subject, queue) in subs.local_interests() {
-            let data = if let Some(q) = queue {
-                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
-            } else {
-                builder.build_route_sub(subject.as_bytes())
-            };
-            w.write_all(data)?;
+        #[cfg(feature = "accounts")]
+        {
+            for (idx, account_subs) in state.account_subs.iter().enumerate() {
+                let account = state
+                    .account_name(idx as crate::server::AccountId)
+                    .as_bytes();
+                let subs = account_subs.read().unwrap();
+                for (subject, queue) in subs.local_interests() {
+                    let data = if let Some(q) = queue {
+                        builder.build_route_sub_queue(
+                            subject.as_bytes(),
+                            q.as_bytes(),
+                            #[cfg(feature = "accounts")]
+                            account,
+                        )
+                    } else {
+                        builder.build_route_sub(
+                            subject.as_bytes(),
+                            #[cfg(feature = "accounts")]
+                            account,
+                        )
+                    };
+                    w.write_all(data)?;
+                }
+            }
         }
-        drop(subs);
+        #[cfg(not(feature = "accounts"))]
+        {
+            let subs = state.subs.read().unwrap();
+            for (subject, queue) in subs.local_interests() {
+                let data = if let Some(q) = queue {
+                    builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+                } else {
+                    builder.build_route_sub(subject.as_bytes())
+                };
+                w.write_all(data)?;
+            }
+        }
         w.flush()?;
     }
 

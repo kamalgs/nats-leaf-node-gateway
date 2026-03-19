@@ -10,6 +10,8 @@ use tracing::debug;
 #[cfg(feature = "leaf")]
 use tracing::warn;
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
@@ -105,10 +107,19 @@ impl LeafHandler {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         };
 
         {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -127,11 +138,23 @@ impl LeafHandler {
 
         // Propagate RS+ to route peers.
         #[cfg(feature = "cluster")]
-        propagate_route_sub(wctx.state, subject.as_ref(), queue.as_deref());
+        propagate_route_sub(
+            wctx.state,
+            subject.as_ref(),
+            queue.as_deref(),
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
+        );
 
         // Propagate RS+ to gateway peers.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(wctx.state, subject.as_ref(), queue.as_deref());
+        propagate_gateway_sub(
+            wctx.state,
+            subject.as_ref(),
+            queue.as_deref(),
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
+        );
 
         gauge!(
             "subscriptions_active",
@@ -164,7 +187,14 @@ impl LeafHandler {
         };
 
         let removed = {
-            let mut subs = wctx.state.subs.write().unwrap();
+            let mut subs = wctx
+                .state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    conn.account_id,
+                )
+                .write()
+                .unwrap();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -186,12 +216,16 @@ impl LeafHandler {
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                #[cfg(feature = "accounts")]
+                wctx.state.account_name(conn.account_id).as_bytes(),
             );
             #[cfg(feature = "gateway")]
             propagate_gateway_unsub(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                #[cfg(feature = "accounts")]
+                wctx.state.account_name(conn.account_id).as_bytes(),
             );
             gauge!(
                 "subscriptions_active",
@@ -236,6 +270,8 @@ impl LeafHandler {
             false, // don't skip routes — leaf msgs forward to route peers
             #[cfg(feature = "gateway")]
             false, // don't skip gateways — leaf msgs forward to gateway peers
+            #[cfg(feature = "accounts")]
+            conn.account_id,
         );
 
         // Forward to optimistic gateways when no gateway sub matched.
@@ -247,7 +283,26 @@ impl LeafHandler {
             reply.as_deref(),
             headers.as_ref(),
             &payload,
+            #[cfg(feature = "accounts")]
+            wctx.state.account_name(conn.account_id).as_bytes(),
         );
+
+        // Cross-account forwarding: deliver to destination accounts' SubLists.
+        #[cfg(feature = "accounts")]
+        let expired = {
+            let mut expired = expired;
+            let cross_expired = deliver_cross_account(
+                wctx,
+                &subject,
+                subject_str,
+                reply.as_deref(),
+                headers.as_ref(),
+                &payload,
+                conn.account_id,
+            );
+            expired.extend(cross_expired);
+            expired
+        };
 
         #[cfg(feature = "leaf")]
         forward_to_upstream(

@@ -19,6 +19,8 @@ use std::path::Path;
 
 #[cfg(feature = "leaf")]
 use crate::server::HubCredentials;
+#[cfg(feature = "accounts")]
+use crate::server::{AccountConfig, ExportRule, ImportRule};
 use crate::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
 
 /// Errors that can occur during config parsing.
@@ -684,6 +686,7 @@ const IGNORED_KEYS: &[&str] = &[
     "jetstream",
     "cluster",
     "gateway",
+    #[cfg(not(feature = "accounts"))]
     "accounts",
     "operator",
     "resolver",
@@ -816,6 +819,10 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             // --- gateway block ---
             #[cfg(feature = "gateway")]
             "gateway" => apply_gateway(&mut config, value)?,
+
+            // --- accounts block ---
+            #[cfg(feature = "accounts")]
+            "accounts" => apply_accounts(&mut config, value)?,
 
             // --- websocket block ---
             "websocket" => {
@@ -1031,6 +1038,95 @@ fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
                 tracing::debug!("ignoring gateway key: {gkey}");
             }
         }
+    }
+    Ok(())
+}
+
+/// Parse an `accounts { ... }` block.
+///
+/// Format:
+/// ```text
+/// accounts {
+///     team_a { users = ["alice", "bob"] }
+///     team_b { users = ["carol", "dave"] }
+/// }
+/// ```
+#[cfg(feature = "accounts")]
+fn apply_accounts(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+    let entries = match value.as_map() {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    for (acct_name, acct_val) in entries {
+        let mut users = Vec::new();
+        let mut exports = Vec::new();
+        let mut imports = Vec::new();
+        if let Some(acct_entries) = acct_val.as_map() {
+            for (akey, aval) in acct_entries {
+                match akey.as_str() {
+                    "users" => {
+                        if let Some(arr) = aval.as_array() {
+                            for item in arr {
+                                users.push(as_string(item)?);
+                            }
+                        }
+                    }
+                    "exports" => {
+                        if let Some(arr) = aval.as_array() {
+                            for item in arr {
+                                if let Some(map) = item.as_map() {
+                                    let mut subject = String::new();
+                                    for (mk, mv) in map {
+                                        if mk == "subject" {
+                                            subject = as_string(mv)?;
+                                        }
+                                    }
+                                    if !subject.is_empty() {
+                                        exports.push(ExportRule { subject });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "imports" => {
+                        if let Some(arr) = aval.as_array() {
+                            for item in arr {
+                                if let Some(map) = item.as_map() {
+                                    let mut subject = String::new();
+                                    let mut account = String::new();
+                                    let mut to = None;
+                                    for (mk, mv) in map {
+                                        match mk.as_str() {
+                                            "subject" => subject = as_string(mv)?,
+                                            "account" => account = as_string(mv)?,
+                                            "to" => to = Some(as_string(mv)?),
+                                            _ => {}
+                                        }
+                                    }
+                                    if !subject.is_empty() && !account.is_empty() {
+                                        imports.push(ImportRule {
+                                            subject,
+                                            account,
+                                            to,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::debug!("ignoring accounts.{}.{}", acct_name, akey);
+                    }
+                }
+            }
+        }
+        config.accounts.push(AccountConfig {
+            name: acct_name.clone(),
+            users,
+            exports,
+            imports,
+        });
     }
     Ok(())
 }
@@ -1724,5 +1820,66 @@ leafnodes {
 "#;
         let config = load_config_str(input).unwrap();
         assert!(config.subject_mappings.is_empty());
+    }
+
+    #[cfg(feature = "accounts")]
+    #[test]
+    fn accounts_with_exports_imports() {
+        let input = r#"
+port = 4222
+accounts {
+    team_a {
+        users = ["alice", "bob"]
+        exports = [
+            { subject = "events.>" }
+        ]
+    }
+    team_b {
+        users = ["carol"]
+        imports = [
+            { subject = "events.>", account = "team_a", to = "team_a.events.>" }
+        ]
+    }
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.accounts.len(), 2);
+
+        let team_a = &config.accounts[0];
+        assert_eq!(team_a.name, "team_a");
+        assert_eq!(team_a.users, vec!["alice", "bob"]);
+        assert_eq!(team_a.exports.len(), 1);
+        assert_eq!(team_a.exports[0].subject, "events.>");
+        assert!(team_a.imports.is_empty());
+
+        let team_b = &config.accounts[1];
+        assert_eq!(team_b.name, "team_b");
+        assert_eq!(team_b.users, vec!["carol"]);
+        assert!(team_b.exports.is_empty());
+        assert_eq!(team_b.imports.len(), 1);
+        assert_eq!(team_b.imports[0].subject, "events.>");
+        assert_eq!(team_b.imports[0].account, "team_a");
+        assert_eq!(team_b.imports[0].to.as_deref(), Some("team_a.events.>"));
+    }
+
+    #[cfg(feature = "accounts")]
+    #[test]
+    fn accounts_import_without_remap() {
+        let input = r#"
+port = 4222
+accounts {
+    src {
+        users = ["alice"]
+        exports = [{ subject = "data.>" }]
+    }
+    dst {
+        users = ["bob"]
+        imports = [{ subject = "data.>", account = "src" }]
+    }
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        let dst = &config.accounts[1];
+        assert_eq!(dst.imports[0].to, None);
     }
 }

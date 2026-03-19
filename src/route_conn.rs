@@ -345,13 +345,28 @@ fn connect_route(
     // --- Send RS+ for existing local subs ---
     {
         let mut w = io::BufWriter::new(&tcp_writer);
-        let subs = state.subs.read().unwrap();
+        let subs = state
+            .get_subs(
+                #[cfg(feature = "accounts")]
+                0,
+            )
+            .read()
+            .unwrap();
         let mut builder = MsgBuilder::new();
         for (subject, queue) in subs.local_interests() {
             let data = if let Some(q) = queue {
-                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+                builder.build_route_sub_queue(
+                    subject.as_bytes(),
+                    q.as_bytes(),
+                    #[cfg(feature = "accounts")]
+                    b"$G".as_slice(),
+                )
             } else {
-                builder.build_route_sub(subject.as_bytes())
+                builder.build_route_sub(
+                    subject.as_bytes(),
+                    #[cfg(feature = "accounts")]
+                    b"$G".as_slice(),
+                )
             };
             w.write_all(data)?;
         }
@@ -383,9 +398,26 @@ fn connect_route(
 
     // Remove all route subs for this connection from SubList
     {
-        let mut subs = state.subs.write().unwrap();
-        subs.remove_conn(conn_id);
-        state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+        #[cfg(feature = "accounts")]
+        {
+            for account_subs in &state.account_subs {
+                let mut subs = account_subs.write().unwrap();
+                subs.remove_conn(conn_id);
+            }
+            state.has_subs.store(
+                state
+                    .account_subs
+                    .iter()
+                    .any(|s| !s.read().unwrap().is_empty()),
+                Ordering::Relaxed,
+            );
+        }
+        #[cfg(not(feature = "accounts"))]
+        {
+            let mut subs = state.subs.write().unwrap();
+            subs.remove_conn(conn_id);
+            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+        }
     }
 
     // Remove from route_writers
@@ -535,19 +567,33 @@ fn handle_route_op(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
+                #[cfg(feature = "accounts")]
+                account_id: 0,
             };
 
-            let mut subs = state.subs.write().unwrap();
+            let mut subs = state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    0,
+                )
+                .write()
+                .unwrap();
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Relaxed);
 
             debug!(conn_id, sid, subject = %subject_str, "outbound route sub");
         }
-        RouteOp::RouteUnsub { subject } => {
+        RouteOp::RouteUnsub { subject, .. } => {
             // RS- doesn't carry queue; remove matching (subject, None) entry
             let key = (subject.clone(), None);
             if let Some(sid) = route_sids.remove(&key) {
-                let mut subs = state.subs.write().unwrap();
+                let mut subs = state
+                    .get_subs(
+                        #[cfg(feature = "accounts")]
+                        0,
+                    )
+                    .write()
+                    .unwrap();
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
             }
@@ -573,8 +619,15 @@ fn handle_route_op(
                 true, // skip_routes
                 #[cfg(feature = "gateway")]
                 false, // don't skip gateways — route msgs forward to gateway peers
+                #[cfg(feature = "accounts")]
+                0, // account_id — will use actual account from wire in Phase 4
             );
-            handle_expired_subs_upstream(&expired, state);
+            handle_expired_subs_upstream(
+                &expired,
+                state,
+                #[cfg(feature = "accounts")]
+                0,
+            );
         }
         RouteOp::Ping => {
             let mut w = io::BufWriter::new(tcp);

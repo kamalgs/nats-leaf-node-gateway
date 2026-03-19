@@ -108,9 +108,17 @@ impl DirectWriter {
         reply: Option<&[u8]>,
         headers: Option<&HeaderMap>,
         payload: &[u8],
+        #[cfg(feature = "accounts")] account: &[u8],
     ) {
         let mut builder = self.msg_builder.lock().unwrap();
-        let data = builder.build_rmsg(subject, reply, headers, payload);
+        let data = builder.build_rmsg(
+            subject,
+            reply,
+            headers,
+            payload,
+            #[cfg(feature = "accounts")]
+            account,
+        );
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
         drop(buf);
@@ -202,6 +210,9 @@ pub struct Subscription {
     /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
     #[cfg(feature = "gateway")]
     pub is_gateway: bool,
+    /// Account this subscription belongs to. 0 = `$G` (global/default).
+    #[cfg(feature = "accounts")]
+    pub account_id: crate::server::AccountId,
 }
 
 impl Clone for Subscription {
@@ -220,6 +231,8 @@ impl Clone for Subscription {
             is_route: self.is_route,
             #[cfg(feature = "gateway")]
             is_gateway: self.is_gateway,
+            #[cfg(feature = "accounts")]
+            account_id: self.account_id,
         }
     }
 }
@@ -243,6 +256,8 @@ impl Subscription {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
         }
     }
 }
@@ -665,6 +680,64 @@ fn subject_matches_bytes(pattern: &[u8], subject: &[u8]) -> bool {
         pp = if pe < pattern.len() { pe + 1 } else { pe };
         sp = if se < subject.len() { se + 1 } else { se };
     }
+}
+
+/// Remap a concrete subject using a from/to pattern pair.
+///
+/// Tokenizes both patterns by `.`, extracts wildcard captures (`*` or `>`)
+/// from the `from_pattern` matched against the subject, and substitutes
+/// them positionally into the `to_pattern`.
+///
+/// Example: from=`events.>`, to=`team_a.events.>`, subject=`events.order.created`
+/// → result: `team_a.events.order.created`
+#[cfg(feature = "accounts")]
+pub fn remap_subject(from_pattern: &str, to_pattern: &str, subject: &str) -> String {
+    let from_tokens: Vec<&str> = from_pattern.split('.').collect();
+    let subject_tokens: Vec<&str> = subject.split('.').collect();
+    let to_tokens: Vec<&str> = to_pattern.split('.').collect();
+
+    // Extract captures from from_pattern vs subject
+    let mut captures: Vec<String> = Vec::new();
+    let mut si = 0;
+    for ft in &from_tokens {
+        if si >= subject_tokens.len() {
+            break;
+        }
+        if *ft == ">" {
+            // Capture remaining tokens
+            captures.push(subject_tokens[si..].join("."));
+            break;
+        } else if *ft == "*" {
+            captures.push(subject_tokens[si].to_string());
+            si += 1;
+        } else {
+            // Literal token — no capture
+            si += 1;
+        }
+    }
+
+    // Build result by substituting captures into to_pattern
+    let mut result_parts: Vec<String> = Vec::new();
+    let mut ci = 0;
+    for tt in &to_tokens {
+        if *tt == ">" {
+            if ci < captures.len() {
+                result_parts.push(captures[ci].clone());
+            }
+            break;
+        } else if *tt == "*" {
+            if ci < captures.len() {
+                result_parts.push(captures[ci].clone());
+                ci += 1;
+            } else {
+                result_parts.push("*".to_string());
+            }
+        } else {
+            result_parts.push(tt.to_string());
+        }
+    }
+
+    result_parts.join(".")
 }
 
 #[cfg(test)]
@@ -1323,7 +1396,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_direct_writer_formats_rmsg() {
         let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(b"test.sub", None, None, b"hello");
+        writer.write_rmsg(
+            b"test.sub",
+            None,
+            None,
+            b"hello",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         let data = writer.drain().expect("should have data");
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "RMSG $G test.sub 5\r\nhello\r\n");
@@ -1333,7 +1413,14 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn test_direct_writer_formats_rmsg_with_reply() {
         let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+        writer.write_rmsg(
+            b"test.sub",
+            Some(b"reply.to"),
+            None,
+            b"hi",
+            #[cfg(feature = "accounts")]
+            b"$G",
+        );
         let data = writer.drain().unwrap();
         let s = std::str::from_utf8(&data).unwrap();
         assert_eq!(s, "RMSG $G test.sub reply.to 2\r\nhi\r\n");
@@ -1350,5 +1437,52 @@ mod tests {
         let (count, expired) = sl.for_each_match("foo.baz", |_sub| {});
         assert_eq!(count, 1);
         assert_eq!(expired.len(), 1);
+    }
+
+    #[cfg(feature = "accounts")]
+    mod remap_tests {
+        use super::super::remap_subject;
+
+        #[test]
+        fn test_remap_gt_prefix() {
+            // events.> → team_a.events.>
+            let result = remap_subject("events.>", "team_a.events.>", "events.order.created");
+            assert_eq!(result, "team_a.events.order.created");
+        }
+
+        #[test]
+        fn test_remap_gt_single_token() {
+            // events.> → team_a.events.>
+            let result = remap_subject("events.>", "team_a.events.>", "events.order");
+            assert_eq!(result, "team_a.events.order");
+        }
+
+        #[test]
+        fn test_remap_star() {
+            // orders.* → team.orders.*
+            let result = remap_subject("orders.*", "team.orders.*", "orders.new");
+            assert_eq!(result, "team.orders.new");
+        }
+
+        #[test]
+        fn test_remap_no_wildcard() {
+            // exact.subject → other.subject
+            let result = remap_subject("exact.subject", "other.subject", "exact.subject");
+            assert_eq!(result, "other.subject");
+        }
+
+        #[test]
+        fn test_remap_multi_star() {
+            // *.*.events → prefix.*.*.events
+            let result = remap_subject("*.*.events", "prefix.*.*.events", "a.b.events");
+            assert_eq!(result, "prefix.a.b.events");
+        }
+
+        #[test]
+        fn test_remap_identity() {
+            // Same pattern: events.> → events.>
+            let result = remap_subject("events.>", "events.>", "events.foo.bar");
+            assert_eq!(result, "events.foo.bar");
+        }
     }
 }
