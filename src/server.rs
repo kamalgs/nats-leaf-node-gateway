@@ -351,6 +351,30 @@ pub struct AccountConfig {
     pub name: String,
     /// Usernames assigned to this account.
     pub users: Vec<String>,
+    /// Subjects this account exports (makes available to other accounts).
+    pub exports: Vec<ExportRule>,
+    /// Subjects this account imports from other accounts.
+    pub imports: Vec<ImportRule>,
+}
+
+/// A subject export rule: makes subjects available for cross-account import.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct ExportRule {
+    /// Subject pattern to export (e.g., "events.>"). Supports NATS wildcards.
+    pub subject: String,
+}
+
+/// A subject import rule: subscribes to subjects exported by another account.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct ImportRule {
+    /// Source subject pattern to import (must match an export in the source account).
+    pub subject: String,
+    /// Name of the source account to import from.
+    pub account: String,
+    /// Optional local subject remapping (e.g., "team_a.events.>").
+    pub to: Option<String>,
 }
 
 /// Maps account names to numeric IDs and vice versa.
@@ -407,6 +431,140 @@ impl AccountRegistry {
     pub fn count(&self) -> usize {
         self.id_to_name.len()
     }
+}
+
+/// A resolved cross-account forwarding rule. Precomputed at startup,
+/// indexed by source `AccountId` for O(1) lookup on the publish path.
+#[cfg(feature = "accounts")]
+pub(crate) struct CrossAccountRoute {
+    /// The export subject pattern to match against (e.g., "events.>").
+    pub export_pattern: String,
+    /// Source account that exports the subject.
+    pub src_account_id: AccountId,
+    /// Destination account that imports the subject.
+    pub dst_account_id: AccountId,
+    /// Optional subject remapping from source → destination namespace.
+    pub remap: Option<SubjectRemap>,
+}
+
+/// Subject remapping specification for cross-account imports.
+#[cfg(feature = "accounts")]
+pub(crate) struct SubjectRemap {
+    /// Source pattern for token extraction (the export pattern).
+    pub from_pattern: String,
+    /// Destination pattern for substitution (the import `to` pattern).
+    pub to_pattern: String,
+}
+
+/// Reverse import entry: maps a destination (local) subject pattern back to
+/// the source account and pattern. Used for reverse interest propagation.
+#[cfg(feature = "accounts")]
+pub(crate) struct ReverseImport {
+    /// The local pattern (the `to` pattern, or `subject` if no remap).
+    pub local_pattern: String,
+    /// The source account that exports this subject.
+    pub src_account_id: AccountId,
+    /// The original source subject pattern (export subject).
+    pub src_pattern: String,
+}
+
+/// Resolve cross-account forwarding rules from account configurations.
+///
+/// Matches each account's imports against other accounts' exports.
+/// Returns a Vec indexed by source AccountId, each containing the list
+/// of forwarding rules for messages published in that account.
+#[cfg(feature = "accounts")]
+pub(crate) fn resolve_cross_account_routes(
+    accounts: &[AccountConfig],
+    registry: &AccountRegistry,
+) -> Vec<Vec<CrossAccountRoute>> {
+    let count = registry.count();
+    let mut routes: Vec<Vec<CrossAccountRoute>> = (0..count).map(|_| Vec::new()).collect();
+
+    for (dst_idx, dst_acct) in accounts.iter().enumerate() {
+        let dst_id = (dst_idx + 1) as AccountId;
+        for import in &dst_acct.imports {
+            // Look up the source account
+            let src_id = match registry.id_by_name(&import.account) {
+                Some(id) => id,
+                None => {
+                    warn!(
+                        account = %dst_acct.name,
+                        import_account = %import.account,
+                        "import references unknown account, skipping"
+                    );
+                    continue;
+                }
+            };
+            // Verify the source account has a matching export
+            let src_acct_idx = (src_id - 1) as usize;
+            if src_acct_idx >= accounts.len() {
+                continue;
+            }
+            let src_acct = &accounts[src_acct_idx];
+            let matching_export = src_acct.exports.iter().find(|e| {
+                crate::sub_list::subject_matches(&e.subject, &import.subject)
+                    || crate::sub_list::subject_matches(&import.subject, &e.subject)
+            });
+            let export_pattern = match matching_export {
+                Some(e) => e.subject.clone(),
+                None => {
+                    warn!(
+                        dst_account = %dst_acct.name,
+                        src_account = %import.account,
+                        subject = %import.subject,
+                        "import subject not matched by any export, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let remap = import.to.as_ref().map(|to| SubjectRemap {
+                from_pattern: export_pattern.clone(),
+                to_pattern: to.clone(),
+            });
+
+            routes[src_id as usize].push(CrossAccountRoute {
+                export_pattern,
+                src_account_id: src_id,
+                dst_account_id: dst_id,
+                remap,
+            });
+        }
+    }
+
+    routes
+}
+
+/// Build the reverse import index from account configurations.
+///
+/// Returns a Vec indexed by destination AccountId. Each entry lists the
+/// reverse mappings: local pattern → (src_account_id, src_pattern).
+#[cfg(feature = "accounts")]
+pub(crate) fn build_reverse_imports(
+    accounts: &[AccountConfig],
+    registry: &AccountRegistry,
+) -> Vec<Vec<ReverseImport>> {
+    let count = registry.count();
+    let mut reverse: Vec<Vec<ReverseImport>> = (0..count).map(|_| Vec::new()).collect();
+
+    for (dst_idx, dst_acct) in accounts.iter().enumerate() {
+        let dst_id = (dst_idx + 1) as AccountId;
+        for import in &dst_acct.imports {
+            let src_id = match registry.id_by_name(&import.account) {
+                Some(id) => id,
+                None => continue,
+            };
+            let local_pattern = import.to.clone().unwrap_or_else(|| import.subject.clone());
+            reverse[dst_id as usize].push(ReverseImport {
+                local_pattern,
+                src_account_id: src_id,
+                src_pattern: import.subject.clone(),
+            });
+        }
+    }
+
+    reverse
 }
 
 impl Default for LeafServerConfig {
@@ -771,6 +929,13 @@ pub(crate) struct ServerState {
     /// Account configurations (for username → account lookup).
     #[cfg(feature = "accounts")]
     pub account_configs: Vec<AccountConfig>,
+    /// Precomputed cross-account forwarding rules, indexed by source AccountId.
+    #[cfg(feature = "accounts")]
+    pub cross_account_routes: Vec<Vec<CrossAccountRoute>>,
+    /// Reverse import index, indexed by destination AccountId.
+    /// Used for reverse interest propagation on SUB/UNSUB.
+    #[cfg(feature = "accounts")]
+    pub reverse_imports: Vec<Vec<ReverseImport>>,
     #[cfg(feature = "leaf")]
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
@@ -912,6 +1077,17 @@ impl ServerState {
             prefix
         };
 
+        #[cfg(feature = "accounts")]
+        let cross_account_routes = {
+            let registry = AccountRegistry::new(&accounts);
+            resolve_cross_account_routes(&accounts, &registry)
+        };
+        #[cfg(feature = "accounts")]
+        let reverse_imports = {
+            let registry = AccountRegistry::new(&accounts);
+            build_reverse_imports(&accounts, &registry)
+        };
+
         Self {
             info,
             auth,
@@ -932,6 +1108,10 @@ impl ServerState {
             account_registry: AccountRegistry::new(&accounts),
             #[cfg(feature = "accounts")]
             account_configs: accounts,
+            #[cfg(feature = "accounts")]
+            cross_account_routes,
+            #[cfg(feature = "accounts")]
+            reverse_imports,
             #[cfg(feature = "leaf")]
             upstream: std::sync::RwLock::new(None),
             #[cfg(feature = "leaf")]
@@ -2177,5 +2357,132 @@ mod tests {
     fn default_auth_timeout() {
         let config = LeafServerConfig::default();
         assert_eq!(config.auth_timeout, std::time::Duration::from_secs(2));
+    }
+
+    // --- Cross-account route resolution ---
+
+    #[cfg(feature = "accounts")]
+    mod cross_account_tests {
+        use super::super::*;
+
+        fn make_accounts() -> Vec<AccountConfig> {
+            vec![
+                AccountConfig {
+                    name: "team_a".into(),
+                    users: vec!["alice".into()],
+                    exports: vec![ExportRule {
+                        subject: "events.>".into(),
+                    }],
+                    imports: vec![],
+                },
+                AccountConfig {
+                    name: "team_b".into(),
+                    users: vec!["bob".into()],
+                    exports: vec![],
+                    imports: vec![ImportRule {
+                        subject: "events.>".into(),
+                        account: "team_a".into(),
+                        to: Some("team_a.events.>".into()),
+                    }],
+                },
+            ]
+        }
+
+        #[test]
+        fn resolve_routes_basic() {
+            let accounts = make_accounts();
+            let registry = AccountRegistry::new(&accounts);
+            let routes = resolve_cross_account_routes(&accounts, &registry);
+
+            // 3 accounts total: $G, team_a, team_b
+            assert_eq!(routes.len(), 3);
+            // $G (idx 0) — no routes
+            assert!(routes[0].is_empty());
+            // team_a (idx 1) — one route: events.> → team_b
+            assert_eq!(routes[1].len(), 1);
+            let r = &routes[1][0];
+            assert_eq!(r.export_pattern, "events.>");
+            assert_eq!(r.src_account_id, 1); // team_a
+            assert_eq!(r.dst_account_id, 2); // team_b
+            assert!(r.remap.is_some());
+            let remap = r.remap.as_ref().unwrap();
+            assert_eq!(remap.from_pattern, "events.>");
+            assert_eq!(remap.to_pattern, "team_a.events.>");
+            // team_b (idx 2) — no routes (it's an importer, not exporter)
+            assert!(routes[2].is_empty());
+        }
+
+        #[test]
+        fn resolve_routes_no_export_match() {
+            let accounts = vec![
+                AccountConfig {
+                    name: "src".into(),
+                    users: vec![],
+                    exports: vec![ExportRule {
+                        subject: "foo.>".into(),
+                    }],
+                    imports: vec![],
+                },
+                AccountConfig {
+                    name: "dst".into(),
+                    users: vec![],
+                    exports: vec![],
+                    imports: vec![ImportRule {
+                        subject: "bar.>".into(), // doesn't match export
+                        account: "src".into(),
+                        to: None,
+                    }],
+                },
+            ];
+            let registry = AccountRegistry::new(&accounts);
+            let routes = resolve_cross_account_routes(&accounts, &registry);
+            // src has no routes (import doesn't match export)
+            assert!(routes[1].is_empty());
+        }
+
+        #[test]
+        fn resolve_routes_no_remap() {
+            let accounts = vec![
+                AccountConfig {
+                    name: "src".into(),
+                    users: vec![],
+                    exports: vec![ExportRule {
+                        subject: "data.>".into(),
+                    }],
+                    imports: vec![],
+                },
+                AccountConfig {
+                    name: "dst".into(),
+                    users: vec![],
+                    exports: vec![],
+                    imports: vec![ImportRule {
+                        subject: "data.>".into(),
+                        account: "src".into(),
+                        to: None, // no remap
+                    }],
+                },
+            ];
+            let registry = AccountRegistry::new(&accounts);
+            let routes = resolve_cross_account_routes(&accounts, &registry);
+            assert_eq!(routes[1].len(), 1);
+            assert!(routes[1][0].remap.is_none());
+        }
+
+        #[test]
+        fn build_reverse_imports_basic() {
+            let accounts = make_accounts();
+            let registry = AccountRegistry::new(&accounts);
+            let reverse = build_reverse_imports(&accounts, &registry);
+
+            assert_eq!(reverse.len(), 3);
+            // team_b (idx 2) has one reverse import
+            assert_eq!(reverse[2].len(), 1);
+            let ri = &reverse[2][0];
+            assert_eq!(ri.local_pattern, "team_a.events.>");
+            assert_eq!(ri.src_account_id, 1);
+            assert_eq!(ri.src_pattern, "events.>");
+            // team_a (idx 1) has no reverse imports
+            assert!(reverse[1].is_empty());
+        }
     }
 }

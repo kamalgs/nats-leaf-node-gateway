@@ -410,6 +410,155 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     (delivered, expired)
 }
 
+/// Deliver a message to cross-account subscribers (worker context).
+///
+/// Called after same-account `deliver_to_subs()`. For each cross-account route
+/// whose export pattern matches the published subject, delivers to the
+/// destination account's SubList (optionally remapping the subject).
+///
+/// Single-hop: cross-account delivery does NOT recursively trigger more
+/// cross-account forwarding.
+#[cfg(feature = "accounts")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_cross_account(
+    wctx: &mut WorkerCtx<'_>,
+    subject: &[u8],
+    subject_str: &str,
+    reply: Option<&[u8]>,
+    headers: Option<&HeaderMap>,
+    payload: &[u8],
+    src_account_id: crate::server::AccountId,
+) -> Vec<(u64, u64)> {
+    let routes = match wctx.state.cross_account_routes.get(src_account_id as usize) {
+        Some(r) if !r.is_empty() => r,
+        _ => return Vec::new(),
+    };
+
+    let payload_len = payload.len() as u64;
+    let mut all_expired = Vec::new();
+
+    for route in routes {
+        if !crate::sub_list::subject_matches(&route.export_pattern, subject_str) {
+            continue;
+        }
+
+        let (dst_subject_str, dst_subject_bytes);
+        match &route.remap {
+            Some(r) => {
+                dst_subject_str =
+                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, subject_str);
+                dst_subject_bytes = dst_subject_str.as_bytes();
+            }
+            None => {
+                dst_subject_str = subject_str.to_string();
+                dst_subject_bytes = subject;
+            }
+        };
+
+        let dst_acct_name = wctx.state.account_name(route.dst_account_id).as_bytes();
+
+        let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
+        let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
+            deliver_to_sub_inner(
+                sub,
+                dst_subject_bytes,
+                reply,
+                headers,
+                payload,
+                dst_acct_name,
+            );
+            *wctx.msgs_delivered += 1;
+            *wctx.msgs_delivered_bytes += payload_len;
+            let fd = sub.writer.event_raw_fd();
+            if fd != wctx.event_fd
+                && !wctx.pending_notify[..*wctx.pending_notify_count].contains(&fd)
+                && *wctx.pending_notify_count < wctx.pending_notify.len()
+            {
+                wctx.pending_notify[*wctx.pending_notify_count] = fd;
+                *wctx.pending_notify_count += 1;
+            }
+        });
+        drop(subs);
+        all_expired.extend(expired);
+    }
+
+    all_expired
+}
+
+/// Deliver a message to cross-account subscribers (upstream/route reader thread).
+///
+/// Same as `deliver_cross_account` but for contexts outside the worker event loop.
+/// Accumulates dirty writers for batch notification.
+#[cfg(feature = "accounts")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_cross_account_upstream(
+    state: &ServerState,
+    subject: &[u8],
+    subject_str: &str,
+    reply: Option<&[u8]>,
+    headers: Option<&HeaderMap>,
+    payload: &[u8],
+    dirty_writers: &mut Vec<DirectWriter>,
+    src_account_id: crate::server::AccountId,
+) -> Vec<(u64, u64)> {
+    let routes = match state.cross_account_routes.get(src_account_id as usize) {
+        Some(r) if !r.is_empty() => r,
+        _ => return Vec::new(),
+    };
+
+    let mut all_expired = Vec::new();
+
+    for route in routes {
+        if !crate::sub_list::subject_matches(&route.export_pattern, subject_str) {
+            continue;
+        }
+
+        let (dst_subject_str, dst_subject_bytes_owned);
+        match &route.remap {
+            Some(r) => {
+                dst_subject_str =
+                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, subject_str);
+                dst_subject_bytes_owned = Some(dst_subject_str.as_bytes().to_vec());
+            }
+            None => {
+                dst_subject_str = subject_str.to_string();
+                dst_subject_bytes_owned = None;
+            }
+        };
+        let dst_subject_bytes = dst_subject_bytes_owned.as_deref().unwrap_or(subject);
+
+        #[allow(unused)]
+        let dst_acct_name = state.account_name(route.dst_account_id).as_bytes();
+
+        let subs = state.get_subs(route.dst_account_id).read().unwrap();
+        let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
+            #[cfg(feature = "cluster")]
+            if sub.is_route {
+                sub.writer
+                    .write_rmsg(dst_subject_bytes, reply, headers, payload, dst_acct_name);
+                dirty_writers.push(sub.writer.clone());
+                return;
+            }
+            #[cfg(feature = "hub")]
+            if sub.is_leaf {
+                sub.writer
+                    .write_lmsg(dst_subject_bytes, reply, headers, payload);
+            } else {
+                sub.writer
+                    .write_msg(dst_subject_bytes, &sub.sid_bytes, reply, headers, payload);
+            }
+            #[cfg(not(feature = "hub"))]
+            sub.writer
+                .write_msg(dst_subject_bytes, &sub.sid_bytes, reply, headers, payload);
+            dirty_writers.push(sub.writer.clone());
+        });
+        drop(subs);
+        all_expired.extend(expired);
+    }
+
+    all_expired
+}
+
 /// Handle expired subscriptions after delivery.
 ///
 /// Removes expired subs from the global sub list, decrements `sub_count` on

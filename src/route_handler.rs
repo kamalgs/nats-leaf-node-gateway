@@ -8,6 +8,8 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
@@ -316,6 +318,23 @@ impl RouteHandler {
             #[cfg(feature = "accounts")]
             wctx.state.account_name(account_id).as_bytes(),
         );
+
+        // Cross-account forwarding: deliver to destination accounts' SubLists.
+        #[cfg(feature = "accounts")]
+        let expired = {
+            let mut expired = expired;
+            let cross_expired = deliver_cross_account(
+                wctx,
+                &subject,
+                subject_str,
+                reply.as_deref(),
+                headers.as_ref(),
+                &payload,
+                account_id,
+            );
+            expired.extend(cross_expired);
+            expired
+        };
 
         // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]

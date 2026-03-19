@@ -18,6 +18,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{
     deliver_to_subs_upstream_inner, handle_expired_subs_upstream, unwrap_gateway_reply_bytes,
 };
@@ -607,6 +609,23 @@ fn handle_gateway_op(
                 #[cfg(feature = "accounts")]
                 0, // account_id — will use actual account from wire in Phase 4
             );
+            // Cross-account forwarding from gateway reader.
+            #[cfg(feature = "accounts")]
+            let expired = {
+                let mut expired = expired;
+                let cross_expired = deliver_cross_account_upstream(
+                    state,
+                    &subject,
+                    subject_str,
+                    unwrapped_reply.as_deref(),
+                    headers.as_ref(),
+                    &payload,
+                    &mut dirty_writers,
+                    0, // gateway uses $G for now
+                );
+                expired.extend(cross_expired);
+                expired
+            };
             handle_expired_subs_upstream(
                 &expired,
                 state,

@@ -10,6 +10,8 @@ use tracing::debug;
 #[cfg(feature = "leaf")]
 use tracing::warn;
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
@@ -284,6 +286,23 @@ impl LeafHandler {
             #[cfg(feature = "accounts")]
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
+
+        // Cross-account forwarding: deliver to destination accounts' SubLists.
+        #[cfg(feature = "accounts")]
+        let expired = {
+            let mut expired = expired;
+            let cross_expired = deliver_cross_account(
+                wctx,
+                &subject,
+                subject_str,
+                reply.as_deref(),
+                headers.as_ref(),
+                &payload,
+                conn.account_id,
+            );
+            expired.extend(cross_expired);
+            expired
+        };
 
         #[cfg(feature = "leaf")]
         forward_to_upstream(

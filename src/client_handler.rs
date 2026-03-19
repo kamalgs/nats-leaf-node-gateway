@@ -8,6 +8,8 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, HandleResult, WorkerCtx};
@@ -185,6 +187,43 @@ impl ClientHandler {
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
 
+        // Reverse interest: if this subscription matches an import's local pattern,
+        // propagate interest in the source account's namespace so remote peers
+        // forward messages to us.
+        #[cfg(feature = "accounts")]
+        {
+            if let Some(reverses) = wctx.state.reverse_imports.get(conn.account_id as usize) {
+                for ri in reverses {
+                    if crate::sub_list::subject_matches(&ri.local_pattern, subject_str) {
+                        let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
+                        #[cfg(feature = "leaf")]
+                        {
+                            let mut upstream = wctx.state.upstream.write().unwrap();
+                            if let Some(ref mut up) = *upstream {
+                                let _ = up.add_interest(ri.src_pattern.clone(), None);
+                            }
+                        }
+                        #[cfg(feature = "hub")]
+                        propagate_leaf_sub(wctx.state, ri.src_pattern.as_bytes(), None);
+                        #[cfg(feature = "cluster")]
+                        propagate_route_sub(
+                            wctx.state,
+                            ri.src_pattern.as_bytes(),
+                            None,
+                            src_acct_name,
+                        );
+                        #[cfg(feature = "gateway")]
+                        propagate_gateway_sub(
+                            wctx.state,
+                            ri.src_pattern.as_bytes(),
+                            None,
+                            src_acct_name,
+                        );
+                    }
+                }
+            }
+        }
+
         gauge!(
             "subscriptions_active",
             "worker" => wctx.worker_label.to_string()
@@ -263,6 +302,9 @@ impl ClientHandler {
                         #[cfg(feature = "accounts")]
                         wctx.state.account_name(conn.account_id).as_bytes(),
                     );
+                    // Reverse interest unsub for cross-account imports.
+                    #[cfg(feature = "accounts")]
+                    propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
                     debug!(
                         conn_id = conn.conn_id,
                         sid,
@@ -325,6 +367,9 @@ impl ClientHandler {
                     #[cfg(feature = "accounts")]
                     wctx.state.account_name(conn.account_id).as_bytes(),
                 );
+                // Reverse interest unsub for cross-account imports.
+                #[cfg(feature = "accounts")]
+                propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
                 debug!(
                     conn_id = conn.conn_id,
                     sid,
@@ -405,6 +450,23 @@ impl ClientHandler {
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
 
+        // Cross-account forwarding: deliver to destination accounts' SubLists.
+        #[cfg(feature = "accounts")]
+        let expired = {
+            let mut expired = expired;
+            let cross_expired = deliver_cross_account(
+                wctx,
+                &subject,
+                subject_str,
+                respond.as_deref(),
+                headers.as_ref(),
+                &payload,
+                conn.account_id,
+            );
+            expired.extend(cross_expired);
+            expired
+        };
+
         #[cfg(feature = "leaf")]
         forward_to_upstream(
             conn.upstream_tx,
@@ -416,5 +478,39 @@ impl ClientHandler {
         );
 
         (HandleResult::Ok, expired)
+    }
+}
+
+/// Propagate reverse interest removal for cross-account imports.
+///
+/// When a client unsubscribes from a subject that matches an import's local pattern,
+/// remove the corresponding interest in the source account's namespace from
+/// upstream/leaf/route/gateway peers.
+#[cfg(feature = "accounts")]
+fn propagate_reverse_unsub(
+    wctx: &mut WorkerCtx<'_>,
+    account_id: crate::server::AccountId,
+    subject: &str,
+) {
+    if let Some(reverses) = wctx.state.reverse_imports.get(account_id as usize) {
+        for ri in reverses {
+            if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
+                #[allow(unused)]
+                let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
+                #[cfg(feature = "leaf")]
+                {
+                    let mut upstream = wctx.state.upstream.write().unwrap();
+                    if let Some(ref mut up) = *upstream {
+                        up.remove_interest(&ri.src_pattern, None);
+                    }
+                }
+                #[cfg(feature = "hub")]
+                propagate_leaf_unsub(wctx.state, ri.src_pattern.as_bytes(), None);
+                #[cfg(feature = "cluster")]
+                propagate_route_unsub(wctx.state, ri.src_pattern.as_bytes(), None, src_acct_name);
+                #[cfg(feature = "gateway")]
+                propagate_gateway_unsub(wctx.state, ri.src_pattern.as_bytes(), None, src_acct_name);
+            }
+        }
     }
 }

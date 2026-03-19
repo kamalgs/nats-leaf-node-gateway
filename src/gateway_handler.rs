@@ -11,6 +11,8 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{
@@ -259,6 +261,23 @@ impl GatewayHandler {
             #[cfg(feature = "accounts")]
             conn.account_id,
         );
+
+        // Cross-account forwarding: deliver to destination accounts' SubLists.
+        #[cfg(feature = "accounts")]
+        let expired = {
+            let mut expired = expired;
+            let cross_expired = deliver_cross_account(
+                wctx,
+                &subject,
+                subject_str,
+                reply_ref,
+                headers.as_ref(),
+                &payload,
+                conn.account_id,
+            );
+            expired.extend(cross_expired);
+            expired
+        };
 
         // Send RS- back when no local subs matched (negative interest signal).
         if delivered == 0 {

@@ -9,6 +9,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream};
 use crate::interest::InterestPipeline;
 use crate::types::HeaderMap;
@@ -579,6 +581,23 @@ fn handle_hub_op(
                 #[cfg(feature = "accounts")]
                 0, // account_id — upstream hub uses $G
             );
+            // Cross-account forwarding from upstream hub.
+            #[cfg(feature = "accounts")]
+            let expired = {
+                let mut expired = expired;
+                let cross_expired = deliver_cross_account_upstream(
+                    state,
+                    &subject,
+                    subject_str,
+                    reply.as_deref(),
+                    headers.as_ref(),
+                    &payload,
+                    dirty_writers,
+                    0, // upstream hub uses $G
+                );
+                expired.extend(cross_expired);
+                expired
+            };
             handle_expired_subs_upstream(
                 &expired,
                 state,
