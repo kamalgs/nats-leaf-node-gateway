@@ -150,9 +150,25 @@ fn deliver_to_sub_inner(
     headers: Option<&HeaderMap>,
     payload: &[u8],
     #[cfg(feature = "accounts")] account_name: &[u8],
+    #[cfg(feature = "udp-transport")] udp_senders: &std::sync::RwLockReadGuard<
+        '_,
+        HashMap<u64, std::sync::mpsc::Sender<crate::udp::UdpCmd>>,
+    >,
 ) {
     #[cfg(feature = "cluster")]
     if sub.is_route {
+        // If this route peer has a UDP transport, send via UDP binary protocol
+        // instead of TCP RMSG.
+        #[cfg(feature = "udp-transport")]
+        if let Some(tx) = udp_senders.get(&sub.conn_id) {
+            let _ = tx.send(crate::udp::UdpCmd::Send {
+                subject: Bytes::copy_from_slice(subject),
+                reply: reply.map(Bytes::copy_from_slice),
+                headers: headers.cloned(),
+                payload: Bytes::copy_from_slice(payload),
+            });
+            return;
+        }
         sub.writer.write_rmsg(
             subject,
             reply,
@@ -207,6 +223,9 @@ pub(crate) fn deliver_to_subs(
     #[cfg(feature = "accounts")]
     let acct_name = acct_name_str.as_bytes();
 
+    #[cfg(feature = "udp-transport")]
+    let udp_senders = wctx.state.udp_senders.read().unwrap();
+
     let subs = wctx
         .state
         .get_subs(
@@ -253,6 +272,8 @@ pub(crate) fn deliver_to_subs(
                 payload,
                 #[cfg(feature = "accounts")]
                 acct_name,
+                #[cfg(feature = "udp-transport")]
+                &udp_senders,
             );
         }
         #[cfg(not(feature = "gateway"))]
@@ -265,6 +286,8 @@ pub(crate) fn deliver_to_subs(
                 payload,
                 #[cfg(feature = "accounts")]
                 acct_name,
+                #[cfg(feature = "udp-transport")]
+                &udp_senders,
             );
         }
         delivered += 1;
@@ -349,6 +372,9 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     #[allow(unused)]
     let acct_name = acct_name_str.as_bytes();
 
+    #[cfg(feature = "udp-transport")]
+    let udp_senders = state.udp_senders.read().unwrap();
+
     let subs = state
         .get_subs(
             #[cfg(feature = "accounts")]
@@ -360,6 +386,18 @@ pub(crate) fn deliver_to_subs_upstream_inner(
         #[cfg(feature = "cluster")]
         if sub.is_route {
             if skip_routes {
+                return;
+            }
+            // If this route peer has a UDP transport, send via UDP.
+            #[cfg(feature = "udp-transport")]
+            if let Some(tx) = udp_senders.get(&sub.conn_id) {
+                let _ = tx.send(crate::udp::UdpCmd::Send {
+                    subject: Bytes::copy_from_slice(subject),
+                    reply: reply.map(Bytes::copy_from_slice),
+                    headers: headers.cloned(),
+                    payload: Bytes::copy_from_slice(payload),
+                });
+                delivered += 1;
                 return;
             }
             sub.writer.write_rmsg(
@@ -457,6 +495,8 @@ pub(crate) fn deliver_cross_account(
 
         let dst_acct_name = wctx.state.account_name(route.dst_account_id).as_bytes();
 
+        #[cfg(feature = "udp-transport")]
+        let udp_senders = wctx.state.udp_senders.read().unwrap();
         let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
         let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
             deliver_to_sub_inner(
@@ -466,6 +506,8 @@ pub(crate) fn deliver_cross_account(
                 headers,
                 payload,
                 dst_acct_name,
+                #[cfg(feature = "udp-transport")]
+                &udp_senders,
             );
             *wctx.msgs_delivered += 1;
             *wctx.msgs_delivered_bytes += payload_len;

@@ -396,20 +396,27 @@ fn connect_route(
         let peer_udp_port = peer_info.udp_port;
         let local_udp_port = state.cluster_udp_port;
         match (local_udp_port, peer_udp_port) {
-            (Some(local_port), Some(remote_port)) => {
+            (Some(_), Some(remote_port)) => {
                 let peer_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
                 let peer_udp_addr: std::net::SocketAddr = format!("{peer_host}:{remote_port}")
                     .parse()
                     .map_err(|e| format!("invalid UDP peer address: {e}"))?;
+                // Bind on ephemeral port (0) — the server side listens on
+                // cluster_udp_port via UdpListener.
                 match crate::udp::transport::UdpTransport::new(
-                    local_port,
+                    0,
                     peer_udp_addr,
                     Arc::clone(state),
                     false, // client side (outbound route)
                 ) {
                     Ok(transport) => {
+                        // Register the UDP sender so the delivery path can
+                        // route messages via UDP for this peer.
+                        {
+                            let mut senders = state.udp_senders.write().unwrap();
+                            senders.insert(conn_id, transport.cmd_tx());
+                        }
                         info!(
-                            local_port,
                             peer = %peer_udp_addr,
                             "UDP transport established for route peer"
                         );
@@ -430,8 +437,12 @@ fn connect_route(
 
     // --- Cleanup ---
     #[cfg(feature = "udp-transport")]
-    if let Some(ref transport) = _udp_transport {
-        transport.shutdown();
+    {
+        if let Some(ref transport) = _udp_transport {
+            transport.shutdown();
+        }
+        let mut senders = state.udp_senders.write().unwrap();
+        senders.remove(&conn_id);
     }
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();

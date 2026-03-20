@@ -999,6 +999,11 @@ pub(crate) struct ServerState {
     /// UDP port for binary cluster data plane transport.
     #[cfg(feature = "udp-transport")]
     pub cluster_udp_port: Option<u16>,
+    /// UDP transport senders keyed by route conn_id.
+    /// When a route sub's conn_id has an entry here, messages are sent via UDP
+    /// instead of TCP RMSG.
+    #[cfg(feature = "udp-transport")]
+    pub udp_senders: std::sync::RwLock<HashMap<u64, std::sync::mpsc::Sender<crate::udp::UdpCmd>>>,
     /// Registry of DirectWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
     pub gateway_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
@@ -1167,6 +1172,8 @@ impl ServerState {
             route_connect_tx: Mutex::new(None),
             #[cfg(feature = "udp-transport")]
             cluster_udp_port,
+            #[cfg(feature = "udp-transport")]
+            udp_senders: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "cluster")]
             cluster_seeds,
             #[cfg(feature = "gateway")]
@@ -1504,6 +1511,20 @@ impl LeafServer {
             None
         };
 
+        // Spawn UDP listener for inbound binary transport from cluster peers
+        #[cfg(feature = "udp-transport")]
+        let _udp_listener = if let Some(udp_port) = self.state.cluster_udp_port {
+            match crate::udp::transport::UdpListener::new(udp_port, Arc::clone(&self.state)) {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    error!(error = %e, port = udp_port, "failed to start UDP listener");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let workers = self.spawn_workers();
         let mut next_worker = 0usize;
 
@@ -1715,6 +1736,20 @@ impl LeafServer {
             Some(crate::route_conn::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
+        } else {
+            None
+        };
+
+        // Spawn UDP listener for inbound binary transport from cluster peers
+        #[cfg(feature = "udp-transport")]
+        let _udp_listener = if let Some(udp_port) = self.state.cluster_udp_port {
+            match crate::udp::transport::UdpListener::new(udp_port, Arc::clone(&self.state)) {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    error!(error = %e, port = udp_port, "failed to start UDP listener");
+                    None
+                }
+            }
         } else {
             None
         };

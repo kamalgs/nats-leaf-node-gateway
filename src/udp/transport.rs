@@ -16,7 +16,7 @@ use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstrea
 use crate::server::ServerState;
 use crate::sub_list::DirectWriter;
 
-use super::codec::{self, BatchEncoder, BATCH_HEADER_SIZE};
+use super::codec::{self, BatchEncoder};
 use super::UdpCmd;
 
 /// A UDP data channel to a single route peer.
@@ -298,6 +298,109 @@ fn handle_incoming_batch(data: &[u8], state: &ServerState, dirty_writers: &mut V
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// UdpListener — shared server-side enet Host accepting inbound connections
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of concurrent inbound enet peers.
+const MAX_PEERS: usize = 64;
+
+/// A shared server-side enet listener that binds on `cluster_udp_port` and
+/// accepts incoming connections from outbound `UdpTransport` clients.
+///
+/// Runs a service thread that polls enet for incoming packets, decodes binary
+/// batches, and delivers messages to local subscribers. Does not send messages
+/// (outbound transport handles that direction).
+pub(crate) struct UdpListener {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl UdpListener {
+    /// Bind on `port` and spawn the server-side enet service thread.
+    pub fn new(port: u16, state: Arc<ServerState>) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port)))?;
+        socket.set_nonblocking(true)?;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+
+        std::thread::Builder::new()
+            .name("udp-listener".into())
+            .spawn(move || {
+                if let Err(e) = run_listener(socket, state, thread_shutdown) {
+                    error!(error = %e, "UDP listener thread exited with error");
+                }
+            })?;
+
+        debug!(port, "UDP listener started");
+        Ok(Self { shutdown })
+    }
+
+    /// Signal shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for UdpListener {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Server-side enet service loop. Accepts connections and receives messages.
+fn run_listener(
+    socket: UdpSocket,
+    state: Arc<ServerState>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = rusty_enet::Host::new(
+        socket,
+        rusty_enet::HostSettings {
+            peer_limit: MAX_PEERS,
+            channel_limit: 1,
+            compressor: Some(Box::new(rusty_enet::RangeCoder::new())),
+            checksum: Some(Box::new(rusty_enet::crc32)),
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("enet listener creation failed: {e:?}"))?;
+
+    let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            host.flush();
+            debug!("UDP listener shutting down");
+            return Ok(());
+        }
+
+        while let Some(event) = host.service()? {
+            match event {
+                rusty_enet::Event::Connect { peer, .. } => {
+                    debug!(
+                        peer_id = peer.id().0,
+                        addr = ?peer.address(),
+                        "enet inbound peer connected"
+                    );
+                }
+                rusty_enet::Event::Disconnect { peer, .. } => {
+                    debug!(peer_id = peer.id().0, "enet inbound peer disconnected");
+                }
+                rusty_enet::Event::Receive { packet, .. } => {
+                    handle_incoming_batch(packet.data(), &state, &mut dirty_writers);
+                }
+            }
+        }
+
+        for w in dirty_writers.drain(..) {
+            w.notify();
+        }
+
+        std::thread::sleep(Duration::from_millis(SERVICE_POLL_MS));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +425,6 @@ mod tests {
     fn test_batch_size_calculation() {
         let encoder = BatchEncoder::with_capacity(256);
         // Empty batch = 3 bytes (header only).
-        assert_eq!(encoder.encoded_size(), BATCH_HEADER_SIZE);
+        assert_eq!(encoder.encoded_size(), codec::BATCH_HEADER_SIZE);
     }
 }
