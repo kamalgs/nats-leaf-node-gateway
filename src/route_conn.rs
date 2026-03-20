@@ -389,10 +389,50 @@ fn connect_route(
         })
         .expect("failed to spawn route writer");
 
+    // --- Spawn UDP transport if both sides support it ---
+    #[cfg(feature = "udp-transport")]
+    let _udp_transport = {
+        // Check if peer advertised a UDP port in their INFO.
+        let peer_udp_port = peer_info.udp_port;
+        let local_udp_port = state.cluster_udp_port;
+        match (local_udp_port, peer_udp_port) {
+            (Some(local_port), Some(remote_port)) => {
+                let peer_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
+                let peer_udp_addr: std::net::SocketAddr = format!("{peer_host}:{remote_port}")
+                    .parse()
+                    .map_err(|e| format!("invalid UDP peer address: {e}"))?;
+                match crate::udp::transport::UdpTransport::new(
+                    local_port,
+                    peer_udp_addr,
+                    Arc::clone(state),
+                    false, // client side (outbound route)
+                ) {
+                    Ok(transport) => {
+                        info!(
+                            local_port,
+                            peer = %peer_udp_addr,
+                            "UDP transport established for route peer"
+                        );
+                        Some(transport)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to start UDP transport, using TCP only");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    };
+
     // --- Run reader loop ---
     let result = run_route_reader(&tcp, &mut read_buf, conn_id, state, &direct_writer);
 
     // --- Cleanup ---
+    #[cfg(feature = "udp-transport")]
+    if let Some(ref transport) = _udp_transport {
+        transport.shutdown();
+    }
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
 
@@ -669,10 +709,19 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
         }
     };
 
+    #[cfg(feature = "udp-transport")]
+    let udp_port_json = if let Some(p) = state.cluster_udp_port {
+        format!(",\"udp_port\":{p}")
+    } else {
+        String::new()
+    };
+    #[cfg(not(feature = "udp-transport"))]
+    let udp_port_json = "";
+
     format!(
         "INFO {{\"server_id\":\"{}\",\"server_name\":\"{}\",\"version\":\"{}\",\
          \"host\":\"{}\",\"port\":{},\"max_payload\":{},\"proto\":1,\
-         \"cluster\":\"{}\",\"cluster_port\":{}{}}}\r\n",
+         \"cluster\":\"{}\",\"cluster_port\":{}{}{}}}\r\n",
         state.info.server_id,
         state.info.server_name,
         state.info.version,
@@ -682,6 +731,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
         cluster_name,
         cluster_port,
         connect_urls,
+        udp_port_json,
     )
 }
 

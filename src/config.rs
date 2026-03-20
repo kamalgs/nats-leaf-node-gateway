@@ -967,6 +967,10 @@ fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
                     }
                 }
             }
+            #[cfg(feature = "udp-transport")]
+            "udp_port" => {
+                config.cluster_udp_port = Some(as_u16(cval)?);
+            }
             _ => {
                 tracing::debug!("ignoring cluster key: {ckey}");
             }

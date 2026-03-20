@@ -58,6 +58,10 @@ pub struct ServerInfo {
     #[cfg(feature = "gateway")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_urls: Option<Vec<String>>,
+    /// UDP port for binary cluster data plane transport.
+    #[cfg(feature = "udp-transport")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_port: Option<u16>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────

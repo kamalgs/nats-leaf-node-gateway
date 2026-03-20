@@ -315,6 +315,10 @@ pub struct LeafServerConfig {
     /// Cluster name. All nodes in a cluster must use the same name.
     #[cfg(feature = "cluster")]
     pub cluster_name: Option<String>,
+    /// UDP port for binary cluster data plane transport.
+    /// When set, the UDP transport runs alongside the TCP control plane.
+    #[cfg(feature = "udp-transport")]
+    pub cluster_udp_port: Option<u16>,
     /// Port for gateway connections. When set, the server listens for
     /// inbound gateway connections from other clusters.
     #[cfg(feature = "gateway")]
@@ -615,6 +619,8 @@ impl Default for LeafServerConfig {
             cluster_seeds: Vec::new(),
             #[cfg(feature = "cluster")]
             cluster_name: None,
+            #[cfg(feature = "udp-transport")]
+            cluster_udp_port: None,
             #[cfg(feature = "gateway")]
             gateway_port: None,
             #[cfg(feature = "gateway")]
@@ -990,6 +996,9 @@ pub(crate) struct ServerState {
     /// are sent here to trigger outbound connections.
     #[cfg(feature = "cluster")]
     pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    /// UDP port for binary cluster data plane transport.
+    #[cfg(feature = "udp-transport")]
+    pub cluster_udp_port: Option<u16>,
     /// Registry of DirectWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
     pub gateway_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
@@ -1048,6 +1057,7 @@ impl ServerState {
         #[cfg(feature = "gateway")] gateway_port: Option<u16>,
         #[cfg(feature = "gateway")] gateway_name: Option<String>,
         #[cfg(feature = "gateway")] gateway_remotes: Vec<GatewayRemote>,
+        #[cfg(feature = "udp-transport")] cluster_udp_port: Option<u16>,
         #[cfg(feature = "accounts")] accounts: Vec<AccountConfig>,
     ) -> Self {
         #[cfg(feature = "cluster")]
@@ -1155,6 +1165,8 @@ impl ServerState {
             },
             #[cfg(feature = "cluster")]
             route_connect_tx: Mutex::new(None),
+            #[cfg(feature = "udp-transport")]
+            cluster_udp_port,
             #[cfg(feature = "cluster")]
             cluster_seeds,
             #[cfg(feature = "gateway")]
@@ -1313,6 +1325,8 @@ impl LeafServer {
                 config.gateway_name.clone(),
                 #[cfg(feature = "gateway")]
                 config.gateway_remotes.clone(),
+                #[cfg(feature = "udp-transport")]
+                config.cluster_udp_port,
                 #[cfg(feature = "accounts")]
                 config.accounts.clone(),
             )),

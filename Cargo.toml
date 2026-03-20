@@ -16,7 +16,7 @@ leaf = []      # Upstream hub connection support
 hub = []       # Inbound leaf node connection support
 cluster = []   # Full mesh route clustering support
 gateway = []   # Gateway inter-cluster traffic support
-udp-transport = ["cluster"]  # UDP binary transport for inter-cluster data plane
+udp-transport = ["cluster", "rusty_enet"]  # UDP binary transport for inter-cluster data plane
 accounts = []  # Multi-tenant per-account subject isolation
 
 [dependencies]
@@ -26,6 +26,7 @@ memchr = "2.4"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.104"
+rusty_enet = { version = "0.4", optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics = "0.24"
