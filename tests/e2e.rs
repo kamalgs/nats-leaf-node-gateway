@@ -1981,3 +1981,222 @@ async fn gateway_fan_out() {
     shutdown_a.store(true, Ordering::Release);
     shutdown_b.store(true, Ordering::Release);
 }
+
+// ── UDP binary transport tests ──────────────────────────────────────────────
+
+#[cfg(feature = "udp-transport")]
+fn spawn_cluster_node_udp(
+    client_port: u16,
+    cluster_port: u16,
+    udp_port: u16,
+    seeds: Vec<String>,
+    name: &str,
+) -> Arc<AtomicBool> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let reload = Arc::new(AtomicBool::new(false));
+
+    let config = LeafServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: client_port,
+        server_name: name.to_string(),
+        cluster_port: Some(cluster_port),
+        cluster_seeds: seeds,
+        cluster_name: Some("test-udp-cluster".to_string()),
+        cluster_udp_port: Some(udp_port),
+        ..Default::default()
+    };
+    let server = LeafServer::new(config);
+    std::thread::Builder::new()
+        .name(format!("udp-cluster-{}", name))
+        .spawn(move || {
+            let _ = server.run_until_shutdown(shutdown_clone, reload, None);
+        })
+        .expect("failed to spawn UDP cluster node thread");
+
+    shutdown
+}
+
+/// Basic two-node pub/sub with UDP transport enabled on both nodes.
+/// Messages should flow over the UDP data plane while the TCP control plane
+/// handles RS+/RS- subscription propagation.
+#[tokio::test]
+#[cfg(feature = "udp-transport")]
+async fn udp_transport_two_node_pub_sub() {
+    let port_a = free_port();
+    let cluster_port_a = free_port();
+    let udp_port_a = free_port();
+    let shutdown_a =
+        spawn_cluster_node_udp(port_a, cluster_port_a, udp_port_a, vec![], "udp-node-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cluster_port_b = free_port();
+    let udp_port_b = free_port();
+    let shutdown_b = spawn_cluster_node_udp(
+        port_b,
+        cluster_port_b,
+        udp_port_b,
+        vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
+        "udp-node-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    // Let route + UDP transport establish
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Client on Node A subscribes
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to node A failed");
+    let mut sub_a = client_a
+        .subscribe("udp.test")
+        .await
+        .expect("subscribe on A failed");
+
+    // Let subscription propagate via RS+ to Node B
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client on Node B publishes
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to node B failed");
+    client_b
+        .publish("udp.test", "hello-udp".into())
+        .await
+        .expect("publish on B failed");
+    client_b.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub_a.next())
+        .await
+        .expect("timed out waiting for UDP transport message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "udp.test");
+    assert_eq!(&msg.payload[..], b"hello-udp");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+}
+
+/// Reverse direction: publish on A, subscribe on B — verifies both
+/// outbound UDP transports work (A→B and B→A).
+#[tokio::test]
+#[cfg(feature = "udp-transport")]
+async fn udp_transport_reverse_direction() {
+    let port_a = free_port();
+    let cluster_port_a = free_port();
+    let udp_port_a = free_port();
+    let shutdown_a =
+        spawn_cluster_node_udp(port_a, cluster_port_a, udp_port_a, vec![], "udp-rev-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cluster_port_b = free_port();
+    let udp_port_b = free_port();
+    let shutdown_b = spawn_cluster_node_udp(
+        port_b,
+        cluster_port_b,
+        udp_port_b,
+        vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
+        "udp-rev-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Subscribe on B, publish on A
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to B failed");
+    let mut sub_b = client_b
+        .subscribe("udp.reverse")
+        .await
+        .expect("subscribe on B failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to A failed");
+    client_a
+        .publish("udp.reverse", "reverse-payload".into())
+        .await
+        .expect("publish on A failed");
+    client_a.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub_b.next())
+        .await
+        .expect("timed out waiting for reverse-direction UDP message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "udp.reverse");
+    assert_eq!(&msg.payload[..], b"reverse-payload");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+}
+
+/// Multiple messages with varying subjects — verifies batching and
+/// correct subject routing over UDP transport.
+#[tokio::test]
+#[cfg(feature = "udp-transport")]
+async fn udp_transport_multi_message() {
+    let port_a = free_port();
+    let cluster_port_a = free_port();
+    let udp_port_a = free_port();
+    let shutdown_a =
+        spawn_cluster_node_udp(port_a, cluster_port_a, udp_port_a, vec![], "udp-multi-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cluster_port_b = free_port();
+    let udp_port_b = free_port();
+    let shutdown_b = spawn_cluster_node_udp(
+        port_b,
+        cluster_port_b,
+        udp_port_b,
+        vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
+        "udp-multi-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to A failed");
+    let mut sub_foo = client_a
+        .subscribe("udp.foo")
+        .await
+        .expect("subscribe foo failed");
+    let mut sub_bar = client_a
+        .subscribe("udp.bar")
+        .await
+        .expect("subscribe bar failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to B failed");
+
+    let msg_count = 10;
+    for i in 0..msg_count {
+        let subj = if i % 2 == 0 { "udp.foo" } else { "udp.bar" };
+        client_b
+            .publish(subj, format!("msg-{i}").into())
+            .await
+            .expect("publish failed");
+    }
+    client_b.flush().await.expect("flush failed");
+
+    let foo_count = collect_msgs(&mut sub_foo, 2000).await;
+    let bar_count = collect_msgs(&mut sub_bar, 2000).await;
+
+    assert_eq!(foo_count, 5, "expected 5 foo messages");
+    assert_eq!(bar_count, 5, "expected 5 bar messages");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+}
