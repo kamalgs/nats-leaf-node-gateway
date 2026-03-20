@@ -29,6 +29,8 @@ pub(crate) mod leaf_handler;
 pub(crate) mod route_conn;
 #[cfg(feature = "cluster")]
 pub(crate) mod route_handler;
+#[cfg(feature = "udp-transport")]
+pub mod udp;
 
 #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
 pub use interest::SubjectMapping;

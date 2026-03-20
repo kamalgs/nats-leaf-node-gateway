@@ -393,6 +393,179 @@ mod proto_bench {
     }
 }
 
+mod udp_bench {
+    use criterion::{Criterion, Throughput};
+
+    #[cfg(feature = "udp-transport")]
+    use open_wire::udp::codec::{decode_batch, BatchEncoder};
+
+    /// Bench encoding a single 128B message into the binary format.
+    pub fn bench_binary_codec_encode(c: &mut Criterion) {
+        #[cfg(feature = "udp-transport")]
+        {
+            let mut group = c.benchmark_group("binary_codec");
+
+            let subject = b"test.subject";
+            let payload = vec![0u8; 128];
+
+            group.throughput(Throughput::Elements(1));
+
+            group.bench_function("encode_128b", |b| {
+                let mut enc = BatchEncoder::with_capacity(256);
+                b.iter(|| {
+                    enc.clear();
+                    enc.push(subject, None, None, &payload);
+                    let _ = enc.finish();
+                });
+            });
+
+            group.bench_function("encode_128b_reply", |b| {
+                let mut enc = BatchEncoder::with_capacity(256);
+                let reply = b"_INBOX.abc123";
+                b.iter(|| {
+                    enc.clear();
+                    enc.push(subject, Some(reply.as_slice()), None, &payload);
+                    let _ = enc.finish();
+                });
+            });
+
+            // Encode a batch of 10 messages (typical batch size).
+            group.throughput(Throughput::Elements(10));
+            group.bench_function("encode_batch_10x128b", |b| {
+                let mut enc = BatchEncoder::with_capacity(2048);
+                b.iter(|| {
+                    enc.clear();
+                    for _ in 0..10 {
+                        enc.push(subject, None, None, &payload);
+                    }
+                    let _ = enc.finish();
+                });
+            });
+
+            group.finish();
+        }
+        #[cfg(not(feature = "udp-transport"))]
+        let _ = c;
+    }
+
+    /// Bench decoding binary datagrams back into messages.
+    pub fn bench_binary_codec_decode(c: &mut Criterion) {
+        #[cfg(feature = "udp-transport")]
+        {
+            let mut group = c.benchmark_group("binary_codec");
+
+            let subject = b"test.subject";
+            let payload = vec![0u8; 128];
+
+            // Pre-encode a single message.
+            let mut enc = BatchEncoder::with_capacity(256);
+            enc.push(subject, None, None, &payload);
+            let single = enc.finish().to_vec();
+
+            group.throughput(Throughput::Elements(1));
+            group.bench_function("decode_128b", |b| {
+                b.iter(|| {
+                    let iter = decode_batch(&single).unwrap();
+                    for msg in iter {
+                        let _ = msg.unwrap();
+                    }
+                });
+            });
+
+            // Pre-encode a batch of 10 messages.
+            enc.clear();
+            for _ in 0..10 {
+                enc.push(subject, None, None, &payload);
+            }
+            let batch = enc.finish().to_vec();
+
+            group.throughput(Throughput::Elements(10));
+            group.bench_function("decode_batch_10x128b", |b| {
+                b.iter(|| {
+                    let iter = decode_batch(&batch).unwrap();
+                    for msg in iter {
+                        let _ = msg.unwrap();
+                    }
+                });
+            });
+
+            group.finish();
+        }
+        #[cfg(not(feature = "udp-transport"))]
+        let _ = c;
+    }
+
+    /// Side-by-side: binary encode vs text RMSG build for the same message.
+    pub fn bench_binary_vs_text(c: &mut Criterion) {
+        #[cfg(feature = "udp-transport")]
+        {
+            use open_wire::nats_proto;
+
+            let mut group = c.benchmark_group("binary_vs_text");
+
+            let subject = b"test.subject";
+            let payload = vec![0u8; 128];
+
+            group.throughput(Throughput::Elements(1));
+
+            // Binary encode.
+            group.bench_function("binary_encode_128b", |b| {
+                let mut enc = BatchEncoder::with_capacity(256);
+                b.iter(|| {
+                    enc.clear();
+                    enc.push(subject, None, None, &payload);
+                    let _ = enc.finish();
+                });
+            });
+
+            // Text RMSG build.
+            group.bench_function("text_rmsg_build_128b", |b| {
+                let mut builder = nats_proto::MsgBuilder::new();
+                b.iter(|| {
+                    let _ = builder.build_rmsg(
+                        subject,
+                        None,
+                        None,
+                        &payload,
+                        #[cfg(feature = "accounts")]
+                        b"$G",
+                    );
+                });
+            });
+
+            // With reply.
+            let reply = b"_INBOX.abc123";
+
+            group.bench_function("binary_encode_128b_reply", |b| {
+                let mut enc = BatchEncoder::with_capacity(256);
+                b.iter(|| {
+                    enc.clear();
+                    enc.push(subject, Some(reply.as_slice()), None, &payload);
+                    let _ = enc.finish();
+                });
+            });
+
+            group.bench_function("text_rmsg_build_128b_reply", |b| {
+                let mut builder = nats_proto::MsgBuilder::new();
+                b.iter(|| {
+                    let _ = builder.build_rmsg(
+                        subject,
+                        Some(reply.as_slice()),
+                        None,
+                        &payload,
+                        #[cfg(feature = "accounts")]
+                        b"$G",
+                    );
+                });
+            });
+
+            group.finish();
+        }
+        #[cfg(not(feature = "udp-transport"))]
+        let _ = c;
+    }
+}
+
 criterion_group!(
     benches,
     bench_subject_matches,
@@ -404,5 +577,8 @@ criterion_group!(
     proto_bench::bench_parse_pub,
     proto_bench::bench_build_msg,
     proto_bench::bench_parse_lmsg,
+    udp_bench::bench_binary_codec_encode,
+    udp_bench::bench_binary_codec_decode,
+    udp_bench::bench_binary_vs_text,
 );
 criterion_main!(benches);
