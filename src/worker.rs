@@ -233,6 +233,8 @@ pub(crate) struct ClientState {
     epoll_has_out: bool,
     /// When false, suppress delivery of the client's own published messages.
     echo: bool,
+    /// When true, send 503 no-responders status for request-reply with zero subscribers.
+    no_responders: bool,
     /// When this connection was accepted (for auth timeout).
     accepted_at: Instant,
     /// Last time activity was seen on this connection.
@@ -568,6 +570,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -644,6 +647,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -719,6 +723,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -794,6 +799,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -2141,6 +2147,8 @@ impl Worker {
                             let client = self.conns.get_mut(&conn_id).unwrap();
                             client.phase = ConnPhase::Active;
                             client.echo = connect_info.echo;
+                            client.no_responders =
+                                connect_info.no_responders && connect_info.headers;
                             client.permissions = perms;
                             #[cfg(feature = "accounts")]
                             {
@@ -2219,6 +2227,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2296,6 +2305,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2373,6 +2383,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2483,6 +2494,7 @@ impl Worker {
                                     write_buf: &mut client.write_buf,
                                     direct_writer: &client.direct_writer,
                                     echo: client.echo,
+                                    no_responders: client.no_responders,
                                     sub_count: &mut client.sub_count,
                                     #[cfg(feature = "leaf")]
                                     upstream_tx: &mut client.upstream_tx,
