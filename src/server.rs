@@ -1003,7 +1003,7 @@ pub(crate) struct ServerState {
     /// When a route sub's conn_id has an entry here, messages are sent via UDP
     /// instead of TCP RMSG.
     #[cfg(feature = "udp-transport")]
-    pub udp_senders: std::sync::RwLock<HashMap<u64, std::sync::mpsc::Sender<crate::udp::UdpCmd>>>,
+    pub udp_senders: std::sync::RwLock<HashMap<u64, crate::udp::UdpSender>>,
     /// Registry of DirectWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
     pub gateway_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,

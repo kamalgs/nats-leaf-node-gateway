@@ -414,7 +414,7 @@ fn connect_route(
                         // route messages via UDP for this peer.
                         {
                             let mut senders = state.udp_senders.write().unwrap();
-                            senders.insert(conn_id, transport.cmd_tx());
+                            senders.insert(conn_id, transport.sender());
                         }
                         info!(
                             peer = %peer_udp_addr,

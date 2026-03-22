@@ -152,7 +152,7 @@ fn deliver_to_sub_inner(
     #[cfg(feature = "accounts")] account_name: &[u8],
     #[cfg(feature = "udp-transport")] udp_senders: &std::sync::RwLockReadGuard<
         '_,
-        HashMap<u64, std::sync::mpsc::Sender<crate::udp::UdpCmd>>,
+        HashMap<u64, crate::udp::UdpSender>,
     >,
 ) {
     #[cfg(feature = "cluster")]
@@ -160,13 +160,11 @@ fn deliver_to_sub_inner(
         // If this route peer has a UDP transport, send via UDP binary protocol
         // instead of TCP RMSG.
         #[cfg(feature = "udp-transport")]
-        if let Some(tx) = udp_senders.get(&sub.conn_id) {
-            let _ = tx.send(crate::udp::UdpCmd::Send {
-                subject: Bytes::copy_from_slice(subject),
-                reply: reply.map(Bytes::copy_from_slice),
-                headers: headers.cloned(),
-                payload: Bytes::copy_from_slice(payload),
-            });
+        if let Some(sender) = udp_senders.get(&sub.conn_id) {
+            let hdr_bytes = headers.map(|h| h.to_bytes());
+            let msg = crate::udp::PackedUdpMsg::new(subject, reply, hdr_bytes.as_deref(), payload);
+            let _ = sender.tx.send(crate::udp::UdpCmd::Send(msg));
+            sender.notify();
             return;
         }
         sub.writer.write_rmsg(
@@ -390,13 +388,12 @@ pub(crate) fn deliver_to_subs_upstream_inner(
             }
             // If this route peer has a UDP transport, send via UDP.
             #[cfg(feature = "udp-transport")]
-            if let Some(tx) = udp_senders.get(&sub.conn_id) {
-                let _ = tx.send(crate::udp::UdpCmd::Send {
-                    subject: Bytes::copy_from_slice(subject),
-                    reply: reply.map(Bytes::copy_from_slice),
-                    headers: headers.cloned(),
-                    payload: Bytes::copy_from_slice(payload),
-                });
+            if let Some(sender) = udp_senders.get(&sub.conn_id) {
+                let hdr_bytes = headers.map(|h| h.to_bytes());
+                let msg =
+                    crate::udp::PackedUdpMsg::new(subject, reply, hdr_bytes.as_deref(), payload);
+                let _ = sender.tx.send(crate::udp::UdpCmd::Send(msg));
+                sender.notify();
                 delivered += 1;
                 return;
             }
