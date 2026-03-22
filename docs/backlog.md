@@ -38,18 +38,20 @@ Items marked ~~strikethrough~~ are already implemented.
 - ~~**NKey auth**~~ — NKey challenge-response authentication.
 - ~~**Per-user permissions**~~ — publish/subscribe allow/deny per user.
 - ~~**Auth timeout**~~ — disconnect clients that don't authenticate within a deadline.
-- **Accounts** — multi-tenant account isolation (non-goal for now, but noted for
-  completeness).
+- ~~**Accounts**~~ — multi-tenant account isolation with cross-account import/export.
 
 ## Performance Ideas
 
 - ~~**io_uring**~~ — replace epoll with io_uring for batched syscalls.
 - ~~**writev / vectored writes**~~ — coalesce messages into a single syscall.
+- ~~**Trie-based subject matching**~~ — replace wildcard `Vec` linear scan with a
+  trie for O(depth) matching. See PR #18.
 - **Connection affinity** — pin publisher and subscribers to the same worker.
-- **Trie-based subject matching** — replace wildcard `Vec` linear scan with a
-  trie or radix tree.
 - **NUMA-aware allocation** — bind workers to CPU cores, allocate from local memory.
 - **Lock-free DirectWriter** — replace `Mutex<BytesMut>` with a lock-free ring buffer.
+- **UDP binary transport** — raw UDP with GSO/GRO for inter-cluster data plane.
+  Explored on `feat/udp-binary-transport`; ~50-60% of TCP throughput on localhost/veth.
+  Needs real multi-node testing on physical NICs to evaluate GSO/GRO hardware offload.
 
 ## Overload Safeguards
 
@@ -64,10 +66,10 @@ Items marked ~~strikethrough~~ are already implemented.
 - ~~**Full-mesh clustering**~~ — route connections between peers using RS+/RS-/RMSG
   protocol. One-hop message forwarding, subscription propagation, 3-node clusters
   tested. See [ADR-010](adr/010-full-mesh-clustering.md).
-- **Duplicate route dedup** — reject inbound route connections from already-connected
-  server_id (currently connects but doesn't enforce uniqueness).
-- **Cluster gossip** — discover peers via INFO gossip (currently requires explicit seeds).
-- **Super-clusters / gateways** — cross-cluster routing (non-goal for now).
+- ~~**Duplicate route dedup**~~ — reject inbound route connections from already-connected
+  server_id.
+- ~~**Cluster gossip**~~ — discover peers via INFO gossip.
+- ~~**Super-clusters / gateways**~~ — cross-cluster routing via gateway protocol.
 - **Sharded clustering** — subject-prefix sharding for large clusters. See
   [ADR-007](adr/007-sharded-cluster-mode.md) for the design spike.
 
