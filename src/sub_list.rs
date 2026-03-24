@@ -747,6 +747,24 @@ impl SubList {
         (count, expired)
     }
 
+    pub fn has_any_subscriber(&self, subject: &str) -> bool {
+        // O(1) exact lookup
+        if let Some(subs) = self.exact.get(subject) {
+            if !subs.is_empty() {
+                return true;
+            }
+        }
+        // O(depth) trie traversal for wildcard matches, early exit on first hit
+        let mut found = false;
+        self.wild.for_each_match(subject, |_sub| {
+            if found {
+                return;
+            }
+            found = true;
+        });
+        found
+    }
+
     /// Returns true if the sublist has no subscriptions at all.
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.wild.is_empty()
@@ -1583,6 +1601,33 @@ mod tests {
         // Verify leaf subs are still in the list for matching
         let matches = sl.match_subject("foo");
         assert_eq!(matches.len(), 2); // client + leaf
+    }
+
+    #[test]
+    fn test_has_any_subscriber_exact() {
+        let mut sl = SubList::new();
+        assert!(!sl.has_any_subscriber("foo"));
+
+        sl.insert(test_sub(1, 1, "foo"));
+        assert!(sl.has_any_subscriber("foo"));
+        assert!(!sl.has_any_subscriber("bar"));
+    }
+
+    #[test]
+    fn test_has_any_subscriber_wildcard() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
+        sl.insert(test_sub(1, 2, "bar.>"));
+
+        assert!(sl.has_any_subscriber("foo.baz"));
+        assert!(sl.has_any_subscriber("bar.a.b"));
+        assert!(!sl.has_any_subscriber("qux"));
+    }
+
+    #[test]
+    fn test_has_any_subscriber_empty() {
+        let sl = SubList::new();
+        assert!(!sl.has_any_subscriber("anything"));
     }
 
     #[test]

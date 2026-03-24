@@ -34,6 +34,8 @@ pub(crate) struct ConnCtx<'a> {
     pub write_buf: &'a mut BytesMut,
     pub direct_writer: &'a DirectWriter,
     pub echo: bool,
+    /// When true, send 503 no-responders status for request-reply with zero subscribers.
+    pub no_responders: bool,
     pub sub_count: &'a mut usize,
     #[cfg(feature = "leaf")]
     pub upstream_tx: &'a mut Option<mpsc::Sender<UpstreamCmd>>,
