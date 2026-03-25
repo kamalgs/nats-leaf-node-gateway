@@ -187,3 +187,195 @@ impl std::fmt::Debug for DirectWriter {
         f.debug_struct("DirectWriter").finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clone_shares_buffer() {
+        let writer1 = DirectWriter::new_dummy();
+        let writer2 = writer1.clone();
+
+        writer1.write_msg(b"a", b"1", None, None, b"x");
+        writer2.write_msg(b"b", b"2", None, None, b"y");
+
+        let data = writer1.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert!(s.contains("MSG a 1 1\r\nx\r\n"));
+        assert!(s.contains("MSG b 2 1\r\ny\r\n"));
+    }
+
+    #[test]
+    fn test_batches_multiple_writes() {
+        let writer = DirectWriter::new_dummy();
+
+        writer.write_msg(b"a", b"1", None, None, b"one");
+        writer.write_msg(b"b", b"2", None, None, b"two");
+        writer.write_msg(b"c", b"3", None, None, b"three");
+
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(
+            s,
+            "MSG a 1 3\r\none\r\nMSG b 2 3\r\ntwo\r\nMSG c 3 5\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn test_drain_empty() {
+        let writer = DirectWriter::new_dummy();
+        assert!(writer.drain().is_none());
+    }
+
+    #[test]
+    fn test_drain_resets_buffer() {
+        let writer = DirectWriter::new_dummy();
+
+        writer.write_msg(b"a", b"1", None, None, b"x");
+        let _ = writer.drain().unwrap();
+
+        // Second drain should be empty
+        assert!(writer.drain().is_none());
+
+        // Write again — should work
+        writer.write_msg(b"b", b"2", None, None, b"y");
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG b 2 1\r\ny\r\n");
+    }
+
+    #[test]
+    fn test_notify_wakes() {
+        let writer = DirectWriter::new_dummy();
+        let writer2 = writer.clone();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            writer2.write_msg(b"test", b"1", None, None, b"hello");
+            writer2.notify();
+        });
+
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
+        assert!(ret > 0, "poll should have returned ready");
+        writer.consume_notify();
+
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test 1 5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_notify_stores_permit() {
+        let writer = DirectWriter::new_dummy();
+
+        writer.write_msg(b"test", b"1", None, None, b"early");
+        writer.notify();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 0) };
+        assert!(ret > 0, "poll should return immediately for stored notify");
+        writer.consume_notify();
+
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test 1 5\r\nearly\r\n");
+    }
+
+    #[test]
+    fn test_fast_producer_slow_consumer() {
+        let writer = DirectWriter::new_dummy();
+        let producer_writer = writer.clone();
+        let total_msgs = 10_000;
+
+        let producer = std::thread::spawn(move || {
+            for i in 0..total_msgs {
+                let payload = format!("msg{i}");
+                producer_writer.write_msg(b"test", b"1", None, None, payload.as_bytes());
+                producer_writer.notify();
+            }
+        });
+
+        let mut total_msgs_seen = 0usize;
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        loop {
+            while let Some(data) = writer.drain() {
+                let s = std::str::from_utf8(&data).unwrap();
+                total_msgs_seen += s.matches("MSG test 1").count();
+            }
+            if total_msgs_seen >= total_msgs {
+                break;
+            }
+            unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
+            writer.consume_notify();
+        }
+
+        producer.join().unwrap();
+        assert_eq!(total_msgs_seen, total_msgs);
+    }
+
+    #[test]
+    fn test_producer_finishes_before_consumer() {
+        let writer = DirectWriter::new_dummy();
+        let total_msgs = 1_000;
+
+        for i in 0..total_msgs {
+            let payload = format!("m{i}");
+            writer.write_msg(b"x", b"1", None, None, payload.as_bytes());
+        }
+        writer.notify();
+
+        let mut total_msgs_seen = 0usize;
+        let mut pfd = [libc::pollfd {
+            fd: writer.event_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        loop {
+            while let Some(data) = writer.drain() {
+                let s = std::str::from_utf8(&data).unwrap();
+                total_msgs_seen += s.matches("MSG x 1").count();
+            }
+            if total_msgs_seen >= total_msgs {
+                break;
+            }
+            let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 1000) };
+            if ret > 0 {
+                writer.consume_notify();
+            } else {
+                panic!("consumer hung! only received {total_msgs_seen}/{total_msgs} messages");
+            }
+        }
+        assert_eq!(total_msgs_seen, total_msgs);
+    }
+
+    #[test]
+    fn test_write_then_drain_clears_pending() {
+        let writer = DirectWriter::new_dummy();
+
+        assert!(!writer.has_pending.load(Ordering::Acquire));
+
+        writer.write_msg(b"test", b"1", None, None, b"data");
+        assert!(writer.has_pending.load(Ordering::Acquire));
+
+        let data = writer.drain().unwrap();
+        assert_eq!(&data[..], b"MSG test 1 4\r\ndata\r\n");
+        // has_pending is still true — the worker is responsible for clearing it
+        assert!(writer.has_pending.load(Ordering::Acquire));
+    }
+}

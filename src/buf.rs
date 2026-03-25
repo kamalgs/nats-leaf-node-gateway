@@ -168,6 +168,7 @@ pub(crate) struct ServerConn {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 impl ServerConn {
     pub(crate) fn from_tcp(stream: TcpStream, buf_config: BufConfig) -> io::Result<Self> {
         let writer_stream = stream.try_clone()?;
@@ -370,143 +371,7 @@ mod tests {
         assert!(s.contains("\"server_id\":\"test\""));
     }
 
-    #[test]
-    fn test_parse_ping_pong() {
-        let (mut conn, mut client) = make_pair();
-        client.write_all(b"PING\r\nPONG\r\n").unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        assert!(matches!(op, ClientOp::Ping));
-        let op = conn.read_client_op().unwrap().unwrap();
-        assert!(matches!(op, ClientOp::Pong));
-    }
-
-    #[test]
-    fn test_parse_sub() {
-        let (mut conn, mut client) = make_pair();
-        client.write_all(b"SUB test.subject 1\r\n").unwrap();
-        client.write_all(b"SUB test.queue myqueue 2\r\n").unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        match op {
-            ClientOp::Subscribe {
-                sid,
-                subject,
-                queue_group,
-            } => {
-                assert_eq!(sid, 1);
-                assert_eq!(&subject[..], b"test.subject");
-                assert!(queue_group.is_none());
-            }
-            _ => panic!("expected Subscribe"),
-        }
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        match op {
-            ClientOp::Subscribe {
-                sid,
-                subject,
-                queue_group,
-            } => {
-                assert_eq!(sid, 2);
-                assert_eq!(&subject[..], b"test.queue");
-                assert_eq!(&queue_group.unwrap()[..], b"myqueue");
-            }
-            _ => panic!("expected Subscribe"),
-        }
-    }
-
-    #[test]
-    fn test_parse_pub() {
-        let (mut conn, mut client) = make_pair();
-        client
-            .write_all(b"PUB test.subject 5\r\nhello\r\n")
-            .unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        match op {
-            ClientOp::Publish {
-                subject,
-                payload,
-                respond,
-                headers,
-                ..
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert_eq!(payload.as_ref(), b"hello");
-                assert!(respond.is_none());
-                assert!(headers.is_none());
-            }
-            _ => panic!("expected Publish"),
-        }
-    }
-
-    #[test]
-    fn test_parse_pub_with_reply() {
-        let (mut conn, mut client) = make_pair();
-        client
-            .write_all(b"PUB test.subject reply.to 5\r\nhello\r\n")
-            .unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        match op {
-            ClientOp::Publish {
-                subject,
-                respond,
-                payload,
-                ..
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert_eq!(&respond.unwrap()[..], b"reply.to");
-                assert_eq!(payload.as_ref(), b"hello");
-            }
-            _ => panic!("expected Publish"),
-        }
-    }
-
-    #[test]
-    fn test_parse_connect() {
-        let (mut conn, mut client) = make_pair();
-        client
-            .write_all(
-                b"CONNECT {\"verbose\":false,\"pedantic\":false,\"lang\":\"rust\",\"version\":\"0.1\",\"protocol\":1,\"echo\":true,\"headers\":true,\"no_responders\":true,\"tls_required\":false}\r\n",
-            )
-            .unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        match op {
-            ClientOp::Connect(info) => {
-                assert_eq!(info.lang, "rust");
-                assert!(info.headers);
-            }
-            _ => panic!("expected Connect"),
-        }
-    }
-
-    #[test]
-    fn test_parse_unsub() {
-        let (mut conn, mut client) = make_pair();
-        client.write_all(b"UNSUB 1\r\n").unwrap();
-        client.write_all(b"UNSUB 2 5\r\n").unwrap();
-        client.flush().unwrap();
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        assert!(matches!(op, ClientOp::Unsubscribe { sid: 1, max: None }));
-
-        let op = conn.read_client_op().unwrap().unwrap();
-        assert!(matches!(
-            op,
-            ClientOp::Unsubscribe {
-                sid: 2,
-                max: Some(5)
-            }
-        ));
-    }
+    // Client protocol parsing tests live in nats_proto.rs.
 
     #[test]
     fn test_send_msg() {
@@ -531,210 +396,13 @@ mod tests {
         assert_eq!(s, "MSG test.sub 1 reply.to 2\r\nhi\r\n");
     }
 
-    #[test]
-    fn test_eof_returns_none() {
-        let (mut conn, client) = make_pair();
-        drop(client);
-        let result = conn.read_client_op().unwrap();
-        assert!(result.is_none());
-    }
-
-    // --- LeafConn tests ---
+    // Leaf protocol parsing tests live in nats_proto.rs.
 
     #[cfg(feature = "leaf")]
     fn make_leaf_pair() -> (crate::leaf_conn::LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
         let conn = crate::leaf_conn::LeafConn::new(server, BufConfig::default());
         (conn, client)
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_info() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"INFO {\"server_id\":\"hub1\",\"max_payload\":1048576}\r\n")
-            .unwrap();
-        hub.flush().unwrap();
-
-        let op = conn.read_leaf_op().unwrap().unwrap();
-        match op {
-            LeafOp::Info(info) => {
-                assert_eq!(info.server_id, "hub1");
-                assert_eq!(info.max_payload, 1048576);
-            }
-            _ => panic!("expected Info"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_ping_pong_ok_err() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"PING\r\nPONG\r\n+OK\r\n-ERR 'test error'\r\n")
-            .unwrap();
-        hub.flush().unwrap();
-
-        assert!(matches!(
-            conn.read_leaf_op().unwrap().unwrap(),
-            LeafOp::Ping
-        ));
-        assert!(matches!(
-            conn.read_leaf_op().unwrap().unwrap(),
-            LeafOp::Pong
-        ));
-        assert!(matches!(conn.read_leaf_op().unwrap().unwrap(), LeafOp::Ok));
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::Err(msg) => assert_eq!(msg, "test error"),
-            _ => panic!("expected Err"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_ls_sub_unsub() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"LS+ foo.bar\r\nLS+ baz.* myqueue\r\nLS- foo.bar\r\n")
-            .unwrap();
-        hub.flush().unwrap();
-
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafSub { subject, queue } => {
-                assert_eq!(&subject[..], b"foo.bar");
-                assert!(queue.is_none());
-            }
-            _ => panic!("expected LeafSub"),
-        }
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafSub { subject, queue } => {
-                assert_eq!(&subject[..], b"baz.*");
-                assert_eq!(&queue.unwrap()[..], b"myqueue");
-            }
-            _ => panic!("expected LeafSub"),
-        }
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafUnsub { subject, queue } => {
-                assert_eq!(&subject[..], b"foo.bar");
-                assert!(queue.is_none());
-            }
-            _ => panic!("expected LeafUnsub"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_lmsg_no_reply_no_headers() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"LMSG test.subject 5\r\nhello\r\n").unwrap();
-        hub.flush().unwrap();
-
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafMsg {
-                subject,
-                reply,
-                headers,
-                payload,
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert!(reply.is_none());
-                assert!(headers.is_none());
-                assert_eq!(payload.as_ref(), b"hello");
-            }
-            _ => panic!("expected LeafMsg"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_lmsg_with_reply() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        hub.write_all(b"LMSG test.subject reply.to 5\r\nhello\r\n")
-            .unwrap();
-        hub.flush().unwrap();
-
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafMsg {
-                subject,
-                reply,
-                headers,
-                payload,
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert_eq!(&reply.unwrap()[..], b"reply.to");
-                assert!(headers.is_none());
-                assert_eq!(payload.as_ref(), b"hello");
-            }
-            _ => panic!("expected LeafMsg"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_lmsg_with_headers() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        let hdr = b"NATS/1.0\r\nX-Key: val\r\n\r\n";
-        let payload = b"data";
-        let hdr_len = hdr.len();
-        let total_len = hdr_len + payload.len();
-        let line = format!("LMSG test.subject {hdr_len} {total_len}\r\n");
-        hub.write_all(line.as_bytes()).unwrap();
-        hub.write_all(hdr).unwrap();
-        hub.write_all(payload).unwrap();
-        hub.write_all(b"\r\n").unwrap();
-        hub.flush().unwrap();
-
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafMsg {
-                subject,
-                reply,
-                headers,
-                payload,
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert!(reply.is_none());
-                let hdrs = headers.unwrap();
-                assert_eq!(
-                    hdrs.get("X-Key").map(|v| v.to_string()),
-                    Some("val".to_string())
-                );
-                assert_eq!(payload.as_ref(), b"data");
-            }
-            _ => panic!("expected LeafMsg"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
-    fn test_leaf_parse_lmsg_with_reply_and_headers() {
-        let (mut conn, mut hub) = make_leaf_pair();
-        let hdr = b"NATS/1.0\r\nFoo: bar\r\n\r\n";
-        let payload = b"body";
-        let hdr_len = hdr.len();
-        let total_len = hdr_len + payload.len();
-        let line = format!("LMSG test.subject reply.inbox {hdr_len} {total_len}\r\n");
-        hub.write_all(line.as_bytes()).unwrap();
-        hub.write_all(hdr).unwrap();
-        hub.write_all(payload).unwrap();
-        hub.write_all(b"\r\n").unwrap();
-        hub.flush().unwrap();
-
-        match conn.read_leaf_op().unwrap().unwrap() {
-            LeafOp::LeafMsg {
-                subject,
-                reply,
-                headers,
-                payload,
-            } => {
-                assert_eq!(&subject[..], b"test.subject");
-                assert_eq!(&reply.unwrap()[..], b"reply.inbox");
-                let hdrs = headers.unwrap();
-                assert_eq!(
-                    hdrs.get("Foo").map(|v| v.to_string()),
-                    Some("bar".to_string())
-                );
-                assert_eq!(payload.as_ref(), b"body");
-            }
-            _ => panic!("expected LeafMsg"),
-        }
     }
 
     #[test]
@@ -786,15 +454,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "leaf")]
-    fn test_leaf_eof_returns_none() {
-        let (mut conn, hub) = make_leaf_pair();
-        drop(hub);
-        let result = conn.read_leaf_op().unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_connect_no_creds() {
         let (mut conn, mut hub) = make_leaf_pair();
         conn.send_leaf_connect("test-leaf", true, None).unwrap();
@@ -830,5 +489,92 @@ mod tests {
         assert!(s.contains("\"user\":\"admin\""));
         assert!(s.contains("\"pass\":\"secret\""));
         assert!(s.contains("\"auth_token\":\"tok\""));
+    }
+
+    // --- LeafConn split test ---
+
+    #[test]
+    #[cfg(feature = "leaf")]
+    fn test_leaf_split_produces_independent_halves() {
+        let (conn, mut hub) = make_leaf_pair();
+        let (mut reader, mut writer) = conn.split().unwrap();
+
+        // Writer can send without blocking the reader
+        writer.send_leaf_sub(b"foo.>").unwrap();
+        writer.flush().unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = hub.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"LS+ foo.>\r\n");
+
+        // Hub sends data that reader can receive independently
+        hub.write_all(b"PING\r\n").unwrap();
+        hub.flush().unwrap();
+
+        let op = reader.read_leaf_op().unwrap().unwrap();
+        assert!(matches!(op, crate::nats_proto::LeafOp::Ping));
+    }
+
+    // --- AdaptiveBuf tests ---
+
+    #[test]
+    fn test_adaptive_buf_grows_on_full_read() {
+        let mut ab = AdaptiveBuf::new(DEFAULT_MAX_BUF);
+        assert_eq!(ab.target_cap, DEFAULT_START_BUF); // 512
+
+        // Simulate a full read (n >= target_cap)
+        ab.after_read(DEFAULT_START_BUF);
+        assert_eq!(ab.target_cap, DEFAULT_START_BUF * 2); // 1024
+    }
+
+    #[test]
+    fn test_adaptive_buf_shrinks_after_short_reads() {
+        let mut ab = AdaptiveBuf::new(DEFAULT_MAX_BUF);
+        // Grow first so we have room to shrink
+        ab.after_read(DEFAULT_START_BUF); // 512 → 1024
+        ab.after_read(1024); // 1024 → 2048
+        assert_eq!(ab.target_cap, 2048);
+
+        // Short reads (< target_cap / 2 = 1024): need SHORTS_TO_SHRINK+1 consecutive
+        ab.after_read(100); // shorts = 1
+        ab.after_read(100); // shorts = 2
+        assert_eq!(ab.target_cap, 2048); // not yet
+        ab.after_read(100); // shorts = 3, triggers shrink
+        assert_eq!(ab.target_cap, 1024);
+    }
+
+    #[test]
+    fn test_adaptive_buf_floor_at_min() {
+        let mut ab = AdaptiveBuf::new(DEFAULT_MAX_BUF);
+        // Force target_cap to minimum by repeated short reads
+        ab.target_cap = DEFAULT_MIN_BUF * 2; // 128
+        for _ in 0..10 {
+            ab.after_read(0);
+        }
+        assert_eq!(ab.target_cap, DEFAULT_MIN_BUF); // 64, never below
+    }
+
+    #[test]
+    fn test_adaptive_buf_ceiling_at_max() {
+        let max = 1024;
+        let mut ab = AdaptiveBuf::new(max);
+        // Repeatedly simulate full reads
+        for _ in 0..20 {
+            let cap = ab.target_cap;
+            ab.after_read(cap);
+        }
+        assert_eq!(ab.target_cap, max);
+    }
+
+    #[test]
+    fn test_adaptive_buf_try_shrink_when_empty() {
+        let mut ab = AdaptiveBuf::new(DEFAULT_MAX_BUF);
+        // Manually inflate the buffer capacity way beyond target
+        ab.buf.reserve(65536);
+        assert!(ab.buf.capacity() > ab.target_cap * 2);
+
+        // try_shrink should reallocate when buffer is empty
+        ab.try_shrink();
+        assert!(ab.buf.capacity() <= ab.target_cap * 2);
     }
 }

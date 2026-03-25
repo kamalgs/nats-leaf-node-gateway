@@ -596,3 +596,310 @@ pub(crate) fn deliver_cross_account_upstream(
 
     all_expired
 }
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "hub")]
+    fn test_server_state() -> crate::server::ServerState {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+
+        crate::server::ServerState {
+            info: Default::default(),
+            auth: Default::default(),
+            ping_interval_ms: AtomicU64::new(0),
+            auth_timeout_ms: AtomicU64::new(0),
+            max_pings_outstanding: AtomicU32::new(0),
+            #[cfg(not(feature = "accounts"))]
+            subs: std::sync::RwLock::new(crate::sub_list::SubList::new()),
+            #[cfg(feature = "accounts")]
+            account_subs: vec![std::sync::RwLock::new(crate::sub_list::SubList::new())],
+            #[cfg(feature = "accounts")]
+            account_registry: crate::server::AccountRegistry::new(&[]),
+            #[cfg(feature = "accounts")]
+            account_configs: Vec::new(),
+            #[cfg(feature = "accounts")]
+            cross_account_routes: Vec::new(),
+            #[cfg(feature = "accounts")]
+            reverse_imports: Vec::new(),
+            #[cfg(feature = "leaf")]
+            upstreams: std::sync::RwLock::new(Vec::new()),
+            #[cfg(feature = "leaf")]
+            upstream_txs: std::sync::RwLock::new(Vec::new()),
+            has_subs: AtomicBool::new(false),
+            buf_config: Default::default(),
+            next_cid: AtomicU64::new(1),
+            tls_config: None,
+            active_connections: AtomicU64::new(0),
+            max_connections: AtomicUsize::new(0),
+            max_payload: AtomicUsize::new(1024 * 1024),
+            max_control_line: AtomicUsize::new(4096),
+            max_subscriptions: AtomicUsize::new(0),
+            stats: Default::default(),
+            leafnode_port: None,
+            leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            leaf_auth: Default::default(),
+            #[cfg(feature = "cluster")]
+            route_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "cluster")]
+            cluster_port: None,
+            #[cfg(feature = "cluster")]
+            cluster_name: None,
+            #[cfg(feature = "cluster")]
+            cluster_seeds: Vec::new(),
+            #[cfg(feature = "cluster")]
+            route_peers: std::sync::Mutex::new(crate::server::RoutePeerRegistry {
+                connected: HashMap::new(),
+                known_urls: std::collections::HashSet::new(),
+            }),
+            #[cfg(feature = "cluster")]
+            route_connect_tx: std::sync::Mutex::new(None),
+            #[cfg(feature = "gateway")]
+            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "gateway")]
+            gateway_port: None,
+            #[cfg(feature = "gateway")]
+            gateway_name: None,
+            #[cfg(feature = "gateway")]
+            gateway_remotes: Vec::new(),
+            #[cfg(feature = "gateway")]
+            gateway_peers: std::sync::Mutex::new(crate::server::GatewayPeerRegistry {
+                connected: HashMap::new(),
+                known_urls: std::collections::HashSet::new(),
+            }),
+            #[cfg(feature = "gateway")]
+            gateway_connect_tx: std::sync::Mutex::new(None),
+            #[cfg(feature = "gateway")]
+            gateway_reply_prefix: b"_GR_.abc.def.".to_vec(),
+            #[cfg(feature = "gateway")]
+            cached_gateway_info: std::sync::Mutex::new(String::new()),
+            #[cfg(feature = "gateway")]
+            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "gateway")]
+            has_gateway_interest: AtomicBool::new(false),
+            #[cfg(feature = "worker-affinity")]
+            affinity: crate::server::AffinityMap::new(1),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "hub")]
+    fn test_propagate_leaf_filters_by_publish_permission() {
+        use std::sync::Arc;
+
+        use crate::server::{Permission, Permissions};
+        use crate::sub_list::DirectWriter;
+
+        let state = test_server_state();
+        let writer = DirectWriter::new_dummy();
+
+        let perms = Permissions {
+            publish: Permission {
+                allow: Vec::new(),
+                deny: vec!["secret.>".to_string()],
+            },
+            subscribe: Permission {
+                allow: Vec::new(),
+                deny: Vec::new(),
+            },
+        };
+        state
+            .leaf_writers
+            .write()
+            .unwrap()
+            .insert(100, (writer.clone(), Some(Arc::new(perms))));
+
+        // Denied subject should not be sent
+        super::propagate_leaf_interest(&state, b"secret.data", None, true);
+        assert!(
+            writer.drain().is_none(),
+            "denied subject should not be sent"
+        );
+
+        // Allowed subject should be sent
+        super::propagate_leaf_interest(&state, b"public.data", None, true);
+        let data = writer.drain().unwrap();
+        assert_eq!(&data[..], b"LS+ public.data\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "hub")]
+    fn test_propagate_leaf_sends_to_all_leaves() {
+        use crate::sub_list::DirectWriter;
+
+        let state = test_server_state();
+        let w1 = DirectWriter::new_dummy();
+        let w2 = DirectWriter::new_dummy();
+
+        {
+            let mut writers = state.leaf_writers.write().unwrap();
+            writers.insert(1, (w1.clone(), None));
+            writers.insert(2, (w2.clone(), None));
+        }
+
+        super::propagate_leaf_interest(&state, b"foo.bar", None, true);
+
+        assert_eq!(&w1.drain().unwrap()[..], b"LS+ foo.bar\r\n");
+        assert_eq!(&w2.drain().unwrap()[..], b"LS+ foo.bar\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "hub")]
+    fn test_send_existing_subs_filters_permissions() {
+        use std::sync::Arc;
+
+        use crate::server::{Permission, Permissions};
+        use crate::sub_list::{DirectWriter, Subscription};
+
+        let state = test_server_state();
+
+        {
+            #[cfg(not(feature = "accounts"))]
+            let mut subs = state.subs.write().unwrap();
+            #[cfg(feature = "accounts")]
+            let mut subs = state.account_subs[0].write().unwrap();
+            subs.insert(Subscription::new_dummy(
+                1,
+                1,
+                "public.events".to_string(),
+                None,
+            ));
+            subs.insert(Subscription::new_dummy(
+                1,
+                2,
+                "secret.data".to_string(),
+                None,
+            ));
+        }
+
+        let writer = DirectWriter::new_dummy();
+        let perms = Permissions {
+            publish: Permission {
+                allow: Vec::new(),
+                deny: vec!["secret.>".to_string()],
+            },
+            subscribe: Permission {
+                allow: Vec::new(),
+                deny: Vec::new(),
+            },
+        };
+
+        super::send_existing_subs(&state, &writer, &Some(Arc::new(perms)));
+
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert!(
+            s.contains("LS+ public.events\r\n"),
+            "allowed sub should be sent"
+        );
+        assert!(!s.contains("secret.data"), "denied sub should be filtered");
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_rewrite_gateway_reply_adds_prefix() {
+        let state = test_server_state_gw();
+        let result = super::rewrite_gateway_reply(Some(b"reply"), &state);
+        let r = result.unwrap();
+        assert!(r.starts_with(b"_GR_."));
+        assert!(r.ends_with(b".reply"));
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_rewrite_gateway_reply_no_double_rewrite() {
+        let state = test_server_state_gw();
+        let already = b"_GR_.abc.def.reply";
+        let result = super::rewrite_gateway_reply(Some(already), &state);
+        let r = result.unwrap();
+        assert_eq!(
+            &r[..],
+            already,
+            "already-prefixed reply should not be rewritten"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "gateway")]
+    fn test_unwrap_gateway_reply_strips_prefix() {
+        let reply = bytes::Bytes::from_static(b"_GR_.abc.def.my.reply");
+        let unwrapped = super::unwrap_gateway_reply_bytes(&reply);
+        assert_eq!(&unwrapped[..], b"my.reply");
+    }
+
+    #[cfg(feature = "gateway")]
+    fn test_server_state_gw() -> crate::server::ServerState {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
+
+        crate::server::ServerState {
+            info: Default::default(),
+            auth: Default::default(),
+            ping_interval_ms: AtomicU64::new(0),
+            auth_timeout_ms: AtomicU64::new(0),
+            max_pings_outstanding: AtomicU32::new(0),
+            #[cfg(not(feature = "accounts"))]
+            subs: std::sync::RwLock::new(crate::sub_list::SubList::new()),
+            #[cfg(feature = "accounts")]
+            account_subs: vec![std::sync::RwLock::new(crate::sub_list::SubList::new())],
+            #[cfg(feature = "accounts")]
+            account_registry: crate::server::AccountRegistry::new(&[]),
+            #[cfg(feature = "accounts")]
+            account_configs: Vec::new(),
+            #[cfg(feature = "accounts")]
+            cross_account_routes: Vec::new(),
+            #[cfg(feature = "accounts")]
+            reverse_imports: Vec::new(),
+            #[cfg(feature = "leaf")]
+            upstreams: std::sync::RwLock::new(Vec::new()),
+            #[cfg(feature = "leaf")]
+            upstream_txs: std::sync::RwLock::new(Vec::new()),
+            has_subs: AtomicBool::new(false),
+            buf_config: Default::default(),
+            next_cid: AtomicU64::new(1),
+            tls_config: None,
+            active_connections: AtomicU64::new(0),
+            max_connections: AtomicUsize::new(0),
+            max_payload: AtomicUsize::new(1024 * 1024),
+            max_control_line: AtomicUsize::new(4096),
+            max_subscriptions: AtomicUsize::new(0),
+            stats: Default::default(),
+            #[cfg(feature = "hub")]
+            leafnode_port: None,
+            #[cfg(feature = "hub")]
+            leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "hub")]
+            leaf_auth: Default::default(),
+            #[cfg(feature = "cluster")]
+            route_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "cluster")]
+            cluster_port: None,
+            #[cfg(feature = "cluster")]
+            cluster_name: None,
+            #[cfg(feature = "cluster")]
+            cluster_seeds: Vec::new(),
+            #[cfg(feature = "cluster")]
+            route_peers: std::sync::Mutex::new(crate::server::RoutePeerRegistry {
+                connected: HashMap::new(),
+                known_urls: std::collections::HashSet::new(),
+            }),
+            #[cfg(feature = "cluster")]
+            route_connect_tx: std::sync::Mutex::new(None),
+            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            gateway_port: None,
+            gateway_name: None,
+            gateway_remotes: Vec::new(),
+            gateway_peers: std::sync::Mutex::new(crate::server::GatewayPeerRegistry {
+                connected: HashMap::new(),
+                known_urls: std::collections::HashSet::new(),
+            }),
+            gateway_connect_tx: std::sync::Mutex::new(None),
+            gateway_reply_prefix: b"_GR_.abc.def.".to_vec(),
+            cached_gateway_info: std::sync::Mutex::new(String::new()),
+            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            has_gateway_interest: AtomicBool::new(false),
+            #[cfg(feature = "worker-affinity")]
+            affinity: crate::server::AffinityMap::new(1),
+        }
+    }
+}

@@ -1124,7 +1124,7 @@ pub(crate) struct ServerState {
     /// just to check emptiness.
     pub has_subs: AtomicBool,
     pub buf_config: BufConfig,
-    next_cid: AtomicU64,
+    pub(crate) next_cid: AtomicU64,
     /// TLS configuration for client connections. `None` = plaintext.
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
     /// Global count of active client connections (across all workers).
