@@ -8,18 +8,18 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, HandleResult, WorkerCtx};
-#[cfg(feature = "gateway")]
-use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
-#[cfg(feature = "hub")]
-use crate::handler::{propagate_leaf_sub, propagate_leaf_unsub};
-#[cfg(feature = "cluster")]
-use crate::handler::{propagate_route_sub, propagate_route_unsub};
 use crate::nats_proto::{self, ClientOp};
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account;
+#[cfg(feature = "gateway")]
+use crate::propagation::propagate_gateway_interest;
+#[cfg(feature = "hub")]
+use crate::propagation::propagate_leaf_interest;
+#[cfg(feature = "cluster")]
+use crate::propagation::propagate_route_interest;
 use crate::sub_list::Subscription;
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
@@ -168,28 +168,31 @@ impl ClientHandler {
 
         // Propagate LS+ to inbound leaf connections.
         #[cfg(feature = "hub")]
-        propagate_leaf_sub(
+        propagate_leaf_interest(
             wctx.state,
             subject_str.as_bytes(),
             leaf_queue.as_deref().map(|q| q.as_bytes()),
+            true,
         );
 
         // Propagate RS+ to inbound route connections.
         #[cfg(feature = "cluster")]
-        propagate_route_sub(
+        propagate_route_interest(
             wctx.state,
             subject_str.as_bytes(),
             queue_group.as_deref(),
+            true,
             #[cfg(feature = "accounts")]
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
 
         // Propagate RS+ to gateway connections.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(
+        propagate_gateway_interest(
             wctx.state,
             subject_str.as_bytes(),
             queue_group.as_deref(),
+            true,
             #[cfg(feature = "accounts")]
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
@@ -211,19 +214,21 @@ impl ClientHandler {
                             }
                         }
                         #[cfg(feature = "hub")]
-                        propagate_leaf_sub(wctx.state, ri.src_pattern.as_bytes(), None);
+                        propagate_leaf_interest(wctx.state, ri.src_pattern.as_bytes(), None, true);
                         #[cfg(feature = "cluster")]
-                        propagate_route_sub(
+                        propagate_route_interest(
                             wctx.state,
                             ri.src_pattern.as_bytes(),
                             None,
+                            true,
                             src_acct_name,
                         );
                         #[cfg(feature = "gateway")]
-                        propagate_gateway_sub(
+                        propagate_gateway_interest(
                             wctx.state,
                             ri.src_pattern.as_bytes(),
                             None,
+                            true,
                             src_acct_name,
                         );
                     }
@@ -292,24 +297,27 @@ impl ClientHandler {
                     )
                     .decrement(1.0);
                     #[cfg(feature = "hub")]
-                    propagate_leaf_unsub(
+                    propagate_leaf_interest(
                         wctx.state,
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
+                        false,
                     );
                     #[cfg(feature = "cluster")]
-                    propagate_route_unsub(
+                    propagate_route_interest(
                         wctx.state,
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
+                        false,
                         #[cfg(feature = "accounts")]
                         wctx.state.account_name(conn.account_id).as_bytes(),
                     );
                     #[cfg(feature = "gateway")]
-                    propagate_gateway_unsub(
+                    propagate_gateway_interest(
                         wctx.state,
                         removed.subject.as_bytes(),
                         removed.queue.as_deref().map(|q| q.as_bytes()),
+                        false,
                         #[cfg(feature = "accounts")]
                         wctx.state.account_name(conn.account_id).as_bytes(),
                     );
@@ -361,24 +369,27 @@ impl ClientHandler {
                 )
                 .decrement(1.0);
                 #[cfg(feature = "hub")]
-                propagate_leaf_unsub(
+                propagate_leaf_interest(
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
+                    false,
                 );
                 #[cfg(feature = "cluster")]
-                propagate_route_unsub(
+                propagate_route_interest(
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
+                    false,
                     #[cfg(feature = "accounts")]
                     wctx.state.account_name(conn.account_id).as_bytes(),
                 );
                 #[cfg(feature = "gateway")]
-                propagate_gateway_unsub(
+                propagate_gateway_interest(
                     wctx.state,
                     removed.subject.as_bytes(),
                     removed.queue.as_deref().map(|q| q.as_bytes()),
+                    false,
                     #[cfg(feature = "accounts")]
                     wctx.state.account_name(conn.account_id).as_bytes(),
                 );
@@ -510,7 +521,7 @@ impl ClientHandler {
 
         // Forward to optimistic gateways when no gateway sub matched.
         #[cfg(feature = "gateway")]
-        crate::handler::forward_to_optimistic_gateways(
+        crate::propagation::forward_to_optimistic_gateways(
             wctx,
             &subject,
             subject_str,
@@ -576,11 +587,23 @@ fn propagate_reverse_unsub(
                     }
                 }
                 #[cfg(feature = "hub")]
-                propagate_leaf_unsub(wctx.state, ri.src_pattern.as_bytes(), None);
+                propagate_leaf_interest(wctx.state, ri.src_pattern.as_bytes(), None, false);
                 #[cfg(feature = "cluster")]
-                propagate_route_unsub(wctx.state, ri.src_pattern.as_bytes(), None, src_acct_name);
+                propagate_route_interest(
+                    wctx.state,
+                    ri.src_pattern.as_bytes(),
+                    None,
+                    false,
+                    src_acct_name,
+                );
                 #[cfg(feature = "gateway")]
-                propagate_gateway_unsub(wctx.state, ri.src_pattern.as_bytes(), None, src_acct_name);
+                propagate_gateway_interest(
+                    wctx.state,
+                    ri.src_pattern.as_bytes(),
+                    None,
+                    false,
+                    src_acct_name,
+                );
             }
         }
     }

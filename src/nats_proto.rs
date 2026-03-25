@@ -171,7 +171,6 @@ pub enum ClientOp {
     },
     Unsubscribe {
         sid: u64,
-        #[allow(dead_code)]
         max: Option<u64>,
     },
 }
@@ -550,12 +549,10 @@ pub enum LeafOp {
     Pong,
     Ok,
     Err(String),
-    #[allow(dead_code)]
     LeafSub {
         subject: Bytes,
         queue: Option<Bytes>,
     },
-    #[allow(dead_code)]
     LeafUnsub {
         subject: Bytes,
         queue: Option<Bytes>,

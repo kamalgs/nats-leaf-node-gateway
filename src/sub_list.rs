@@ -1,188 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
-use crate::types::HeaderMap;
-
-use crate::nats_proto::MsgBuilder;
-
-/// Create a Linux eventfd for notification.
-pub(crate) fn create_eventfd() -> OwnedFd {
-    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
-    assert!(
-        fd >= 0,
-        "eventfd creation failed: {}",
-        std::io::Error::last_os_error()
-    );
-    unsafe { OwnedFd::from_raw_fd(fd) }
-}
-
-/// A shared write buffer + eventfd pair for zero-channel message delivery.
-///
-/// Instead of sending `ClientMsg` structs through an mpsc channel (which costs
-/// atomic ops + linked-list push + task wake per message), the upstream reader
-/// formats MSG/HMSG wire bytes directly into this shared buffer. The worker
-/// thread is notified via a shared eventfd to flush the buffer to TCP.
-///
-/// Multiple DirectWriters on the same worker share one eventfd, so fan-out
-/// to N connections on one worker costs only 1 eventfd write.
-#[derive(Clone)]
-pub(crate) struct DirectWriter {
-    buf: Arc<Mutex<BytesMut>>,
-    event_fd: Arc<OwnedFd>,
-    has_pending: Arc<AtomicBool>,
-    /// Pre-built MsgBuilder for formatting — kept per-writer to avoid allocation.
-    msg_builder: Arc<Mutex<MsgBuilder>>,
-}
-
-impl DirectWriter {
-    /// Create a DirectWriter with an externally-owned eventfd (shared by worker).
-    pub(crate) fn new(
-        buf: Arc<Mutex<BytesMut>>,
-        has_pending: Arc<AtomicBool>,
-        event_fd: Arc<OwnedFd>,
-    ) -> Self {
-        Self {
-            buf,
-            has_pending,
-            event_fd,
-            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-        }
-    }
-
-    /// Create a standalone DirectWriter with its own eventfd (for tests/benchmarks).
-    pub(crate) fn new_dummy() -> Self {
-        let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
-        let has_pending = Arc::new(AtomicBool::new(false));
-        let event_fd = Arc::new(create_eventfd());
-        Self {
-            buf,
-            has_pending,
-            event_fd,
-            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-        }
-    }
-
-    /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
-    pub(crate) fn write_msg(
-        &self,
-        subject: &[u8],
-        sid_bytes: &[u8],
-        reply: Option<&[u8]>,
-        headers: Option<&HeaderMap>,
-        payload: &[u8],
-    ) {
-        let mut builder = self.msg_builder.lock().unwrap();
-        let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
-        let mut buf = self.buf.lock().unwrap();
-        buf.extend_from_slice(data);
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
-    }
-
-    /// Format and append an LMSG to the shared buffer (for leaf node delivery).
-    #[cfg(any(feature = "leaf", feature = "hub"))]
-    pub(crate) fn write_lmsg(
-        &self,
-        subject: &[u8],
-        reply: Option<&[u8]>,
-        headers: Option<&HeaderMap>,
-        payload: &[u8],
-    ) {
-        let mut builder = self.msg_builder.lock().unwrap();
-        let data = builder.build_lmsg(subject, reply, headers, payload);
-        let mut buf = self.buf.lock().unwrap();
-        buf.extend_from_slice(data);
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
-    }
-
-    /// Format and append an RMSG to the shared buffer (for route/gateway delivery).
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
-    pub(crate) fn write_rmsg(
-        &self,
-        subject: &[u8],
-        reply: Option<&[u8]>,
-        headers: Option<&HeaderMap>,
-        payload: &[u8],
-        #[cfg(feature = "accounts")] account: &[u8],
-    ) {
-        let mut builder = self.msg_builder.lock().unwrap();
-        let data = builder.build_rmsg(
-            subject,
-            reply,
-            headers,
-            payload,
-            #[cfg(feature = "accounts")]
-            account,
-        );
-        let mut buf = self.buf.lock().unwrap();
-        buf.extend_from_slice(data);
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
-    }
-
-    /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS-/RS+ lines).
-    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-    pub(crate) fn write_raw(&self, data: &[u8]) {
-        let mut buf = self.buf.lock().unwrap();
-        buf.extend_from_slice(data);
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
-    }
-
-    /// Notify the worker thread that there is data to flush.
-    /// Writes 1 to the eventfd — wakes epoll_wait() on the worker thread.
-    /// Multiple writers sharing one eventfd collapse into a single wake.
-    pub(crate) fn notify(&self) {
-        let val: u64 = 1;
-        unsafe {
-            libc::write(
-                self.event_fd.as_raw_fd(),
-                &val as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
-    }
-
-    /// Drain all buffered data. Returns `None` if buffer was empty.
-    #[cfg(any(test, feature = "cluster", feature = "gateway"))]
-    pub(crate) fn drain(&self) -> Option<BytesMut> {
-        let mut buf = self.buf.lock().unwrap();
-        if buf.is_empty() {
-            None
-        } else {
-            Some(buf.split())
-        }
-    }
-
-    /// Get the raw fd of the eventfd.
-    pub(crate) fn event_raw_fd(&self) -> std::os::fd::RawFd {
-        self.event_fd.as_raw_fd()
-    }
-
-    /// Read the eventfd to reset it after poll() returns POLLIN.
-    #[cfg(test)]
-    pub(crate) fn consume_notify(&self) {
-        let mut val: u64 = 0;
-        unsafe {
-            libc::read(
-                self.event_fd.as_raw_fd(),
-                &mut val as *mut u64 as *mut libc::c_void,
-                8,
-            );
-        }
-    }
-}
-
-impl std::fmt::Debug for DirectWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectWriter").finish()
-    }
-}
+pub(crate) use crate::direct_writer::{create_eventfd, DirectWriter};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -770,7 +591,6 @@ impl SubList {
         self.exact.is_empty() && self.wild.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn unique_subjects(&self) -> HashSet<&str> {
         let mut subjects: HashSet<&str> = self.exact.keys().map(|s| s.as_str()).collect();
         self.wild.for_each_sub(|sub| {
@@ -1136,260 +956,7 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    // --- DirectWriter tests ---
-
-    #[test]
-    #[cfg(any(feature = "leaf", feature = "hub"))]
-    fn test_direct_writer_formats_lmsg() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_lmsg(b"test.sub", None, None, b"hello");
-
-        let data = writer.drain().expect("should have data");
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "LMSG test.sub 5\r\nhello\r\n");
-    }
-
-    #[test]
-    #[cfg(any(feature = "leaf", feature = "hub"))]
-    fn test_direct_writer_formats_lmsg_with_reply() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_lmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "LMSG test.sub reply.to 2\r\nhi\r\n");
-    }
-
-    #[test]
-    fn test_direct_writer_formats_msg() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_msg(b"test.sub", b"1", None, None, b"hello");
-
-        let data = writer.drain().expect("should have data");
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "MSG test.sub 1 5\r\nhello\r\n");
-    }
-
-    #[test]
-    fn test_direct_writer_formats_msg_with_reply() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_msg(b"test.sub", b"42", Some(b"reply.to"), None, b"hi");
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "MSG test.sub 42 reply.to 2\r\nhi\r\n");
-    }
-
-    #[test]
-    fn test_direct_writer_formats_hmsg_with_headers() {
-        let writer = DirectWriter::new_dummy();
-
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Key", "val".into());
-
-        writer.write_msg(b"test.sub", b"1", None, Some(&headers), b"data");
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert!(s.starts_with("HMSG test.sub 1 "));
-        assert!(s.contains("X-Key: val"));
-        assert!(s.ends_with("data\r\n"));
-    }
-
-    #[test]
-    fn test_direct_writer_batches_multiple_writes() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_msg(b"a", b"1", None, None, b"one");
-        writer.write_msg(b"b", b"2", None, None, b"two");
-        writer.write_msg(b"c", b"3", None, None, b"three");
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(
-            s,
-            "MSG a 1 3\r\none\r\nMSG b 2 3\r\ntwo\r\nMSG c 3 5\r\nthree\r\n"
-        );
-    }
-
-    #[test]
-    fn test_direct_writer_drain_empty() {
-        let writer = DirectWriter::new_dummy();
-        assert!(writer.drain().is_none());
-    }
-
-    #[test]
-    fn test_direct_writer_drain_resets_buffer() {
-        let writer = DirectWriter::new_dummy();
-
-        writer.write_msg(b"a", b"1", None, None, b"x");
-        let _ = writer.drain().unwrap();
-
-        // Second drain should be empty
-        assert!(writer.drain().is_none());
-
-        // Write again — should work
-        writer.write_msg(b"b", b"2", None, None, b"y");
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "MSG b 2 1\r\ny\r\n");
-    }
-
-    #[test]
-    fn test_direct_writer_clone_shares_buffer() {
-        let writer1 = DirectWriter::new_dummy();
-        let writer2 = writer1.clone();
-
-        writer1.write_msg(b"a", b"1", None, None, b"x");
-        writer2.write_msg(b"b", b"2", None, None, b"y");
-
-        let data = writer1.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        // Both messages should be in the same buffer
-        assert!(s.contains("MSG a 1 1\r\nx\r\n"));
-        assert!(s.contains("MSG b 2 1\r\ny\r\n"));
-    }
-
-    #[test]
-    fn test_direct_writer_notify_wakes() {
-        let writer = DirectWriter::new_dummy();
-        let writer2 = writer.clone();
-
-        // Spawn a thread that writes and notifies after a short delay
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            writer2.write_msg(b"test", b"1", None, None, b"hello");
-            writer2.notify();
-        });
-
-        // Wait for notification using poll
-        let mut pfd = [libc::pollfd {
-            fd: writer.event_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
-        assert!(ret > 0, "poll should have returned ready");
-        writer.consume_notify();
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "MSG test 1 5\r\nhello\r\n");
-    }
-
-    #[test]
-    fn test_direct_writer_notify_stores_permit() {
-        let writer = DirectWriter::new_dummy();
-
-        // Notify BEFORE waiting — the eventfd counter should be stored
-        writer.write_msg(b"test", b"1", None, None, b"early");
-        writer.notify();
-
-        // Small delay to ensure eventfd is written
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // poll should return immediately because eventfd is ready
-        let mut pfd = [libc::pollfd {
-            fd: writer.event_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 0) };
-        assert!(ret > 0, "poll should return immediately for stored notify");
-        writer.consume_notify();
-
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "MSG test 1 5\r\nearly\r\n");
-    }
-
-    /// Simulate the producer/consumer pattern used in the server:
-    /// a fast producer writes many messages, consumer must receive all of them.
-    /// Uses the correct drain-before-wait pattern that avoids the lost-notify race.
-    #[test]
-    fn test_direct_writer_fast_producer_slow_consumer() {
-        let writer = DirectWriter::new_dummy();
-        let producer_writer = writer.clone();
-        let total_msgs = 10_000;
-
-        // Producer: write all messages rapidly (all at once, simulating burst)
-        let producer = std::thread::spawn(move || {
-            for i in 0..total_msgs {
-                let payload = format!("msg{i}");
-                producer_writer.write_msg(b"test", b"1", None, None, payload.as_bytes());
-                producer_writer.notify();
-            }
-        });
-
-        // Consumer: drain-before-wait pattern (matches worker event loop)
-        let mut total_msgs_seen = 0usize;
-        let mut pfd = [libc::pollfd {
-            fd: writer.event_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        loop {
-            // Always check buffer first before blocking
-            while let Some(data) = writer.drain() {
-                let s = std::str::from_utf8(&data).unwrap();
-                total_msgs_seen += s.matches("MSG test 1").count();
-            }
-            if total_msgs_seen >= total_msgs {
-                break;
-            }
-            unsafe { libc::poll(pfd.as_mut_ptr(), 1, 5000) };
-            writer.consume_notify();
-        }
-
-        producer.join().unwrap();
-        assert_eq!(total_msgs_seen, total_msgs);
-    }
-
-    /// Test the race where producer finishes before consumer starts draining.
-    /// This catches the lost-notify bug: all notify() calls collapse into one
-    /// eventfd counter, consumer must drain without relying on future notifications.
-    #[test]
-    fn test_direct_writer_producer_finishes_before_consumer() {
-        let writer = DirectWriter::new_dummy();
-        let total_msgs = 1_000;
-
-        // Producer writes everything synchronously (no yield points)
-        for i in 0..total_msgs {
-            let payload = format!("m{i}");
-            writer.write_msg(b"x", b"1", None, None, payload.as_bytes());
-        }
-        writer.notify(); // single notify at end
-
-        // Consumer: must get all messages even though notify was called once
-        // The drain-before-wait pattern handles this.
-        let mut total_msgs_seen = 0usize;
-        let mut pfd = [libc::pollfd {
-            fd: writer.event_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        loop {
-            while let Some(data) = writer.drain() {
-                let s = std::str::from_utf8(&data).unwrap();
-                total_msgs_seen += s.matches("MSG x 1").count();
-            }
-            if total_msgs_seen >= total_msgs {
-                break;
-            }
-            // Use timeout to detect hang (would fail without drain-before-wait)
-            let ret = unsafe { libc::poll(pfd.as_mut_ptr(), 1, 1000) };
-            if ret > 0 {
-                writer.consume_notify();
-            } else {
-                panic!("consumer hung! only received {total_msgs_seen}/{total_msgs} messages");
-            }
-        }
-        assert_eq!(total_msgs_seen, total_msgs);
-    }
+    // DirectWriter behavioral tests live in direct_writer.rs.
 
     // --- Queue group tests ---
 
@@ -1670,58 +1237,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
-    fn test_direct_writer_write_raw() {
-        let writer = DirectWriter::new_dummy();
-        // No data yet
-        assert!(writer.drain().is_none());
-
-        writer.write_raw(b"LS+ foo\r\n");
-        let data = writer.drain().unwrap();
-        assert_eq!(&data[..], b"LS+ foo\r\n");
-
-        // Multiple raw writes accumulate
-        writer.write_raw(b"LS+ bar\r\n");
-        writer.write_raw(b"LS- baz\r\n");
-        let data = writer.drain().unwrap();
-        assert_eq!(&data[..], b"LS+ bar\r\nLS- baz\r\n");
-    }
-
-    #[test]
-    #[cfg(feature = "cluster")]
-    fn test_direct_writer_formats_rmsg() {
-        let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(
-            b"test.sub",
-            None,
-            None,
-            b"hello",
-            #[cfg(feature = "accounts")]
-            b"$G",
-        );
-        let data = writer.drain().expect("should have data");
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "RMSG $G test.sub 5\r\nhello\r\n");
-    }
-
-    #[test]
-    #[cfg(feature = "cluster")]
-    fn test_direct_writer_formats_rmsg_with_reply() {
-        let writer = DirectWriter::new_dummy();
-        writer.write_rmsg(
-            b"test.sub",
-            Some(b"reply.to"),
-            None,
-            b"hi",
-            #[cfg(feature = "accounts")]
-            b"$G",
-        );
-        let data = writer.drain().unwrap();
-        let s = std::str::from_utf8(&data).unwrap();
-        assert_eq!(s, "RMSG $G test.sub reply.to 2\r\nhi\r\n");
-    }
-
-    #[test]
     fn test_set_unsub_max_wildcard() {
         let mut sl = SubList::new();
         sl.insert(test_sub(1, 1, "foo.*"));
@@ -1734,179 +1249,48 @@ mod tests {
         assert_eq!(expired.len(), 1);
     }
 
-    // --- WildTrie tests ---
+    // --- SubList wildcard spec tests (via public API) ---
 
     #[test]
-    fn test_trie_insert_and_match_star() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
+    fn test_wildcard_star_matches_one_level() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
 
-        let mut matched = Vec::new();
-        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
+        let matches = sl.match_subject("foo.bar");
+        assert_eq!(matches.len(), 1);
 
-        matched.clear();
-        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty(), "* should not match multiple tokens");
+        let matches = sl.match_subject("foo.bar.baz");
+        assert!(matches.is_empty(), "* should not match multiple levels");
     }
 
     #[test]
-    fn test_trie_insert_and_match_gt() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.>"));
+    fn test_wildcard_gt_matches_all_levels() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.>"));
 
-        let mut matched = Vec::new();
-        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
+        let one = sl.match_subject("foo.bar");
+        assert_eq!(one.len(), 1);
 
-        matched.clear();
-        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
+        let two = sl.match_subject("foo.bar.baz");
+        assert_eq!(two.len(), 1);
 
-        matched.clear();
-        trie.for_each_match("foo", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty(), "> requires at least one token");
+        let none = sl.match_subject("foo");
+        assert!(
+            none.is_empty(),
+            "> requires at least one token after prefix"
+        );
     }
 
     #[test]
-    fn test_trie_gt_only() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, ">"));
+    fn test_wildcard_no_false_positives() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
 
-        let mut matched = Vec::new();
-        trie.for_each_match("anything", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
+        let matches = sl.match_subject("bar.baz");
+        assert!(matches.is_empty(), "foo.* should not match bar.baz");
 
-        matched.clear();
-        trie.for_each_match("a.b.c", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
-    }
-
-    #[test]
-    fn test_trie_star_gt_combined() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*.>"));
-
-        let mut matched = Vec::new();
-        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
-
-        matched.clear();
-        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty(), "*.> needs at least 2 tokens after foo");
-    }
-
-    #[test]
-    fn test_trie_multiple_patterns() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
-        trie.insert(test_sub(2, 1, "foo.>"));
-        trie.insert(test_sub(3, 1, "*.bar"));
-
-        let mut matched = Vec::new();
-        trie.for_each_match("foo.bar", |sub| matched.push(sub.conn_id));
-        matched.sort();
-        assert_eq!(matched, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn test_trie_remove() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
-        trie.insert(test_sub(2, 1, "foo.>"));
-
-        let removed = trie.remove(1, 1);
-        assert!(removed.is_some());
-        assert_eq!(removed.unwrap().subject, "foo.*");
-        assert_eq!(trie.len, 1);
-
-        let mut matched = Vec::new();
-        trie.for_each_match("foo.bar", |sub| matched.push(sub.conn_id));
-        assert_eq!(matched, vec![2]);
-    }
-
-    #[test]
-    fn test_trie_remove_gt() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.>"));
-
-        let removed = trie.remove(1, 1);
-        assert!(removed.is_some());
-        assert!(trie.is_empty());
-    }
-
-    #[test]
-    fn test_trie_remove_conn() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
-        trie.insert(test_sub(1, 2, "bar.>"));
-        trie.insert(test_sub(2, 1, "baz.*"));
-
-        let removed = trie.remove_conn(1);
-        assert_eq!(removed.len(), 2);
-        assert_eq!(trie.len, 1);
-
-        let mut matched = Vec::new();
-        trie.for_each_match("baz.qux", |sub| matched.push(sub.conn_id));
-        assert_eq!(matched, vec![2]);
-    }
-
-    #[test]
-    fn test_trie_find() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
-        trie.insert(test_sub(2, 1, "bar.>"));
-
-        let found = trie.find(1, 1);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().subject, "foo.*");
-
-        let found = trie.find(2, 1);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().subject, "bar.>");
-
-        assert!(trie.find(3, 1).is_none());
-    }
-
-    #[test]
-    fn test_trie_for_each_sub() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "foo.*"));
-        trie.insert(test_sub(2, 1, "bar.>"));
-        trie.insert(test_sub(3, 1, "*.baz"));
-
-        let mut subjects = Vec::new();
-        trie.for_each_sub(|sub| subjects.push(sub.subject.clone()));
-        subjects.sort();
-        assert_eq!(subjects, vec!["*.baz", "bar.>", "foo.*"]);
-    }
-
-    #[test]
-    fn test_trie_multi_level_star() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "*.*.*"));
-
-        let mut matched = Vec::new();
-        trie.for_each_match("a.b.c", |sub| matched.push(sub.sid));
-        assert_eq!(matched, vec![1]);
-
-        matched.clear();
-        trie.for_each_match("a.b", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn test_trie_no_false_positives() {
-        let mut trie = WildTrie::default();
-        trie.insert(test_sub(1, 1, "orders.*"));
-
-        let mut matched = Vec::new();
-        trie.for_each_match("events.created", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty());
-
-        matched.clear();
-        trie.for_each_match("orders", |sub| matched.push(sub.sid));
-        assert!(matched.is_empty(), "* requires exactly one more token");
+        let matches = sl.match_subject("foo");
+        assert!(matches.is_empty(), "foo.* should not match bare foo");
     }
 
     #[cfg(feature = "accounts")]

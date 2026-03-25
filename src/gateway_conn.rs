@@ -18,12 +18,11 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account_upstream;
-use crate::handler::{
-    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, unwrap_gateway_reply_bytes,
-};
+use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstream};
 use crate::nats_proto::{self, GatewayOp, MsgBuilder};
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account_upstream;
+use crate::propagation::unwrap_gateway_reply_bytes;
 use crate::server::{
     GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
     GATEWAY_MAX_NI_BEFORE_SWITCH,

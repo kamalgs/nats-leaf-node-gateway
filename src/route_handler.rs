@@ -8,15 +8,15 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account;
+use crate::buf::RouteOp;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
-#[cfg(feature = "gateway")]
-use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
 use crate::nats_proto;
-use crate::protocol::RouteOp;
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account;
+#[cfg(feature = "gateway")]
+use crate::propagation::propagate_gateway_interest;
 use crate::sub_list::Subscription;
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
@@ -189,10 +189,11 @@ impl RouteHandler {
 
         // Propagate RS+ to gateway peers.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(
+        propagate_gateway_interest(
             wctx.state,
             subject_str.as_bytes(),
             queue.as_deref(),
+            true,
             #[cfg(feature = "accounts")]
             wctx.state.account_name(account_id).as_bytes(),
         );
@@ -253,10 +254,11 @@ impl RouteHandler {
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
             #[cfg(feature = "gateway")]
-            propagate_gateway_unsub(
+            propagate_gateway_interest(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                false,
                 #[cfg(feature = "accounts")]
                 wctx.state.account_name(account_id).as_bytes(),
             );
@@ -310,7 +312,7 @@ impl RouteHandler {
 
         // Forward to optimistic gateways when no gateway sub matched.
         #[cfg(feature = "gateway")]
-        crate::handler::forward_to_optimistic_gateways(
+        crate::propagation::forward_to_optimistic_gateways(
             wctx,
             &subject,
             subject_str,

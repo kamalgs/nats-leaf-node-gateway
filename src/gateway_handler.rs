@@ -11,16 +11,14 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{
-    bytes_to_str, deliver_to_subs, unwrap_gateway_reply_bytes, ConnCtx, ConnExt, HandleResult,
-    WorkerCtx,
-};
+use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account;
+use crate::propagation::unwrap_gateway_reply_bytes;
 use crate::sub_list::Subscription;
 
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
