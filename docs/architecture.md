@@ -63,19 +63,26 @@ Features marked `[leaf]` require the `leaf` Cargo feature; `[hub]` requires
 | File | Purpose | Key Types | Feature |
 |------|---------|-----------|---------|
 | `lib.rs` | Public API re-exports | `LeafServer`, `LeafServerConfig` | — |
+| `config.rs` | Go nats-server `.conf` file parser | `load_config` | — |
 | `server.rs` | Accept loop, worker spawning, shutdown | `LeafServer`, `ServerState` | — |
 | `worker.rs` | Per-thread epoll event loop | `Worker`, `ClientState`, `ConnPhase` | — |
+| `nats_proto.rs` | Zero-copy protocol parser and message builder | `ClientOp`, `LeafOp`, `MsgBuilder` | `leaf\|hub`* |
+| `sub_list.rs` | Subscription storage, wildcard matching | `SubList`, `Subscription` | — |
+| `direct_writer.rs` | Shared buffer + eventfd fan-out delivery | `DirectWriter` | — |
 | `handler.rs` | Shared handler types and delivery | `ConnCtx`, `WorkerCtx`, `ConnExt` | — |
+| `propagation.rs` | Interest propagation (LS+/LS-, RS+/RS-) | propagate functions | — |
 | `client_handler.rs` | Client protocol dispatch | `ClientHandler` | — |
 | `leaf_handler.rs` | Inbound leaf protocol dispatch | `LeafHandler` | `hub` |
-| `protocol.rs` | Connection I/O wrappers, adaptive buffers | `ServerConn`, `LeafConn`, `AdaptiveBuf` | `leaf`* |
-| `nats_proto.rs` | Zero-copy protocol parser and message builder | `ClientOp`, `LeafOp`, `MsgBuilder` | `leaf\|hub`* |
-| `sub_list.rs` | Subscription storage and fan-out | `SubList`, `Subscription`, `DirectWriter` | — |
+| `leaf_conn.rs` | Leaf connection I/O wrappers | `LeafConn`, `LeafReader`, `LeafWriter` | `leaf` |
+| `buf.rs` | Adaptive buffers, connection I/O | `AdaptiveBuf`, `BufConfig`, `ServerConn` | — |
 | `upstream.rs` | Hub connection (reader + writer threads) | `Upstream`, `UpstreamCmd` | `leaf` |
 | `interest.rs` | Interest collapse + subject mapping pipeline | `InterestPipeline` | `leaf` |
 | `route_handler.rs` | Route protocol dispatch (RS+/RS-/RMSG) | `RouteHandler` | `cluster` |
 | `route_conn.rs` | Outbound route connection manager | `RouteConnManager` | `cluster` |
-| `config.rs` | Go nats-server `.conf` file parser | `load_config` | — |
+| `gateway_handler.rs` | Gateway protocol dispatch | `GatewayHandler` | `gateway` |
+| `gateway_conn.rs` | Outbound gateway connection manager | `GatewayConnManager` | `gateway` |
+| `websocket.rs` | HTTP upgrade handshake, WS frame codec | — | — |
+| `types.rs` | ServerInfo, ConnectInfo, HeaderMap | — | — |
 
 \* These modules are always compiled but individual types/functions within
 them are gated behind the indicated features.
@@ -205,9 +212,9 @@ and the worker epoll loop (inbound, multiplexed like client connections).
 `for_each_match(subject, callback)` avoids allocation by invoking a closure
 on each match rather than collecting into a `Vec`.
 
-Each `Subscription` holds a `DirectWriter` that points to the subscriber's
-shared buffer. Fan-out is lock → memcpy → unlock per subscriber, with a
-single eventfd notification per remote worker.
+Each `Subscription` holds a `DirectWriter` (defined in `direct_writer.rs`)
+that points to the subscriber's shared buffer. Fan-out is lock → memcpy →
+unlock per subscriber, with a single eventfd notification per remote worker.
 
 ## See Also
 
