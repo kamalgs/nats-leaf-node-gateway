@@ -4,11 +4,14 @@
 //! Routes messages between local clients, optionally bridges traffic to an
 //! upstream NATS hub, and can form full-mesh clusters with peer nodes.
 
+pub(crate) mod buf;
 pub mod config;
+pub(crate) mod direct_writer;
 #[cfg(feature = "leaf")]
 pub(crate) mod interest;
+#[cfg(feature = "leaf")]
+pub(crate) mod leaf_conn;
 pub mod nats_proto;
-pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
 pub mod types;
@@ -25,6 +28,7 @@ pub(crate) mod gateway_handler;
 pub(crate) mod handler;
 #[cfg(feature = "hub")]
 pub(crate) mod leaf_handler;
+pub(crate) mod propagation;
 #[cfg(feature = "cluster")]
 pub(crate) mod route_conn;
 #[cfg(feature = "cluster")]

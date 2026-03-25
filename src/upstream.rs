@@ -9,13 +9,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream};
 use crate::interest::InterestPipeline;
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account_upstream;
 use crate::types::HeaderMap;
 
-use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter, UpstreamConnectCreds};
+use crate::buf::LeafOp;
+use crate::leaf_conn::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 use crate::server::{HubCredentials, ServerState};
 use crate::sub_list::DirectWriter;
 
@@ -30,7 +31,6 @@ pub(crate) enum UpstreamCmd {
         headers: Option<HeaderMap>,
         payload: Bytes,
     },
-    #[allow(dead_code)]
     Pong,
     /// Signals the writer thread to shut down.
     Shutdown,

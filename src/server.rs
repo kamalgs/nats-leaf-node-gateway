@@ -24,7 +24,7 @@ use tracing::{error, info, warn};
 
 use crate::types::{ConnectInfo, ServerInfo};
 
-use crate::protocol::BufConfig;
+use crate::buf::BufConfig;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use crate::sub_list::DirectWriter;
 use crate::sub_list::SubList;

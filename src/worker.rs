@@ -17,22 +17,22 @@ use bytes::{Buf, BufMut, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "cluster")]
+use crate::buf::RouteOp;
+use crate::buf::{AdaptiveBuf, ClientOp};
 use crate::client_handler::ClientHandler;
 #[cfg(feature = "gateway")]
 use crate::gateway_handler::GatewayHandler;
-#[cfg(feature = "hub")]
-use crate::handler::send_existing_subs;
-#[cfg(feature = "gateway")]
-use crate::handler::send_existing_subs_to_gateway;
-#[cfg(feature = "cluster")]
-use crate::handler::send_existing_subs_to_route;
 use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
+#[cfg(feature = "hub")]
+use crate::propagation::send_existing_subs;
+#[cfg(feature = "gateway")]
+use crate::propagation::send_existing_subs_to_gateway;
 #[cfg(feature = "cluster")]
-use crate::protocol::RouteOp;
-use crate::protocol::{AdaptiveBuf, ClientOp};
+use crate::propagation::send_existing_subs_to_route;
 #[cfg(feature = "cluster")]
 use crate::route_handler::RouteHandler;
 use crate::server::ServerState;
@@ -224,8 +224,6 @@ pub(crate) struct ClientState {
     has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
     transport: Transport,
-    #[allow(dead_code)]
-    conn_id: u64,
     ext: ConnExt,
     #[cfg(feature = "leaf")]
     upstream_txs: Vec<mpsc::Sender<UpstreamCmd>>,
@@ -248,6 +246,27 @@ pub(crate) struct ClientState {
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     account_id: crate::server::AccountId,
+}
+
+impl ClientState {
+    /// Build a per-connection context view for protocol handlers.
+    fn conn_ctx(&mut self, conn_id: u64) -> ConnCtx<'_> {
+        ConnCtx {
+            conn_id,
+            write_buf: &mut self.write_buf,
+            direct_writer: &self.direct_writer,
+            echo: self.echo,
+            no_responders: self.no_responders,
+            sub_count: &mut self.sub_count,
+            #[cfg(feature = "leaf")]
+            upstream_txs: &mut self.upstream_txs,
+            permissions: &self.permissions,
+            ext: &mut self.ext,
+            draining: matches!(self.phase, ConnPhase::Draining),
+            #[cfg(feature = "accounts")]
+            account_id: self.account_id,
+        }
+    }
 }
 
 // --- Worker ---
@@ -569,7 +588,6 @@ impl Worker {
             has_pending,
             phase,
             transport,
-            conn_id: id,
             ext: ConnExt::Client,
             #[cfg(feature = "leaf")]
             upstream_txs: Vec::new(),
@@ -601,15 +619,25 @@ impl Worker {
         }
     }
 
-    /// Add an inbound leaf node connection (hub mode).
-    /// Sends INFO immediately and waits for CONNECT from the leaf.
-    #[cfg(feature = "hub")]
-    fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+    /// Shared setup for inbound leaf/route/gateway connections.
+    ///
+    /// Configures the socket, registers with epoll, creates DirectWriter,
+    /// queues the INFO line, and inserts into the connection map.
+    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+    fn register_conn(
+        &mut self,
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+        info_bytes: &[u8],
+        ext: ConnExt,
+    ) {
+        let kind = ext.kind();
+
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        // Register with epoll (EPOLLIN, level-triggered)
         let mut ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,
             u64: id,
@@ -617,7 +645,7 @@ impl Worker {
         let ret =
             unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
         if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for leaf conn");
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for {kind} conn");
             return;
         }
 
@@ -629,9 +657,8 @@ impl Worker {
             Arc::clone(&self.event_fd),
         );
 
-        // Queue INFO in write_buf — use leaf_info_line (port = leafnode_port).
         let mut write_buf = BytesMut::with_capacity(4096);
-        write_buf.extend_from_slice(&self.leaf_info_line);
+        write_buf.extend_from_slice(info_bytes);
 
         let client = ClientState {
             fd,
@@ -643,187 +670,79 @@ impl Worker {
             has_pending,
             phase: ConnPhase::SendInfo,
             transport: Transport::Raw,
-            conn_id: id,
-            ext: ConnExt::Leaf {
+            ext,
+            #[cfg(feature = "leaf")]
+            upstream_txs: Vec::new(),
+            epoll_has_out: false,
+            echo: true,
+            no_responders: false,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        let metric = format!("{kind}_connections_total");
+        counter!(metric, "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+
+        debug!(id, addr = %addr, "accepted inbound {kind} connection");
+        self.try_flush_conn(id);
+    }
+
+    #[cfg(feature = "hub")]
+    fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let info = self.leaf_info_line.clone();
+        self.register_conn(
+            id,
+            stream,
+            addr,
+            &info,
+            ConnExt::Leaf {
                 leaf_sid_counter: 0,
                 leaf_sids: HashMap::new(),
             },
-            #[cfg(feature = "leaf")]
-            upstream_txs: Vec::new(),
-            epoll_has_out: false,
-            echo: true,
-            no_responders: false,
-            accepted_at: Instant::now(),
-            last_activity: Instant::now(),
-            pings_outstanding: 0,
-            sub_count: 0,
-            permissions: None,
-            #[cfg(feature = "accounts")]
-            account_id: 0,
-        };
-
-        self.fd_to_conn.insert(fd, id);
-        self.conns.insert(id, client);
-
-        counter!("leaf_connections_total", "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
-
-        debug!(id, addr = %addr, "accepted inbound leaf connection on worker");
-        // Try to flush INFO immediately
-        self.try_flush_conn(id);
+        );
     }
 
-    /// Add an inbound route connection (cluster mode).
-    /// Sends INFO immediately and waits for CONNECT from the route peer.
     #[cfg(feature = "cluster")]
     fn add_route_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        stream.set_nonblocking(true).ok();
-        stream.set_nodelay(true).ok();
-        let fd = stream.as_raw_fd();
-
-        // Register with epoll (EPOLLIN, level-triggered)
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: id,
-        };
-        let ret =
-            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for route conn");
-            return;
-        }
-
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
-        let has_pending = Arc::new(AtomicBool::new(false));
-        let direct_writer = DirectWriter::new(
-            Arc::clone(&direct_buf),
-            Arc::clone(&has_pending),
-            Arc::clone(&self.event_fd),
-        );
-
-        // Queue INFO in write_buf — use dynamic route INFO (includes connect_urls).
-        let mut write_buf = BytesMut::with_capacity(4096);
-        let info_str = crate::route_conn::build_route_info(&self.state);
-        // Use the dynamic info
-        write_buf.extend_from_slice(info_str.as_bytes());
-
-        let client = ClientState {
-            fd,
-            _stream: stream,
-            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
-            write_buf,
-            direct_writer,
-            direct_buf,
-            has_pending,
-            phase: ConnPhase::SendInfo,
-            transport: Transport::Raw,
-            conn_id: id,
-            ext: ConnExt::Route {
+        let info = crate::route_conn::build_route_info(&self.state);
+        self.register_conn(
+            id,
+            stream,
+            addr,
+            info.as_bytes(),
+            ConnExt::Route {
                 route_sid_counter: 0,
-                route_sids: std::collections::HashMap::new(),
+                route_sids: HashMap::new(),
                 peer_server_id: None,
             },
-            #[cfg(feature = "leaf")]
-            upstream_txs: Vec::new(),
-            epoll_has_out: false,
-            echo: true,
-            no_responders: false,
-            accepted_at: Instant::now(),
-            last_activity: Instant::now(),
-            pings_outstanding: 0,
-            sub_count: 0,
-            permissions: None,
-            #[cfg(feature = "accounts")]
-            account_id: 0,
-        };
-
-        self.fd_to_conn.insert(fd, id);
-        self.conns.insert(id, client);
-
-        counter!("route_connections_total", "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
-
-        debug!(id, addr = %addr, "accepted inbound route connection on worker");
-        // Try to flush INFO immediately
-        self.try_flush_conn(id);
+        );
     }
 
-    /// Add an inbound gateway connection (gateway mode).
-    /// Sends INFO immediately and waits for CONNECT from the gateway peer.
     #[cfg(feature = "gateway")]
     fn add_gateway_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        stream.set_nonblocking(true).ok();
-        stream.set_nodelay(true).ok();
-        let fd = stream.as_raw_fd();
-
-        // Register with epoll (EPOLLIN, level-triggered)
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: id,
-        };
-        let ret =
-            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for gateway conn");
-            return;
-        }
-
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
-        let has_pending = Arc::new(AtomicBool::new(false));
-        let direct_writer = DirectWriter::new(
-            Arc::clone(&direct_buf),
-            Arc::clone(&has_pending),
-            Arc::clone(&self.event_fd),
-        );
-
-        // Queue INFO in write_buf — use dynamic gateway INFO.
-        let mut write_buf = BytesMut::with_capacity(4096);
-        let info_str = crate::gateway_conn::get_gateway_info(&self.state);
-        write_buf.extend_from_slice(info_str.as_bytes());
-
-        let client = ClientState {
-            fd,
-            _stream: stream,
-            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
-            write_buf,
-            direct_writer,
-            direct_buf,
-            has_pending,
-            phase: ConnPhase::SendInfo,
-            transport: Transport::Raw,
-            conn_id: id,
-            ext: ConnExt::Gateway {
+        let info = crate::gateway_conn::get_gateway_info(&self.state);
+        self.register_conn(
+            id,
+            stream,
+            addr,
+            info.as_bytes(),
+            ConnExt::Gateway {
                 gateway_sid_counter: 0,
-                gateway_sids: std::collections::HashMap::new(),
-                gateway_sids_by_subject: std::collections::HashMap::new(),
+                gateway_sids: HashMap::new(),
+                gateway_sids_by_subject: HashMap::new(),
                 peer_gateway_name: None,
             },
-            #[cfg(feature = "leaf")]
-            upstream_txs: Vec::new(),
-            epoll_has_out: false,
-            echo: true,
-            no_responders: false,
-            accepted_at: Instant::now(),
-            last_activity: Instant::now(),
-            pings_outstanding: 0,
-            sub_count: 0,
-            permissions: None,
-            #[cfg(feature = "accounts")]
-            account_id: 0,
-        };
-
-        self.fd_to_conn.insert(fd, id);
-        self.conns.insert(id, client);
-
-        counter!("gateway_connections_total", "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
-
-        debug!(id, addr = %addr, "accepted inbound gateway connection on worker");
-        // Try to flush INFO immediately
-        self.try_flush_conn(id);
+        );
     }
 
     fn remove_conn(&mut self, conn_id: u64) {
@@ -2229,22 +2148,7 @@ impl Worker {
                             Some(op) => {
                                 let (result, expired) = {
                                     let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let draining = matches!(client.phase, ConnPhase::Draining);
-                                    let mut conn_ctx = ConnCtx {
-                                        conn_id,
-                                        write_buf: &mut client.write_buf,
-                                        direct_writer: &client.direct_writer,
-                                        echo: client.echo,
-                                        no_responders: client.no_responders,
-                                        sub_count: &mut client.sub_count,
-                                        #[cfg(feature = "leaf")]
-                                        upstream_txs: &mut client.upstream_txs,
-                                        permissions: &client.permissions,
-                                        ext: &mut client.ext,
-                                        draining,
-                                        #[cfg(feature = "accounts")]
-                                        account_id: client.account_id,
-                                    };
+                                    let mut conn_ctx = client.conn_ctx(conn_id);
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
                                         event_fd: self.event_fd.as_raw_fd(),
@@ -2309,22 +2213,7 @@ impl Worker {
                             Some(op) => {
                                 let (result, expired) = {
                                     let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let draining = matches!(client.phase, ConnPhase::Draining);
-                                    let mut conn_ctx = ConnCtx {
-                                        conn_id,
-                                        write_buf: &mut client.write_buf,
-                                        direct_writer: &client.direct_writer,
-                                        echo: client.echo,
-                                        no_responders: client.no_responders,
-                                        sub_count: &mut client.sub_count,
-                                        #[cfg(feature = "leaf")]
-                                        upstream_txs: &mut client.upstream_txs,
-                                        permissions: &client.permissions,
-                                        ext: &mut client.ext,
-                                        draining,
-                                        #[cfg(feature = "accounts")]
-                                        account_id: client.account_id,
-                                    };
+                                    let mut conn_ctx = client.conn_ctx(conn_id);
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
                                         event_fd: self.event_fd.as_raw_fd(),
@@ -2389,22 +2278,7 @@ impl Worker {
                             Some(op) => {
                                 let (result, expired) = {
                                     let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let draining = matches!(client.phase, ConnPhase::Draining);
-                                    let mut conn_ctx = ConnCtx {
-                                        conn_id,
-                                        write_buf: &mut client.write_buf,
-                                        direct_writer: &client.direct_writer,
-                                        echo: client.echo,
-                                        no_responders: client.no_responders,
-                                        sub_count: &mut client.sub_count,
-                                        #[cfg(feature = "leaf")]
-                                        upstream_txs: &mut client.upstream_txs,
-                                        permissions: &client.permissions,
-                                        ext: &mut client.ext,
-                                        draining,
-                                        #[cfg(feature = "accounts")]
-                                        account_id: client.account_id,
-                                    };
+                                    let mut conn_ctx = client.conn_ctx(conn_id);
                                     let mut worker_ctx = WorkerCtx {
                                         state: &self.state,
                                         event_fd: self.event_fd.as_raw_fd(),
@@ -2502,22 +2376,7 @@ impl Worker {
                         Some(op) => {
                             let (result, expired) = {
                                 let client = self.conns.get_mut(&conn_id).unwrap();
-                                let draining = matches!(client.phase, ConnPhase::Draining);
-                                let mut conn_ctx = ConnCtx {
-                                    conn_id,
-                                    write_buf: &mut client.write_buf,
-                                    direct_writer: &client.direct_writer,
-                                    echo: client.echo,
-                                    no_responders: client.no_responders,
-                                    sub_count: &mut client.sub_count,
-                                    #[cfg(feature = "leaf")]
-                                    upstream_txs: &mut client.upstream_txs,
-                                    permissions: &client.permissions,
-                                    ext: &mut client.ext,
-                                    draining,
-                                    #[cfg(feature = "accounts")]
-                                    account_id: client.account_id,
-                                };
+                                let mut conn_ctx = client.conn_ctx(conn_id);
                                 let mut worker_ctx = WorkerCtx {
                                     state: &self.state,
                                     event_fd: self.event_fd.as_raw_fd(),

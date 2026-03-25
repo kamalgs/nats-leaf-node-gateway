@@ -1,98 +1,25 @@
-use std::io::{self, BufWriter, Read, Write};
+//! Adaptive read buffer and connection I/O primitives.
+//!
+//! `AdaptiveBuf` implements Go-style dynamic buffer sizing (512B → 64KB).
+//! `BufConfig` controls buffer sizes and slow-consumer limits.
+//! `ServerConn` is a test-only wrapper for unit testing protocol parsing.
+
+use std::io::{self, Read};
+#[cfg(test)]
+use std::io::{BufWriter, Write};
+#[cfg(test)]
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::RawFd;
-#[cfg(feature = "leaf")]
-use std::sync::{Arc, Mutex};
 
 use bytes::{BufMut, BytesMut};
 
-use crate::types::{HeaderMap, ServerInfo};
-
-/// Resolved credentials to include in a leaf CONNECT message to the hub.
-#[cfg(feature = "leaf")]
-#[derive(Debug, Default)]
-pub(crate) struct UpstreamConnectCreds {
-    pub user: Option<String>,
-    pub pass: Option<String>,
-    pub token: Option<String>,
-    pub jwt: Option<String>,
-    pub nkey: Option<String>,
-    pub sig: Option<String>,
-}
-
+#[cfg(test)]
 use crate::nats_proto::{self, MsgBuilder};
-
-/// Stream wrapper for upstream hub connections — plain TCP or TLS.
-///
-/// For TLS, both halves share the same `ClientConnection` behind an `Arc<Mutex>`.
-/// Each half also holds a cloned `TcpStream` so reads and writes go to the same socket.
-#[cfg(feature = "leaf")]
-pub(crate) enum HubStream {
-    Plain(TcpStream),
-    Tls {
-        tls: Arc<Mutex<rustls::ClientConnection>>,
-        tcp: TcpStream,
-    },
-}
-
-#[cfg(feature = "leaf")]
-impl Read for HubStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            HubStream::Plain(s) => s.read(buf),
-            HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
-                // Feed encrypted data from socket into TLS engine
-                match conn.read_tls(tcp) {
-                    Ok(0) => return Ok(0),
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No data available on socket, but maybe we have buffered plaintext
-                    }
-                    Err(e) => return Err(e),
-                }
-                conn.process_new_packets()
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                match conn.reader().read(buf) {
-                    Ok(n) => Ok(n),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No plaintext available yet
-                        Err(e)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "leaf")]
-impl Write for HubStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            HubStream::Plain(s) => s.write(buf),
-            HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
-                let n = conn.writer().write(buf)?;
-                conn.write_tls(tcp)?;
-                Ok(n)
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            HubStream::Plain(s) => s.flush(),
-            HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
-                conn.writer().flush()?;
-                conn.write_tls(tcp)?;
-                tcp.flush()
-            }
-        }
-    }
-}
+#[cfg(test)]
+use crate::types::HeaderMap;
+#[cfg(test)]
+use crate::types::ServerInfo;
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
 pub(crate) use crate::nats_proto::ClientOp;
@@ -204,7 +131,7 @@ impl AdaptiveBuf {
 
     /// Read from a reader into the buffer's spare capacity.
     /// Ensures spare capacity exists before reading.
-    fn read_from(&mut self, reader: &mut impl Read) -> io::Result<usize> {
+    pub(crate) fn read_from(&mut self, reader: &mut impl Read) -> io::Result<usize> {
         if self.buf.remaining_mut() == 0 {
             self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
         }
@@ -231,11 +158,8 @@ impl DerefMut for AdaptiveBuf {
     }
 }
 
-/// Server-side connection wrapper.
-/// Uses cloned TcpStream halves so the writer is wrapped in a BufWriter.
-/// This ensures `write_msg` calls go into a memory buffer and only hit the
-/// socket on `flush()`, dramatically reducing syscalls when batching.
-#[allow(dead_code)]
+/// Server-side connection wrapper for unit tests.
+#[cfg(test)]
 pub(crate) struct ServerConn {
     reader: TcpStream,
     writer: BufWriter<TcpStream>,
@@ -243,7 +167,7 @@ pub(crate) struct ServerConn {
     msg_builder: MsgBuilder,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ServerConn {
     pub(crate) fn from_tcp(stream: TcpStream, buf_config: BufConfig) -> io::Result<Self> {
         let writer_stream = stream.try_clone()?;
@@ -271,7 +195,6 @@ impl ServerConn {
     }
 
     /// Send MSG to connected client (write + flush).
-    #[cfg(test)]
     pub(crate) fn send_msg(
         &mut self,
         subject: &str,
@@ -292,7 +215,6 @@ impl ServerConn {
 
     /// Write a MSG to the client without flushing.
     /// Uses direct byte assembly — no `write!()` formatting.
-    #[allow(dead_code)]
     pub(crate) fn write_msg(
         &mut self,
         subject: &[u8],
@@ -318,7 +240,6 @@ impl ServerConn {
         self.writer.flush()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn send_ping(&mut self) -> io::Result<()> {
         self.write_flush(b"PING\r\n")
     }
@@ -327,7 +248,6 @@ impl ServerConn {
         self.write_flush(b"PONG\r\n")
     }
 
-    #[allow(dead_code)]
     pub(crate) fn send_ok(&mut self) -> io::Result<()> {
         self.write_flush(b"+OK\r\n")
     }
@@ -407,271 +327,6 @@ impl ServerConn {
         self.writer.write_all(data)?;
         self.writer.flush()?;
         Ok(())
-    }
-}
-
-/// Outgoing leaf node connection to a hub.
-/// Owns the raw stream and its own read buffer for parsing hub operations.
-/// Used during the handshake phase; call `split()` to get independent
-/// reader/writer halves for the I/O loop.
-#[cfg(feature = "leaf")]
-pub(crate) struct LeafConn {
-    stream: HubStream,
-    read_buf: AdaptiveBuf,
-    buf_config: BufConfig,
-}
-
-#[cfg(feature = "leaf")]
-impl LeafConn {
-    pub(crate) fn new(stream: TcpStream, buf_config: BufConfig) -> Self {
-        Self {
-            stream: HubStream::Plain(stream),
-            read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
-            buf_config,
-        }
-    }
-
-    /// Create a new leaf connection over TLS.
-    pub(crate) fn new_tls(
-        tcp: TcpStream,
-        tls_conn: rustls::ClientConnection,
-        buf_config: BufConfig,
-    ) -> Self {
-        Self {
-            stream: HubStream::Tls {
-                tls: Arc::new(Mutex::new(tls_conn)),
-                tcp,
-            },
-            read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
-            buf_config,
-        }
-    }
-
-    /// Split into independent reader and writer halves.
-    /// The writer is wrapped in a BufWriter for batched I/O.
-    pub(crate) fn split(self) -> io::Result<(LeafReader, LeafWriter)> {
-        match self.stream {
-            HubStream::Plain(tcp) => {
-                let writer_tcp = tcp.try_clone()?;
-                Ok((
-                    LeafReader {
-                        reader: HubStream::Plain(tcp),
-                        read_buf: self.read_buf,
-                    },
-                    LeafWriter {
-                        writer: BufWriter::with_capacity(
-                            self.buf_config.write_buf,
-                            HubStream::Plain(writer_tcp),
-                        ),
-                        msg_builder: MsgBuilder::new(),
-                    },
-                ))
-            }
-            HubStream::Tls { tls, tcp } => {
-                let writer_tcp = tcp.try_clone()?;
-                Ok((
-                    LeafReader {
-                        reader: HubStream::Tls {
-                            tls: Arc::clone(&tls),
-                            tcp,
-                        },
-                        read_buf: self.read_buf,
-                    },
-                    LeafWriter {
-                        writer: BufWriter::with_capacity(
-                            self.buf_config.write_buf,
-                            HubStream::Tls {
-                                tls,
-                                tcp: writer_tcp,
-                            },
-                        ),
-                        msg_builder: MsgBuilder::new(),
-                    },
-                ))
-            }
-        }
-    }
-
-    /// Read the next leaf operation from the hub.
-    pub(crate) fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
-        loop {
-            if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
-                self.read_buf.try_shrink();
-                return Ok(Some(op));
-            }
-            let n = self.read_buf.read_from(&mut self.stream)?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(io::ErrorKind::ConnectionReset.into());
-            }
-            self.read_buf.after_read(n);
-        }
-    }
-
-    /// Send a leaf node CONNECT to the hub, optionally including credentials.
-    pub(crate) fn send_leaf_connect(
-        &mut self,
-        name: &str,
-        headers: bool,
-        creds: Option<&UpstreamConnectCreds>,
-    ) -> io::Result<()> {
-        let mut map = serde_json::Map::new();
-        map.insert("verbose".into(), false.into());
-        map.insert("pedantic".into(), false.into());
-        map.insert("headers".into(), headers.into());
-        map.insert("no_responders".into(), true.into());
-        map.insert("name".into(), name.into());
-        map.insert("version".into(), "0.5.0".into());
-        map.insert("protocol".into(), 1.into());
-
-        if let Some(c) = creds {
-            if let Some(ref u) = c.user {
-                map.insert("user".into(), u.clone().into());
-            }
-            if let Some(ref p) = c.pass {
-                map.insert("pass".into(), p.clone().into());
-            }
-            if let Some(ref t) = c.token {
-                map.insert("auth_token".into(), t.clone().into());
-            }
-            if let Some(ref j) = c.jwt {
-                map.insert("jwt".into(), j.clone().into());
-            }
-            if let Some(ref n) = c.nkey {
-                map.insert("nkey".into(), n.clone().into());
-            }
-            if let Some(ref s) = c.sig {
-                map.insert("sig".into(), s.clone().into());
-            }
-        }
-
-        let json = serde_json::Value::Object(map);
-        let line = format!("CONNECT {json}\r\n");
-        self.stream.write_all(line.as_bytes())
-    }
-
-    pub(crate) fn send_ping(&mut self) -> io::Result<()> {
-        self.stream.write_all(b"PING\r\n")
-    }
-
-    pub(crate) fn send_pong(&mut self) -> io::Result<()> {
-        self.stream.write_all(b"PONG\r\n")
-    }
-
-    /// Send LS+ subscription interest to the hub.
-    pub(crate) fn send_leaf_sub(&mut self, subject: &str) -> io::Result<()> {
-        let line = format!("LS+ {subject}\r\n");
-        self.stream.write_all(line.as_bytes())
-    }
-
-    /// Send LS+ with queue group to the hub.
-    pub(crate) fn send_leaf_sub_queue(&mut self, subject: &str, queue: &str) -> io::Result<()> {
-        let line = format!("LS+ {subject} {queue}\r\n");
-        self.stream.write_all(line.as_bytes())
-    }
-
-    /// Flush buffered writes to the wire.
-    pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-/// Read half of a leaf connection.
-#[cfg(feature = "leaf")]
-pub(crate) struct LeafReader {
-    reader: HubStream,
-    read_buf: AdaptiveBuf,
-}
-
-#[cfg(feature = "leaf")]
-impl LeafReader {
-    /// Read the next leaf operation from the hub.
-    /// Performs I/O if the buffer doesn't contain a complete op.
-    pub(crate) fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
-        loop {
-            if let Some(op) = self.try_parse_leaf_op()? {
-                return Ok(Some(op));
-            }
-            let n = self.read_buf.read_from(&mut self.reader)?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(io::ErrorKind::ConnectionReset.into());
-            }
-            self.read_buf.after_read(n);
-        }
-    }
-
-    /// Try to parse the next leaf op from the buffer without I/O.
-    pub(crate) fn try_parse_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
-        let result = nats_proto::try_parse_leaf_op(&mut self.read_buf);
-        self.read_buf.try_shrink();
-        result
-    }
-}
-
-/// Write half of a leaf connection, wrapped in BufWriter.
-#[cfg(feature = "leaf")]
-pub(crate) struct LeafWriter {
-    writer: BufWriter<HubStream>,
-    msg_builder: MsgBuilder,
-}
-
-#[cfg(feature = "leaf")]
-impl LeafWriter {
-    /// Send LS+ subscription interest to the hub.
-    pub(crate) fn send_leaf_sub(&mut self, subject: &[u8]) -> io::Result<()> {
-        let data = self.msg_builder.build_leaf_sub(subject);
-        self.writer.write_all(data)
-    }
-
-    /// Send LS- unsubscribe to the hub.
-    pub(crate) fn send_leaf_unsub(&mut self, subject: &[u8]) -> io::Result<()> {
-        let data = self.msg_builder.build_leaf_unsub(subject);
-        self.writer.write_all(data)
-    }
-
-    /// Send LS+ with queue group to the hub.
-    pub(crate) fn send_leaf_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> io::Result<()> {
-        let data = self.msg_builder.build_leaf_sub_queue(subject, queue);
-        self.writer.write_all(data)
-    }
-
-    /// Send LS- with queue group to the hub.
-    pub(crate) fn send_leaf_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> io::Result<()> {
-        let data = self.msg_builder.build_leaf_unsub_queue(subject, queue);
-        self.writer.write_all(data)
-    }
-
-    /// Send PONG to the hub.
-    pub(crate) fn send_pong(&mut self) -> io::Result<()> {
-        self.writer.write_all(b"PONG\r\n")
-    }
-
-    /// Send LMSG to the hub.
-    /// Writes header and payload separately to avoid copying the payload
-    /// into the MsgBuilder scratch buffer. The BufWriter coalesces them.
-    pub(crate) fn send_leaf_msg(
-        &mut self,
-        subject: &[u8],
-        reply: Option<&[u8]>,
-        headers: Option<&HeaderMap>,
-        payload: &[u8],
-    ) -> io::Result<()> {
-        let hdr = self
-            .msg_builder
-            .build_lmsg_header(subject, reply, headers, payload.len());
-        self.writer.write_all(hdr)?;
-        self.writer.write_all(payload)?;
-        self.writer.write_all(b"\r\n")
-    }
-
-    /// Flush buffered writes to the wire.
-    pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
     }
 }
 
@@ -887,9 +542,9 @@ mod tests {
     // --- LeafConn tests ---
 
     #[cfg(feature = "leaf")]
-    fn make_leaf_pair() -> (LeafConn, TcpStream) {
+    fn make_leaf_pair() -> (crate::leaf_conn::LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
-        let conn = LeafConn::new(server, BufConfig::default());
+        let conn = crate::leaf_conn::LeafConn::new(server, BufConfig::default());
         (conn, client)
     }
 
@@ -1158,6 +813,7 @@ mod tests {
     #[test]
     #[cfg(feature = "leaf")]
     fn test_leaf_connect_with_creds() {
+        use crate::leaf_conn::UpstreamConnectCreds;
         let (mut conn, mut hub) = make_leaf_pair();
         let creds = UpstreamConnectCreds {
             user: Some("admin".into()),

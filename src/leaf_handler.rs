@@ -10,17 +10,17 @@ use tracing::debug;
 #[cfg(feature = "leaf")]
 use tracing::warn;
 
-#[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account;
+use crate::buf::LeafOp;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
 use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
-#[cfg(feature = "gateway")]
-use crate::handler::{propagate_gateway_sub, propagate_gateway_unsub};
-#[cfg(feature = "cluster")]
-use crate::handler::{propagate_route_sub, propagate_route_unsub};
 use crate::nats_proto;
-use crate::protocol::LeafOp;
+#[cfg(feature = "accounts")]
+use crate::propagation::deliver_cross_account;
+#[cfg(feature = "gateway")]
+use crate::propagation::propagate_gateway_interest;
+#[cfg(feature = "cluster")]
+use crate::propagation::propagate_route_interest;
 use crate::sub_list::Subscription;
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
@@ -159,20 +159,22 @@ impl LeafHandler {
 
         // Propagate RS+ to route peers.
         #[cfg(feature = "cluster")]
-        propagate_route_sub(
+        propagate_route_interest(
             wctx.state,
             subject.as_ref(),
             queue.as_deref(),
+            true,
             #[cfg(feature = "accounts")]
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
 
         // Propagate RS+ to gateway peers.
         #[cfg(feature = "gateway")]
-        propagate_gateway_sub(
+        propagate_gateway_interest(
             wctx.state,
             subject.as_ref(),
             queue.as_deref(),
+            true,
             #[cfg(feature = "accounts")]
             wctx.state.account_name(conn.account_id).as_bytes(),
         );
@@ -233,18 +235,20 @@ impl LeafHandler {
                 }
             }
             #[cfg(feature = "cluster")]
-            propagate_route_unsub(
+            propagate_route_interest(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                false,
                 #[cfg(feature = "accounts")]
                 wctx.state.account_name(conn.account_id).as_bytes(),
             );
             #[cfg(feature = "gateway")]
-            propagate_gateway_unsub(
+            propagate_gateway_interest(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
+                false,
                 #[cfg(feature = "accounts")]
                 wctx.state.account_name(conn.account_id).as_bytes(),
             );
@@ -306,7 +310,7 @@ impl LeafHandler {
 
         // Forward to optimistic gateways when no gateway sub matched.
         #[cfg(feature = "gateway")]
-        crate::handler::forward_to_optimistic_gateways(
+        crate::propagation::forward_to_optimistic_gateways(
             wctx,
             &subject,
             subject_str,
