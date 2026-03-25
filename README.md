@@ -187,14 +187,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Module | Purpose |
 |---|---|
+| `config.rs` | Go nats-server `.conf` file parser |
 | `server.rs` | Accept loop, worker spawning, shutdown |
 | `worker.rs` | Per-thread epoll event loop, connection state machine |
 | `nats_proto.rs` | Zero-copy protocol parser and message builder |
-| `sub_list.rs` | Subscription storage, wildcard matching, DirectWriter fan-out |
-| `upstream.rs` | Hub connection via leaf node protocol |
+| `sub_list.rs` | SubList: exact + wildcard subscription matching |
+| `direct_writer.rs` | DirectWriter: shared buffer + eventfd fan-out |
+| `handler.rs` | Shared handler types, ConnExt, deliver_to_subs |
+| `propagation.rs` | Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting |
+| `client_handler.rs` | Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG) |
+| `leaf_handler.rs` | Inbound leaf protocol dispatch (LS+/LS-/LMSG) — `hub` feature |
+| `leaf_conn.rs` | LeafConn, LeafReader, LeafWriter, HubStream — `leaf` feature |
+| `upstream.rs` | Hub connection via leaf node protocol — `leaf` feature |
+| `interest.rs` | InterestPipeline: subject mapping + interest collapse — `leaf` feature |
 | `route_handler.rs` | Route protocol dispatch (RS+/RS-/RMSG) — `cluster` feature |
 | `route_conn.rs` | Outbound route connection manager — `cluster` feature |
-| `protocol.rs` | Connection I/O wrappers, adaptive buffers |
+| `gateway_handler.rs` | Gateway protocol dispatch — `gateway` feature |
+| `gateway_conn.rs` | Outbound gateway connection manager — `gateway` feature |
+| `buf.rs` | AdaptiveBuf, BufConfig, ServerConn (test-only) |
 | `websocket.rs` | HTTP upgrade handshake, WS frame codec |
 | `types.rs` | ServerInfo, ConnectInfo, HeaderMap |
 
@@ -203,7 +213,7 @@ See [architecture.md](docs/architecture.md) for detailed message flow diagrams.
 ## Tests
 
 ```bash
-cargo test --lib                    # 260 unit tests (with --features cluster)
+cargo test --lib --all-features     # 295 unit tests
 cargo test                          # unit + integration (requires nats-server in PATH)
 cargo test --test e2e --features cluster -- cluster   # cluster integration tests
 ```

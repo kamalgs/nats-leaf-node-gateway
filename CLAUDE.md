@@ -13,21 +13,28 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 
 ```
 src/
-├── main.rs          # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
-├── lib.rs           # Public API: LeafServer, LeafServerConfig
-├── server.rs        # Accept loop, worker spawning, shutdown
-├── worker.rs        # Per-thread epoll event loop, connection state machine
-├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
-├── sub_list.rs      # SubList (exact + wildcard), DirectWriter fan-out
-├── upstream.rs      # Hub connection via leaf node protocol
-├── handler.rs       # Shared handler types, ConnExt, deliver_to_subs, propagation
-├── client_handler.rs # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
-├── leaf_handler.rs  # Inbound leaf protocol dispatch (LS+/LS-/LMSG) [hub]
-├── route_handler.rs # Route protocol dispatch (RS+/RS-/RMSG) [cluster]
-├── route_conn.rs    # Outbound route connection manager [cluster]
-├── protocol.rs      # Connection I/O wrappers, AdaptiveBuf
-├── websocket.rs     # HTTP upgrade handshake, WS frame codec
-└── types.rs         # ServerInfo, ConnectInfo, HeaderMap
+├── main.rs              # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
+├── lib.rs               # Public API: LeafServer, LeafServerConfig
+├── config.rs            # Go nats-server .conf file parser
+├── server.rs            # Accept loop, worker spawning, shutdown
+├── worker.rs            # Per-thread epoll event loop, connection state machine
+├── nats_proto.rs        # Zero-copy protocol parser + MsgBuilder
+├── sub_list.rs          # SubList (exact + wildcard subscription matching)
+├── direct_writer.rs     # DirectWriter: shared buffer + eventfd fan-out
+├── handler.rs           # Shared handler types, ConnExt, deliver_to_subs
+├── propagation.rs       # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
+├── client_handler.rs    # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
+├── leaf_handler.rs      # Inbound leaf protocol dispatch (LS+/LS-/LMSG) [hub]
+├── leaf_conn.rs         # LeafConn, LeafReader, LeafWriter, HubStream [leaf]
+├── upstream.rs          # Hub connection via leaf node protocol [leaf]
+├── interest.rs          # InterestPipeline: subject mapping + interest collapse [leaf]
+├── route_handler.rs     # Route protocol dispatch (RS+/RS-/RMSG) [cluster]
+├── route_conn.rs        # Outbound route connection manager [cluster]
+├── gateway_handler.rs   # Gateway protocol dispatch (RS+/RS-/RMSG) [gateway]
+├── gateway_conn.rs      # Outbound gateway connection manager [gateway]
+├── buf.rs               # AdaptiveBuf, BufConfig, ServerConn (test-only)
+├── websocket.rs         # HTTP upgrade handshake, WS frame codec
+└── types.rs             # ServerInfo, ConnectInfo, HeaderMap
 examples/
 └── chat/            # Sample chat app (HTML + README)
 tests/
@@ -161,14 +168,33 @@ Always run `cargo +nightly fmt` before committing.
 |------|----------|---------|
 | `LeafServer` | `lib.rs` | Public API entry point |
 | `LeafServerConfig` | `lib.rs` | Server configuration |
+| `load_config` | `config.rs` | Go nats-server `.conf` file parser |
 | `Worker` | `worker.rs` | Per-thread epoll event loop |
 | `NatsProto` / `MsgBuilder` | `nats_proto.rs` | Protocol parser + message builder |
-| `SubList` / `DirectWriter` | `sub_list.rs` | Subscription storage + fan-out delivery |
-| `ServerConn` / `LeafConn` | `protocol.rs` | Connection I/O wrappers |
-| `AdaptiveBuf` | `protocol.rs` | Dynamic read buffer |
+| `SubList` | `sub_list.rs` | Subscription storage + wildcard matching |
+| `DirectWriter` | `direct_writer.rs` | Shared buffer + eventfd fan-out delivery |
+| `ServerConn` | `buf.rs` | Connection I/O wrapper (test-only) |
+| `LeafConn` | `leaf_conn.rs` | Leaf connection I/O wrapper |
+| `AdaptiveBuf` | `buf.rs` | Dynamic read buffer |
 | `Upstream` | `upstream.rs` | Hub connection management |
+| `InterestPipeline` | `interest.rs` | Subject mapping + interest collapse |
 | `RouteHandler` | `route_handler.rs` | Route protocol dispatch (`cluster`) |
 | `RouteConnManager` | `route_conn.rs` | Outbound route connections (`cluster`) |
+| `GatewayHandler` | `gateway_handler.rs` | Gateway protocol dispatch (`gateway`) |
+| `GatewayConnManager` | `gateway_conn.rs` | Outbound gateway connections (`gateway`) |
+
+## Feature Flags
+
+| Feature | Default | Purpose |
+|---------|---------|---------|
+| `leaf` | yes | Upstream hub connection support |
+| `hub` | yes | Inbound leaf node connection support |
+| `interest-collapse` | yes | N:1 wildcard aggregation for upstream subs |
+| `subject-mapping` | yes | Stateless subject rewriting before upstream |
+| `cluster` | no | Full mesh route clustering (RS+/RS-/RMSG) |
+| `gateway` | no | Gateway inter-cluster traffic |
+| `accounts` | no | Multi-tenant per-account subject isolation |
+| `worker-affinity` | no | Subject-based worker affinity tracking |
 
 ## Dependencies
 
@@ -181,9 +207,18 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.104"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+nkeys = { version = "0.4", default-features = false }
+data-encoding = "2"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
 ```
 
-Minimal dependency footprint. No async runtime, no TLS library.
+Minimal dependency footprint. No async runtime.
 
 New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause.
 
@@ -197,7 +232,7 @@ New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Cla
 - **No `unwrap()` or `expect()`** in library code.
 - **Imports**: Group std → external crates → crate-internal.
 - All public items should have doc comments.
-- Tests go in `#[cfg(test)] mod tests` within each source file (260 unit tests currently).
+- Tests go in `#[cfg(test)] mod tests` within each source file (295 unit tests with `--all-features`).
 - Integration tests in `tests/e2e.rs` use `async-nats` client against a real `nats-server`.
 
 ## Commit & PR Standards
