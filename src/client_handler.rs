@@ -10,7 +10,9 @@ use tracing::{debug, warn};
 
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, HandleResult, WorkerCtx};
+use crate::handler::{
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, HandleResult, WorkerCtx,
+};
 use crate::nats_proto::{self, ClientOp};
 #[cfg(feature = "accounts")]
 use crate::propagation::deliver_cross_account;
@@ -25,12 +27,14 @@ use crate::sub_list::Subscription;
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
 pub(crate) struct ClientHandler;
 
-impl ClientHandler {
-    /// Dispatch a parsed client operation.
-    ///
-    /// Returns `(HandleResult, expired_subs)`. Expired subs must be cleaned up
-    /// by the worker after regaining `&mut self` access to the connections map.
-    pub(crate) fn handle_op(
+impl ConnectionHandler for ClientHandler {
+    type Op = ClientOp;
+
+    fn parse_op(buf: &mut bytes::BytesMut) -> std::io::Result<Option<ClientOp>> {
+        nats_proto::try_parse_client_op(buf)
+    }
+
+    fn handle_op(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         op: ClientOp,
@@ -70,7 +74,9 @@ impl ClientHandler {
             }
         }
     }
+}
 
+impl ClientHandler {
     fn handle_sub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
