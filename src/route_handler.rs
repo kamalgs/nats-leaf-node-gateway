@@ -11,7 +11,9 @@ use tracing::debug;
 use crate::buf::RouteOp;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+use crate::handler::{
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+};
 use crate::nats_proto;
 #[cfg(feature = "accounts")]
 use crate::propagation::deliver_cross_account;
@@ -22,12 +24,14 @@ use crate::sub_list::Subscription;
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
 
-impl RouteHandler {
-    /// Dispatch a parsed route protocol operation.
-    ///
-    /// Returns `(HandleResult, expired_subs)`. Expired subs must be cleaned up
-    /// by the worker after regaining `&mut self` access to the connections map.
-    pub(crate) fn handle_op(
+impl ConnectionHandler for RouteHandler {
+    type Op = RouteOp;
+
+    fn parse_op(buf: &mut bytes::BytesMut) -> std::io::Result<Option<RouteOp>> {
+        nats_proto::try_parse_route_op(buf)
+    }
+
+    fn handle_op(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         op: RouteOp,
@@ -127,7 +131,9 @@ impl RouteHandler {
             }
         }
     }
+}
 
+impl RouteHandler {
     fn handle_route_sub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,

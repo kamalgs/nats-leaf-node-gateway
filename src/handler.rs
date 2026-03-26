@@ -5,6 +5,7 @@
 //! helpers used by both `ClientHandler` and `LeafHandler`.
 
 use std::collections::HashMap;
+use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
 #[cfg(feature = "leaf")]
@@ -20,6 +21,30 @@ use crate::sub_list::DirectWriter;
 use crate::types::HeaderMap;
 #[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
+
+/// Trait unifying protocol handlers for different connection types.
+///
+/// Each connection kind (client, leaf, route, gateway) implements this trait
+/// to provide both protocol parsing and operation dispatch. This enables
+/// the worker to use a single generic `process_active<H>()` method instead
+/// of duplicating the parse → handle → cleanup pipeline for each type.
+pub(crate) trait ConnectionHandler {
+    /// Protocol operation type produced by the parser.
+    type Op;
+
+    /// Parse the next protocol operation from the read buffer.
+    ///
+    /// Returns `Ok(Some(op))` on success, `Ok(None)` if more data is needed,
+    /// or `Err` on parse error (caller should disconnect).
+    fn parse_op(buf: &mut BytesMut) -> io::Result<Option<Self::Op>>;
+
+    /// Dispatch a parsed operation, returning the result and any expired subs.
+    fn handle_op(
+        conn: &mut ConnCtx<'_>,
+        wctx: &mut WorkerCtx<'_>,
+        op: Self::Op,
+    ) -> (HandleResult, Vec<(u64, u64)>);
+}
 
 /// Per-connection state view. Borrows disjointly from `ClientState` fields
 /// so the handler can read/write connection-specific data without holding
@@ -74,7 +99,35 @@ pub(crate) enum ConnExt {
     },
 }
 
+/// Lightweight tag for dispatch — always compiled, no cfg gates on the enum itself.
+pub(crate) enum ConnKind {
+    /// Normal NATS client connection.
+    Client,
+    /// Inbound leaf node connection.
+    #[cfg(feature = "hub")]
+    Leaf,
+    /// Inbound route connection.
+    #[cfg(feature = "cluster")]
+    Route,
+    /// Inbound gateway connection.
+    #[cfg(feature = "gateway")]
+    Gateway,
+}
+
 impl ConnExt {
+    /// Returns a lightweight discriminant tag for dispatch.
+    pub(crate) fn kind_tag(&self) -> ConnKind {
+        match self {
+            Self::Client => ConnKind::Client,
+            #[cfg(feature = "hub")]
+            Self::Leaf { .. } => ConnKind::Leaf,
+            #[cfg(feature = "cluster")]
+            Self::Route { .. } => ConnKind::Route,
+            #[cfg(feature = "gateway")]
+            Self::Gateway { .. } => ConnKind::Gateway,
+        }
+    }
+
     /// Returns `true` for inbound leaf connections.
     #[cfg(feature = "hub")]
     pub fn is_leaf(&self) -> bool {

@@ -13,7 +13,9 @@ use tracing::debug;
 
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+use crate::handler::{
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+};
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
 #[cfg(feature = "accounts")]
@@ -24,12 +26,14 @@ use crate::sub_list::Subscription;
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct GatewayHandler;
 
-impl GatewayHandler {
-    /// Dispatch a parsed gateway protocol operation.
-    ///
-    /// Returns `(HandleResult, expired_subs)`. Expired subs must be cleaned up
-    /// by the worker after regaining `&mut self` access to the connections map.
-    pub(crate) fn handle_op(
+impl ConnectionHandler for GatewayHandler {
+    type Op = GatewayOp;
+
+    fn parse_op(buf: &mut bytes::BytesMut) -> std::io::Result<Option<GatewayOp>> {
+        nats_proto::try_parse_gateway_op(buf)
+    }
+
+    fn handle_op(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         op: GatewayOp,
@@ -87,7 +91,9 @@ impl GatewayHandler {
             }
         }
     }
+}
 
+impl GatewayHandler {
     fn handle_gateway_sub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,

@@ -23,7 +23,9 @@ use crate::buf::{AdaptiveBuf, ClientOp};
 use crate::client_handler::ClientHandler;
 #[cfg(feature = "gateway")]
 use crate::gateway_handler::GatewayHandler;
-use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+use crate::handler::{
+    handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult, WorkerCtx,
+};
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
@@ -174,6 +176,7 @@ impl WorkerHandle {
 
 // --- Connection state machine ---
 
+#[derive(Clone, Copy)]
 enum ConnPhase {
     /// TLS: handshake in progress.
     TlsHandshake,
@@ -1620,439 +1623,415 @@ impl Worker {
     fn process_read_buf(&mut self, conn_id: u64) {
         loop {
             let phase = match self.conns.get(&conn_id) {
-                Some(c) => match c.phase {
-                    ConnPhase::TlsHandshake => 3,
-                    ConnPhase::WsHandshake => 0,
-                    ConnPhase::SendInfo => return,
-                    ConnPhase::WaitConnect => 1,
-                    ConnPhase::Active | ConnPhase::Draining => 2,
-                },
+                Some(c) => c.phase,
                 None => return,
             };
-
-            if phase == 3 {
-                // TlsHandshake: check if handshake is complete
-                let handshake_done = match self.conns.get(&conn_id) {
-                    Some(c) => {
-                        if let Transport::Tls(ref tls) = c.transport {
-                            !tls.tls_conn.is_handshaking()
-                        } else {
-                            false
-                        }
-                    }
-                    None => return,
-                };
-                if handshake_done {
-                    // Log client certificate if present (mTLS)
-                    if let Some(c) = self.conns.get(&conn_id) {
-                        if let Transport::Tls(ref tls) = c.transport {
-                            if let Some(certs) = tls.tls_conn.peer_certificates() {
-                                if let Some(cert) = certs.first() {
-                                    tracing::info!(
-                                        conn_id,
-                                        cert_len = cert.len(),
-                                        "client certificate verified"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let client = self.conns.get_mut(&conn_id).unwrap();
-                    // Queue INFO in write_buf (will be encrypted by tls_flush_encrypted)
-                    client.write_buf.extend_from_slice(&self.info_line);
-                    client.phase = ConnPhase::SendInfo;
-                    self.tls_flush_encrypted(conn_id);
-                    // Check if all encrypted data was flushed
-                    let flushed = match self.conns.get(&conn_id) {
-                        Some(c) => {
-                            if let Transport::Tls(ref tls) = c.transport {
-                                tls.enc_out.is_empty()
-                            } else {
-                                true
-                            }
-                        }
-                        None => return,
-                    };
-                    if flushed {
-                        if let Some(c) = self.conns.get_mut(&conn_id) {
-                            c.phase = ConnPhase::WaitConnect;
-                        }
-                    }
+            match phase {
+                ConnPhase::SendInfo => return,
+                ConnPhase::TlsHandshake => {
+                    self.process_tls_handshake(conn_id);
+                    return;
                 }
-                return;
-            }
-
-            if phase == 0 {
-                // WsHandshake: parse HTTP upgrade request
-                let result = {
-                    let client = self.conns.get(&conn_id).unwrap();
-                    websocket::parse_ws_upgrade(&client.read_buf)
-                };
-                match result {
-                    None => return, // need more data
-                    Some(Err(_)) => {
-                        // Bad upgrade request
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client
-                                .write_buf
-                                .extend_from_slice(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-                        }
-                        self.try_flush_conn(conn_id);
-                        self.remove_conn(conn_id);
+                ConnPhase::WsHandshake => {
+                    if !self.process_ws_handshake(conn_id) {
                         return;
                     }
-                    Some(Ok((upgrade, consumed))) => {
-                        let response = websocket::build_ws_accept_response(&upgrade.key);
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        // Consume HTTP request from read_buf
-                        client.read_buf.advance(consumed);
-                        // Write raw HTTP 101 response directly to ws_out
-                        // (bypassing WS framing since this is the upgrade response)
-                        if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
-                            ws_out.extend_from_slice(&response);
-                        }
-                        // Queue INFO in write_buf (will be WS-encoded by try_flush_conn)
-                        let info_line = self.info_line.clone();
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        client.write_buf.extend_from_slice(&info_line);
-                        // Now transition to SendInfo
-                        client.phase = ConnPhase::SendInfo;
-                        self.try_flush_conn(conn_id);
+                }
+                ConnPhase::WaitConnect => {
+                    if self.check_max_control_line(conn_id) {
+                        return;
+                    }
+                    if !self.process_wait_connect(conn_id) {
+                        return;
                     }
                 }
-                continue;
-            }
-
-            // Max control line check: if the buffer is larger than the limit
-            // and there is no newline within the first max_control_line bytes,
-            // the client is sending an oversized control line.
-            if phase == 1 || phase == 2 {
-                let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
-                if max_ctrl > 0 {
-                    let exceeded = {
-                        let client = self.conns.get(&conn_id).unwrap();
-                        let buf: &[u8] = &client.read_buf;
-                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
-                    };
-                    if exceeded {
-                        warn!(
-                            conn_id,
-                            max_control_line = max_ctrl,
-                            "maximum control line exceeded"
-                        );
-                        counter!("connections_rejected_total").increment(1);
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client
-                                .write_buf
-                                .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
-                        }
-                        self.try_flush_conn(conn_id);
-                        self.remove_conn(conn_id);
+                ConnPhase::Active | ConnPhase::Draining => {
+                    if self.check_max_control_line(conn_id) {
+                        return;
+                    }
+                    if !self.dispatch_active(conn_id) {
                         return;
                     }
                 }
             }
+        }
+    }
 
-            if phase == 1 {
-                // WaitConnect: parse CONNECT (or route INFO+CONNECT for route conns)
-
-                // Route connections use the route protocol parser (INFO+CONNECT+PING).
-                #[cfg(feature = "cluster")]
-                let is_route_conn = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.ext.is_route())
-                    .unwrap_or(false);
-                #[cfg(not(feature = "cluster"))]
-                let _is_route_conn = false;
-
-                #[cfg(feature = "cluster")]
-                if is_route_conn {
-                    let route_op = {
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        match nats_proto::try_parse_route_op(&mut client.read_buf) {
-                            Ok(op) => op,
-                            Err(_) => {
-                                self.remove_conn(conn_id);
-                                return;
-                            }
-                        }
-                    };
-                    match route_op {
-                        Some(RouteOp::Info(peer_info)) => {
-                            // Process gossip connect_urls from peer's INFO.
-                            if !peer_info.connect_urls.is_empty() {
-                                crate::route_conn::process_gossip_urls(
-                                    &self.state,
-                                    &peer_info.connect_urls,
-                                );
-                            }
-                            continue;
-                        }
-                        Some(RouteOp::Connect(connect_info)) => {
-                            let peer_sid = connect_info.server_id.clone();
-
-                            // Self-connect check.
-                            if let Some(ref sid) = peer_sid {
-                                if *sid == self.state.info.server_id {
-                                    debug!(conn_id, "self-connect on inbound route, closing");
-                                    self.remove_conn(conn_id);
-                                    return;
-                                }
-                            }
-
-                            // Peer's CONNECT — go Active, register, exchange subs.
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            client.phase = ConnPhase::Active;
-                            client.echo = false;
-                            #[cfg(feature = "leaf")]
-                            {
-                                client.upstream_txs =
-                                    self.state.upstream_txs.read().unwrap().clone();
-                            }
-                            client.write_buf.extend_from_slice(b"PONG\r\n");
-
-                            // Store peer_server_id for cleanup.
-                            if let ConnExt::Route {
-                                ref mut peer_server_id,
-                                ..
-                            } = client.ext
-                            {
-                                *peer_server_id = peer_sid.clone();
-                            }
-
-                            // Note: we intentionally do NOT register inbound peers
-                            // in route_peers.connected here. The outbound side handles
-                            // its own registration in connect_route(). Having both an
-                            // inbound and outbound route to the same peer is harmless
-                            // (one-hop enforcement prevents message loops) and avoids
-                            // a retry storm when outbound dedup rejects connections.
-
-                            // Register route DirectWriter.
-                            let dw = client.direct_writer.clone();
-                            self.state
-                                .route_writers
-                                .write()
-                                .unwrap()
-                                .insert(conn_id, dw);
-
-                            // Send existing local subscriptions as RS+ to the new route.
-                            send_existing_subs_to_route(&self.state, &client.direct_writer);
-
-                            // Broadcast updated INFO to all routes (gossip re-broadcast).
-                            crate::route_conn::broadcast_route_info(&self.state);
-
-                            info!(conn_id, "inbound route connected");
-                        }
-                        Some(RouteOp::Ping) => {
-                            // Peer sent PING during handshake — respond with PONG.
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.write_buf.extend_from_slice(b"PONG\r\n");
-                            }
-                            continue;
-                        }
-                        Some(_) => {
-                            self.remove_conn(conn_id);
-                            return;
-                        }
-                        None => return, // need more data
-                    }
-                    // After route handshake ops, continue the outer loop to process
-                    // remaining data in the read buffer.
-                    continue;
+    /// Process TLS handshake phase: check completion, queue INFO, flush encrypted.
+    fn process_tls_handshake(&mut self, conn_id: u64) {
+        let handshake_done = match self.conns.get(&conn_id) {
+            Some(c) => {
+                if let Transport::Tls(ref tls) = c.transport {
+                    !tls.tls_conn.is_handshaking()
+                } else {
+                    false
                 }
-
-                // Gateway connections use the gateway protocol parser (INFO+CONNECT+PING).
-                #[cfg(feature = "gateway")]
-                let is_gateway_conn = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.ext.is_gateway())
-                    .unwrap_or(false);
-
-                #[cfg(feature = "gateway")]
-                if is_gateway_conn {
-                    let gw_op = {
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
-                            Ok(op) => op,
-                            Err(_) => {
-                                self.remove_conn(conn_id);
-                                return;
-                            }
-                        }
-                    };
-                    match gw_op {
-                        Some(nats_proto::GatewayOp::Info(peer_info)) => {
-                            // Process gateway_urls from peer's INFO for gossip.
-                            if let Some(ref urls) = peer_info.gateway_urls {
-                                if !urls.is_empty() {
-                                    let tx = self.state.gateway_connect_tx.lock().unwrap();
-                                    let mut peers = self.state.gateway_peers.lock().unwrap();
-                                    for url in urls {
-                                        if peers.known_urls.insert(url.clone()) {
-                                            if let Some(ref sender) = *tx {
-                                                let _ = sender.send(url.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        Some(nats_proto::GatewayOp::Connect(connect_info)) => {
-                            // Extract gateway name from CONNECT.
-                            let peer_gw_name = connect_info.gateway.clone();
-
-                            // Peer's CONNECT — go Active, register, exchange subs.
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            client.phase = ConnPhase::Active;
-                            client.echo = false;
-                            #[cfg(feature = "leaf")]
-                            {
-                                client.upstream_txs =
-                                    self.state.upstream_txs.read().unwrap().clone();
-                            }
-                            client.write_buf.extend_from_slice(b"PONG\r\n");
-
-                            // Store peer gateway name for cleanup.
-                            if let ConnExt::Gateway {
-                                ref mut peer_gateway_name,
-                                ..
-                            } = client.ext
-                            {
-                                *peer_gateway_name = peer_gw_name.clone();
-                            }
-
-                            // Register gateway DirectWriter.
-                            let dw = client.direct_writer.clone();
-                            self.state
-                                .gateway_writers
-                                .write()
-                                .unwrap()
-                                .insert(conn_id, dw);
-
-                            // Register in gateway_peers.
-                            if let Some(ref name) = peer_gw_name {
-                                let mut peers = self.state.gateway_peers.lock().unwrap();
-                                peers
-                                    .connected
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .insert(conn_id);
-                            }
-
-                            // Send existing local subscriptions as RS+ to the
-                            // new gateway (interest-only mode).
-                            send_existing_subs_to_gateway(&self.state, &client.direct_writer);
-
-                            // Broadcast updated INFO to all gateways (gossip).
-                            crate::gateway_conn::broadcast_gateway_info(&self.state);
-
-                            info!(
+            }
+            None => return,
+        };
+        if handshake_done {
+            // Log client certificate if present (mTLS)
+            if let Some(c) = self.conns.get(&conn_id) {
+                if let Transport::Tls(ref tls) = c.transport {
+                    if let Some(certs) = tls.tls_conn.peer_certificates() {
+                        if let Some(cert) = certs.first() {
+                            tracing::info!(
                                 conn_id,
-                                peer_gateway = ?peer_gw_name,
-                                "inbound gateway connected"
+                                cert_len = cert.len(),
+                                "client certificate verified"
                             );
                         }
-                        Some(nats_proto::GatewayOp::Ping) => {
-                            // Peer sent PING during handshake — respond with PONG.
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.write_buf.extend_from_slice(b"PONG\r\n");
-                            }
-                            continue;
-                        }
-                        Some(_) => {
-                            self.remove_conn(conn_id);
-                            return;
-                        }
-                        None => return, // need more data
                     }
-                    // After gateway handshake ops, continue the outer loop.
-                    continue;
                 }
+            }
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            // Queue INFO in write_buf (will be encrypted by tls_flush_encrypted)
+            client.write_buf.extend_from_slice(&self.info_line);
+            client.phase = ConnPhase::SendInfo;
+            self.tls_flush_encrypted(conn_id);
+            // Check if all encrypted data was flushed
+            let flushed = match self.conns.get(&conn_id) {
+                Some(c) => {
+                    if let Transport::Tls(ref tls) = c.transport {
+                        tls.enc_out.is_empty()
+                    } else {
+                        true
+                    }
+                }
+                None => return,
+            };
+            if flushed {
+                if let Some(c) = self.conns.get_mut(&conn_id) {
+                    c.phase = ConnPhase::WaitConnect;
+                }
+            }
+        }
+    }
 
-                let op = {
-                    let client = self.conns.get_mut(&conn_id).unwrap();
-                    match nats_proto::try_parse_client_op(&mut client.read_buf) {
-                        Ok(op) => op,
-                        Err(_) => {
+    /// Process WebSocket handshake: parse HTTP upgrade, send accept response, queue INFO.
+    ///
+    /// Returns `true` if the caller should `continue` the loop, `false` to `return`.
+    fn process_ws_handshake(&mut self, conn_id: u64) -> bool {
+        let result = {
+            let client = self.conns.get(&conn_id).unwrap();
+            websocket::parse_ws_upgrade(&client.read_buf)
+        };
+        match result {
+            None => false, // need more data
+            Some(Err(_)) => {
+                // Bad upgrade request
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client
+                        .write_buf
+                        .extend_from_slice(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                }
+                self.try_flush_conn(conn_id);
+                self.remove_conn(conn_id);
+                false
+            }
+            Some(Ok((upgrade, consumed))) => {
+                let response = websocket::build_ws_accept_response(&upgrade.key);
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                // Consume HTTP request from read_buf
+                client.read_buf.advance(consumed);
+                // Write raw HTTP 101 response directly to ws_out
+                // (bypassing WS framing since this is the upgrade response)
+                if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
+                    ws_out.extend_from_slice(&response);
+                }
+                // Queue INFO in write_buf (will be WS-encoded by try_flush_conn)
+                let info_line = self.info_line.clone();
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                client.write_buf.extend_from_slice(&info_line);
+                // Now transition to SendInfo
+                client.phase = ConnPhase::SendInfo;
+                self.try_flush_conn(conn_id);
+                true // continue loop
+            }
+        }
+    }
+
+    /// Check if read buffer exceeds `max_control_line` without a newline.
+    ///
+    /// Returns `true` if exceeded (caller should return), `false` if OK.
+    fn check_max_control_line(&mut self, conn_id: u64) -> bool {
+        let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
+        if max_ctrl > 0 {
+            let exceeded = {
+                let client = self.conns.get(&conn_id).unwrap();
+                let buf: &[u8] = &client.read_buf;
+                buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+            };
+            if exceeded {
+                warn!(
+                    conn_id,
+                    max_control_line = max_ctrl,
+                    "maximum control line exceeded"
+                );
+                counter!("connections_rejected_total").increment(1);
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client
+                        .write_buf
+                        .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                }
+                self.try_flush_conn(conn_id);
+                self.remove_conn(conn_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Process WaitConnect phase: parse CONNECT from client/leaf/route/gateway.
+    ///
+    /// Returns `true` if the caller should `continue` the loop, `false` to `return`.
+    fn process_wait_connect(&mut self, conn_id: u64) -> bool {
+        // Route connections use the route protocol parser (INFO+CONNECT+PING).
+        #[cfg(feature = "cluster")]
+        let is_route_conn = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.ext.is_route())
+            .unwrap_or(false);
+        #[cfg(not(feature = "cluster"))]
+        let _is_route_conn = false;
+
+        #[cfg(feature = "cluster")]
+        if is_route_conn {
+            let route_op = {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                match nats_proto::try_parse_route_op(&mut client.read_buf) {
+                    Ok(op) => op,
+                    Err(_) => {
+                        self.remove_conn(conn_id);
+                        return false;
+                    }
+                }
+            };
+            match route_op {
+                Some(RouteOp::Info(peer_info)) => {
+                    // Process gossip connect_urls from peer's INFO.
+                    if !peer_info.connect_urls.is_empty() {
+                        crate::route_conn::process_gossip_urls(
+                            &self.state,
+                            &peer_info.connect_urls,
+                        );
+                    }
+                    return true; // continue
+                }
+                Some(RouteOp::Connect(connect_info)) => {
+                    let peer_sid = connect_info.server_id.clone();
+
+                    // Self-connect check.
+                    if let Some(ref sid) = peer_sid {
+                        if *sid == self.state.info.server_id {
+                            debug!(conn_id, "self-connect on inbound route, closing");
                             self.remove_conn(conn_id);
-                            return;
+                            return false;
                         }
                     }
-                };
-                match op {
-                    Some(ClientOp::Connect(connect_info)) => {
-                        #[cfg(feature = "hub")]
-                        let is_leaf = self
-                            .conns
-                            .get(&conn_id)
-                            .map(|c| c.ext.is_leaf())
-                            .unwrap_or(false);
-                        #[cfg(not(feature = "hub"))]
-                        let is_leaf = false;
 
-                        if is_leaf {
-                            // Inbound leaf node — validate leaf auth, send PING, go Active.
-                            #[cfg(feature = "hub")]
-                            {
-                                // Validate leaf auth before taking mutable borrow on conns.
-                                let leaf_perms = self.state.leaf_auth.validate(&connect_info);
-                                let leaf_perms = match leaf_perms {
-                                    Some(p) => p.map(std::sync::Arc::new),
-                                    None => {
-                                        // Auth failed — disconnect.
-                                        warn!(conn_id, "leaf authorization violation");
-                                        counter!(
-                                            "auth_failures_total",
-                                            "worker" => self.worker_label.clone()
-                                        )
-                                        .increment(1);
-                                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                                            client.write_buf.extend_from_slice(
-                                                b"-ERR 'Authorization Violation'\r\n",
-                                            );
-                                        }
-                                        self.try_flush_conn(conn_id);
-                                        self.remove_conn(conn_id);
-                                        return;
+                    // Peer's CONNECT — go Active, register, exchange subs.
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    client.phase = ConnPhase::Active;
+                    client.echo = false;
+                    #[cfg(feature = "leaf")]
+                    {
+                        client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
+                    }
+                    client.write_buf.extend_from_slice(b"PONG\r\n");
+
+                    // Store peer_server_id for cleanup.
+                    if let ConnExt::Route {
+                        ref mut peer_server_id,
+                        ..
+                    } = client.ext
+                    {
+                        *peer_server_id = peer_sid.clone();
+                    }
+
+                    // Note: we intentionally do NOT register inbound peers
+                    // in route_peers.connected here. The outbound side handles
+                    // its own registration in connect_route(). Having both an
+                    // inbound and outbound route to the same peer is harmless
+                    // (one-hop enforcement prevents message loops) and avoids
+                    // a retry storm when outbound dedup rejects connections.
+
+                    // Register route DirectWriter.
+                    let dw = client.direct_writer.clone();
+                    self.state
+                        .route_writers
+                        .write()
+                        .unwrap()
+                        .insert(conn_id, dw);
+
+                    // Send existing local subscriptions as RS+ to the new route.
+                    send_existing_subs_to_route(&self.state, &client.direct_writer);
+
+                    // Broadcast updated INFO to all routes (gossip re-broadcast).
+                    crate::route_conn::broadcast_route_info(&self.state);
+
+                    info!(conn_id, "inbound route connected");
+                }
+                Some(RouteOp::Ping) => {
+                    // Peer sent PING during handshake — respond with PONG.
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client.write_buf.extend_from_slice(b"PONG\r\n");
+                    }
+                    return true; // continue
+                }
+                Some(_) => {
+                    self.remove_conn(conn_id);
+                    return false;
+                }
+                None => return false, // need more data
+            }
+            // After route handshake ops, continue the outer loop to process
+            // remaining data in the read buffer.
+            return true;
+        }
+
+        // Gateway connections use the gateway protocol parser (INFO+CONNECT+PING).
+        #[cfg(feature = "gateway")]
+        let is_gateway_conn = self
+            .conns
+            .get(&conn_id)
+            .map(|c| c.ext.is_gateway())
+            .unwrap_or(false);
+
+        #[cfg(feature = "gateway")]
+        if is_gateway_conn {
+            let gw_op = {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
+                    Ok(op) => op,
+                    Err(_) => {
+                        self.remove_conn(conn_id);
+                        return false;
+                    }
+                }
+            };
+            match gw_op {
+                Some(nats_proto::GatewayOp::Info(peer_info)) => {
+                    // Process gateway_urls from peer's INFO for gossip.
+                    if let Some(ref urls) = peer_info.gateway_urls {
+                        if !urls.is_empty() {
+                            let tx = self.state.gateway_connect_tx.lock().unwrap();
+                            let mut peers = self.state.gateway_peers.lock().unwrap();
+                            for url in urls {
+                                if peers.known_urls.insert(url.clone()) {
+                                    if let Some(ref sender) = *tx {
+                                        let _ = sender.send(url.clone());
                                     }
-                                };
-
-                                let client = self.conns.get_mut(&conn_id).unwrap();
-                                client.phase = ConnPhase::Active;
-                                client.echo = false; // suppress echo for leaf conns
-                                client.permissions =
-                                    leaf_perms.as_ref().map(|p| p.as_ref().clone());
-                                #[cfg(feature = "leaf")]
-                                {
-                                    client.upstream_txs =
-                                        self.state.upstream_txs.read().unwrap().clone();
                                 }
-                                client.write_buf.extend_from_slice(b"PING\r\n");
-
-                                // Register leaf DirectWriter so interest can be propagated.
-                                let dw = client.direct_writer.clone();
-                                self.state
-                                    .leaf_writers
-                                    .write()
-                                    .unwrap()
-                                    .insert(conn_id, (dw, leaf_perms.clone()));
-
-                                // Send existing subscriptions as LS+ to the new leaf.
-                                send_existing_subs(&self.state, &client.direct_writer, &leaf_perms);
-
-                                info!(conn_id, "inbound leaf connected");
                             }
-                        } else {
-                            // Regular client connection — validate auth.
-                            if !self
-                                .state
-                                .auth
-                                .validate(&connect_info, &self.state.info.nonce)
-                            {
-                                warn!(conn_id, "authorization violation");
+                        }
+                    }
+                    return true; // continue
+                }
+                Some(nats_proto::GatewayOp::Connect(connect_info)) => {
+                    // Extract gateway name from CONNECT.
+                    let peer_gw_name = connect_info.gateway.clone();
+
+                    // Peer's CONNECT — go Active, register, exchange subs.
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    client.phase = ConnPhase::Active;
+                    client.echo = false;
+                    #[cfg(feature = "leaf")]
+                    {
+                        client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
+                    }
+                    client.write_buf.extend_from_slice(b"PONG\r\n");
+
+                    // Store peer gateway name for cleanup.
+                    if let ConnExt::Gateway {
+                        ref mut peer_gateway_name,
+                        ..
+                    } = client.ext
+                    {
+                        *peer_gateway_name = peer_gw_name.clone();
+                    }
+
+                    // Register gateway DirectWriter.
+                    let dw = client.direct_writer.clone();
+                    self.state
+                        .gateway_writers
+                        .write()
+                        .unwrap()
+                        .insert(conn_id, dw);
+
+                    // Register in gateway_peers.
+                    if let Some(ref name) = peer_gw_name {
+                        let mut peers = self.state.gateway_peers.lock().unwrap();
+                        peers
+                            .connected
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(conn_id);
+                    }
+
+                    // Send existing local subscriptions as RS+ to the
+                    // new gateway (interest-only mode).
+                    send_existing_subs_to_gateway(&self.state, &client.direct_writer);
+
+                    // Broadcast updated INFO to all gateways (gossip).
+                    crate::gateway_conn::broadcast_gateway_info(&self.state);
+
+                    info!(
+                        conn_id,
+                        peer_gateway = ?peer_gw_name,
+                        "inbound gateway connected"
+                    );
+                }
+                Some(nats_proto::GatewayOp::Ping) => {
+                    // Peer sent PING during handshake — respond with PONG.
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client.write_buf.extend_from_slice(b"PONG\r\n");
+                    }
+                    return true; // continue
+                }
+                Some(_) => {
+                    self.remove_conn(conn_id);
+                    return false;
+                }
+                None => return false, // need more data
+            }
+            // After gateway handshake ops, continue the outer loop.
+            return true;
+        }
+
+        let op = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            match nats_proto::try_parse_client_op(&mut client.read_buf) {
+                Ok(op) => op,
+                Err(_) => {
+                    self.remove_conn(conn_id);
+                    return false;
+                }
+            }
+        };
+        match op {
+            Some(ClientOp::Connect(connect_info)) => {
+                #[cfg(feature = "hub")]
+                let is_leaf = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_leaf())
+                    .unwrap_or(false);
+                #[cfg(not(feature = "hub"))]
+                let is_leaf = false;
+
+                if is_leaf {
+                    // Inbound leaf node — validate leaf auth, send PING, go Active.
+                    #[cfg(feature = "hub")]
+                    {
+                        // Validate leaf auth before taking mutable borrow on conns.
+                        let leaf_perms = self.state.leaf_auth.validate(&connect_info);
+                        let leaf_perms = match leaf_perms {
+                            Some(p) => p.map(std::sync::Arc::new),
+                            None => {
+                                // Auth failed — disconnect.
+                                warn!(conn_id, "leaf authorization violation");
                                 counter!(
                                     "auth_failures_total",
                                     "worker" => self.worker_label.clone()
@@ -2065,365 +2044,260 @@ impl Worker {
                                 }
                                 self.try_flush_conn(conn_id);
                                 self.remove_conn(conn_id);
-                                return;
+                                return false;
                             }
-                            let perms = self.state.auth.lookup_permissions(&connect_info);
-                            #[cfg(feature = "accounts")]
-                            let acct_id = self.state.lookup_account(connect_info.user.as_deref());
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            client.phase = ConnPhase::Active;
-                            client.echo = connect_info.echo;
-                            client.no_responders =
-                                connect_info.no_responders && connect_info.headers;
-                            client.permissions = perms;
-                            #[cfg(feature = "accounts")]
-                            {
-                                client.account_id = acct_id;
-                            }
-                            #[cfg(feature = "leaf")]
-                            {
-                                client.upstream_txs =
-                                    self.state.upstream_txs.read().unwrap().clone();
-                            }
-                            info!(conn_id, "client connected");
+                        };
+
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        client.phase = ConnPhase::Active;
+                        client.echo = false; // suppress echo for leaf conns
+                        client.permissions = leaf_perms.as_ref().map(|p| p.as_ref().clone());
+                        #[cfg(feature = "leaf")]
+                        {
+                            client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                         }
+                        client.write_buf.extend_from_slice(b"PING\r\n");
+
+                        // Register leaf DirectWriter so interest can be propagated.
+                        let dw = client.direct_writer.clone();
+                        self.state
+                            .leaf_writers
+                            .write()
+                            .unwrap()
+                            .insert(conn_id, (dw, leaf_perms.clone()));
+
+                        // Send existing subscriptions as LS+ to the new leaf.
+                        send_existing_subs(&self.state, &client.direct_writer, &leaf_perms);
+
+                        info!(conn_id, "inbound leaf connected");
                     }
-                    Some(_) => {
-                        // Wrong op
+                } else {
+                    // Regular client connection — validate auth.
+                    if !self
+                        .state
+                        .auth
+                        .validate(&connect_info, &self.state.info.nonce)
+                    {
+                        warn!(conn_id, "authorization violation");
+                        counter!(
+                            "auth_failures_total",
+                            "worker" => self.worker_label.clone()
+                        )
+                        .increment(1);
                         if let Some(client) = self.conns.get_mut(&conn_id) {
                             client
                                 .write_buf
-                                .extend_from_slice(b"-ERR 'expected CONNECT'\r\n");
+                                .extend_from_slice(b"-ERR 'Authorization Violation'\r\n");
                         }
                         self.try_flush_conn(conn_id);
                         self.remove_conn(conn_id);
-                        return;
+                        return false;
                     }
-                    None => return, // need more data
+                    let perms = self.state.auth.lookup_permissions(&connect_info);
+                    #[cfg(feature = "accounts")]
+                    let acct_id = self.state.lookup_account(connect_info.user.as_deref());
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    client.phase = ConnPhase::Active;
+                    client.echo = connect_info.echo;
+                    client.no_responders = connect_info.no_responders && connect_info.headers;
+                    client.permissions = perms;
+                    #[cfg(feature = "accounts")]
+                    {
+                        client.account_id = acct_id;
+                    }
+                    #[cfg(feature = "leaf")]
+                    {
+                        client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
+                    }
+                    info!(conn_id, "client connected");
                 }
+            }
+            Some(_) => {
+                // Wrong op
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client
+                        .write_buf
+                        .extend_from_slice(b"-ERR 'expected CONNECT'\r\n");
+                }
+                self.try_flush_conn(conn_id);
+                self.remove_conn(conn_id);
+                return false;
+            }
+            None => return false, // need more data
+        }
+        true // continue loop
+    }
+
+    // --- Active phase dispatch ---
+
+    /// Dispatch to the appropriate handler based on connection kind.
+    fn dispatch_active(&mut self, conn_id: u64) -> bool {
+        let conn_kind = match self.conns.get(&conn_id) {
+            Some(c) => c.ext.kind_tag(),
+            None => return false,
+        };
+        match conn_kind {
+            #[cfg(feature = "hub")]
+            ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
+            #[cfg(feature = "cluster")]
+            ConnKind::Route => self.process_active::<RouteHandler>(conn_id),
+            #[cfg(feature = "gateway")]
+            ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
+            ConnKind::Client => self.process_active_client(conn_id),
+        }
+    }
+
+    /// Generic active-phase processing: parse → handle → cleanup.
+    ///
+    /// Works for any connection type that implements `ConnectionHandler`.
+    /// The client path uses its own method due to the `can_skip` optimization.
+    fn process_active<H: ConnectionHandler>(&mut self, conn_id: u64) -> bool {
+        let op = match self.parse_conn_op::<H>(conn_id) {
+            Some(op) => op,
+            None => return false,
+        };
+        self.dispatch_and_apply::<H>(conn_id, op)
+    }
+
+    /// Parse the next protocol operation from a connection's read buffer.
+    ///
+    /// Returns `Some(op)` on success. On `None` (need more data) shrinks the
+    /// buffer; on error disconnects the connection.
+    fn parse_conn_op<H: ConnectionHandler>(&mut self, conn_id: u64) -> Option<H::Op> {
+        let result = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            H::parse_op(&mut client.read_buf)
+        };
+        match result {
+            Ok(Some(op)) => Some(op),
+            Ok(None) => {
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client.read_buf.try_shrink();
+                }
+                None
+            }
+            Err(_) => {
+                self.remove_conn(conn_id);
+                None
+            }
+        }
+    }
+
+    /// Dispatch a parsed op through its handler, then apply the result.
+    fn dispatch_and_apply<H: ConnectionHandler>(&mut self, conn_id: u64, op: H::Op) -> bool {
+        let (result, expired) = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            let mut conn_ctx = client.conn_ctx(conn_id);
+            let mut worker_ctx = WorkerCtx {
+                state: &self.state,
+                event_fd: self.event_fd.as_raw_fd(),
+                pending_notify: &mut self.pending_notify,
+                pending_notify_count: &mut self.pending_notify_count,
+                msgs_received: &mut self.msgs_received,
+                msgs_received_bytes: &mut self.msgs_received_bytes,
+                msgs_delivered: &mut self.msgs_delivered,
+                msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                worker_label: &self.worker_label,
+                #[cfg(feature = "worker-affinity")]
+                worker_index: self.worker_index,
+            };
+            H::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+        };
+        self.apply_result(conn_id, result, expired)
+    }
+
+    /// Handle expired subs cleanup and flush/disconnect from a `HandleResult`.
+    fn apply_result(
+        &mut self,
+        conn_id: u64,
+        result: HandleResult,
+        expired: Vec<(u64, u64)>,
+    ) -> bool {
+        #[cfg(feature = "accounts")]
+        let acct = self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
+        handle_expired_subs(
+            &expired,
+            &self.state,
+            &mut self.conns,
+            &self.worker_label,
+            #[cfg(feature = "accounts")]
+            acct,
+        );
+        match result {
+            HandleResult::Ok => true,
+            HandleResult::Flush => {
+                self.try_flush_conn(conn_id);
+                true
+            }
+            HandleResult::Disconnect => {
+                self.try_flush_conn(conn_id);
+                self.remove_conn(conn_id);
+                false
+            }
+        }
+    }
+
+    /// Client-specific active processing with `can_skip` optimization.
+    fn process_active_client(&mut self, conn_id: u64) -> bool {
+        let can_skip = self.can_skip_publishes(conn_id);
+        let op = match self.parse_client_op(conn_id, can_skip) {
+            Some(op) => op,
+            None => return false,
+        };
+        match op {
+            ClientOp::Pong if can_skip => true,
+            ClientOp::Pong => {
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client.pings_outstanding = 0;
+                    client.last_activity = Instant::now();
+                }
+                true
+            }
+            op => self.dispatch_and_apply::<ClientHandler>(conn_id, op),
+        }
+    }
+
+    /// Check if publishes can be skipped (no subscribers, no upstream, no gateways).
+    fn can_skip_publishes(&self, conn_id: u64) -> bool {
+        #[cfg(feature = "gateway")]
+        let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
+        #[cfg(not(feature = "gateway"))]
+        let has_gw = false;
+
+        #[cfg(feature = "leaf")]
+        {
+            let client = self.conns.get(&conn_id).unwrap();
+            client.upstream_txs.is_empty()
+                && !self.state.has_subs.load(Ordering::Relaxed)
+                && !has_gw
+        }
+        #[cfg(not(feature = "leaf"))]
+        {
+            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
+        }
+    }
+
+    /// Parse a client op, optionally using the skip-publish fast path.
+    fn parse_client_op(&mut self, conn_id: u64, can_skip: bool) -> Option<ClientOp> {
+        let result = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            if can_skip {
+                nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
             } else {
-                // Active phase: parse ops (client or leaf protocol).
-                #[cfg(feature = "hub")]
-                let is_leaf = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.ext.is_leaf())
-                    .unwrap_or(false);
-                #[cfg(not(feature = "hub"))]
-                let is_leaf = false;
-
-                #[cfg(feature = "cluster")]
-                let is_route = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.ext.is_route())
-                    .unwrap_or(false);
-                #[cfg(not(feature = "cluster"))]
-                let is_route = false;
-
-                #[cfg(feature = "gateway")]
-                let is_gateway = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.ext.is_gateway())
-                    .unwrap_or(false);
-                #[cfg(not(feature = "gateway"))]
-                let is_gateway = false;
-
-                if is_leaf {
-                    // Leaf connection: parse leaf protocol ops (LS+, LS-, LMSG, PING, PONG).
-                    #[cfg(feature = "hub")]
-                    {
-                        let op = {
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            match nats_proto::try_parse_leaf_op(&mut client.read_buf) {
-                                Ok(op) => op,
-                                Err(_) => {
-                                    self.remove_conn(conn_id);
-                                    return;
-                                }
-                            }
-                        };
-                        match op {
-                            Some(op) => {
-                                let (result, expired) = {
-                                    let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let mut conn_ctx = client.conn_ctx(conn_id);
-                                    let mut worker_ctx = WorkerCtx {
-                                        state: &self.state,
-                                        event_fd: self.event_fd.as_raw_fd(),
-                                        pending_notify: &mut self.pending_notify,
-                                        pending_notify_count: &mut self.pending_notify_count,
-                                        msgs_received: &mut self.msgs_received,
-                                        msgs_received_bytes: &mut self.msgs_received_bytes,
-                                        msgs_delivered: &mut self.msgs_delivered,
-                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
-                                        worker_label: &self.worker_label,
-                                        #[cfg(feature = "worker-affinity")]
-                                        worker_index: self.worker_index,
-                                    };
-                                    LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
-                                };
-                                {
-                                    #[cfg(feature = "accounts")]
-                                    let acct =
-                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
-                                    handle_expired_subs(
-                                        &expired,
-                                        &self.state,
-                                        &mut self.conns,
-                                        &self.worker_label,
-                                        #[cfg(feature = "accounts")]
-                                        acct,
-                                    );
-                                }
-                                match result {
-                                    HandleResult::Ok => {}
-                                    HandleResult::Flush => self.try_flush_conn(conn_id),
-                                    HandleResult::Disconnect => {
-                                        self.try_flush_conn(conn_id);
-                                        self.remove_conn(conn_id);
-                                        return;
-                                    }
-                                }
-                            }
-                            None => {
-                                if let Some(client) = self.conns.get_mut(&conn_id) {
-                                    client.read_buf.try_shrink();
-                                }
-                                return;
-                            }
-                        }
-                    }
-                } else if is_route {
-                    // Route connection: parse route protocol ops (RS+, RS-, RMSG, PING, PONG).
-                    #[cfg(feature = "cluster")]
-                    {
-                        let op = {
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            match nats_proto::try_parse_route_op(&mut client.read_buf) {
-                                Ok(op) => op,
-                                Err(_) => {
-                                    self.remove_conn(conn_id);
-                                    return;
-                                }
-                            }
-                        };
-                        match op {
-                            Some(op) => {
-                                let (result, expired) = {
-                                    let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let mut conn_ctx = client.conn_ctx(conn_id);
-                                    let mut worker_ctx = WorkerCtx {
-                                        state: &self.state,
-                                        event_fd: self.event_fd.as_raw_fd(),
-                                        pending_notify: &mut self.pending_notify,
-                                        pending_notify_count: &mut self.pending_notify_count,
-                                        msgs_received: &mut self.msgs_received,
-                                        msgs_received_bytes: &mut self.msgs_received_bytes,
-                                        msgs_delivered: &mut self.msgs_delivered,
-                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
-                                        worker_label: &self.worker_label,
-                                        #[cfg(feature = "worker-affinity")]
-                                        worker_index: self.worker_index,
-                                    };
-                                    RouteHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
-                                };
-                                {
-                                    #[cfg(feature = "accounts")]
-                                    let acct =
-                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
-                                    handle_expired_subs(
-                                        &expired,
-                                        &self.state,
-                                        &mut self.conns,
-                                        &self.worker_label,
-                                        #[cfg(feature = "accounts")]
-                                        acct,
-                                    );
-                                }
-                                match result {
-                                    HandleResult::Ok => {}
-                                    HandleResult::Flush => self.try_flush_conn(conn_id),
-                                    HandleResult::Disconnect => {
-                                        self.try_flush_conn(conn_id);
-                                        self.remove_conn(conn_id);
-                                        return;
-                                    }
-                                }
-                            }
-                            None => {
-                                if let Some(client) = self.conns.get_mut(&conn_id) {
-                                    client.read_buf.try_shrink();
-                                }
-                                return;
-                            }
-                        }
-                    }
-                } else if is_gateway {
-                    // Gateway connection: parse gateway protocol ops.
-                    #[cfg(feature = "gateway")]
-                    {
-                        let op = {
-                            let client = self.conns.get_mut(&conn_id).unwrap();
-                            match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
-                                Ok(op) => op,
-                                Err(_) => {
-                                    self.remove_conn(conn_id);
-                                    return;
-                                }
-                            }
-                        };
-                        match op {
-                            Some(op) => {
-                                let (result, expired) = {
-                                    let client = self.conns.get_mut(&conn_id).unwrap();
-                                    let mut conn_ctx = client.conn_ctx(conn_id);
-                                    let mut worker_ctx = WorkerCtx {
-                                        state: &self.state,
-                                        event_fd: self.event_fd.as_raw_fd(),
-                                        pending_notify: &mut self.pending_notify,
-                                        pending_notify_count: &mut self.pending_notify_count,
-                                        msgs_received: &mut self.msgs_received,
-                                        msgs_received_bytes: &mut self.msgs_received_bytes,
-                                        msgs_delivered: &mut self.msgs_delivered,
-                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
-                                        worker_label: &self.worker_label,
-                                        #[cfg(feature = "worker-affinity")]
-                                        worker_index: self.worker_index,
-                                    };
-                                    GatewayHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
-                                };
-                                {
-                                    #[cfg(feature = "accounts")]
-                                    let acct =
-                                        self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
-                                    handle_expired_subs(
-                                        &expired,
-                                        &self.state,
-                                        &mut self.conns,
-                                        &self.worker_label,
-                                        #[cfg(feature = "accounts")]
-                                        acct,
-                                    );
-                                }
-                                match result {
-                                    HandleResult::Ok => {}
-                                    HandleResult::Flush => self.try_flush_conn(conn_id),
-                                    HandleResult::Disconnect => {
-                                        self.try_flush_conn(conn_id);
-                                        self.remove_conn(conn_id);
-                                        return;
-                                    }
-                                }
-                            }
-                            None => {
-                                if let Some(client) = self.conns.get_mut(&conn_id) {
-                                    client.read_buf.try_shrink();
-                                }
-                                return;
-                            }
-                        }
-                    }
-                } else {
-                    // Client connection: parse client protocol ops.
-                    let can_skip = {
-                        #[cfg(feature = "gateway")]
-                        let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
-                        #[cfg(not(feature = "gateway"))]
-                        let has_gw = false;
-
-                        #[cfg(feature = "leaf")]
-                        {
-                            let client = self.conns.get(&conn_id).unwrap();
-                            client.upstream_txs.is_empty()
-                                && !self.state.has_subs.load(Ordering::Relaxed)
-                                && !has_gw
-                        }
-                        #[cfg(not(feature = "leaf"))]
-                        {
-                            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
-                        }
-                    };
-
-                    let op = {
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        let result = if can_skip {
-                            nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
-                        } else {
-                            nats_proto::try_parse_client_op(&mut client.read_buf)
-                        };
-                        match result {
-                            Ok(op) => op,
-                            Err(_) => {
-                                self.remove_conn(conn_id);
-                                return;
-                            }
-                        }
-                    };
-
-                    match op {
-                        Some(ClientOp::Pong) if can_skip => {
-                            // Skipped PUB/HPUB, continue parsing
-                            continue;
-                        }
-                        Some(ClientOp::Pong) => {
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.pings_outstanding = 0;
-                                client.last_activity = Instant::now();
-                            }
-                        }
-                        Some(op) => {
-                            let (result, expired) = {
-                                let client = self.conns.get_mut(&conn_id).unwrap();
-                                let mut conn_ctx = client.conn_ctx(conn_id);
-                                let mut worker_ctx = WorkerCtx {
-                                    state: &self.state,
-                                    event_fd: self.event_fd.as_raw_fd(),
-                                    pending_notify: &mut self.pending_notify,
-                                    pending_notify_count: &mut self.pending_notify_count,
-                                    msgs_received: &mut self.msgs_received,
-                                    msgs_received_bytes: &mut self.msgs_received_bytes,
-                                    msgs_delivered: &mut self.msgs_delivered,
-                                    msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
-                                    worker_label: &self.worker_label,
-                                    #[cfg(feature = "worker-affinity")]
-                                    worker_index: self.worker_index,
-                                };
-                                ClientHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
-                            };
-                            {
-                                #[cfg(feature = "accounts")]
-                                let acct =
-                                    self.conns.get(&conn_id).map(|c| c.account_id).unwrap_or(0);
-                                handle_expired_subs(
-                                    &expired,
-                                    &self.state,
-                                    &mut self.conns,
-                                    &self.worker_label,
-                                    #[cfg(feature = "accounts")]
-                                    acct,
-                                );
-                            }
-                            match result {
-                                HandleResult::Ok => {}
-                                HandleResult::Flush => self.try_flush_conn(conn_id),
-                                HandleResult::Disconnect => {
-                                    self.try_flush_conn(conn_id);
-                                    self.remove_conn(conn_id);
-                                    return;
-                                }
-                            }
-                        }
-                        None => {
-                            // No more complete ops — try_shrink and return
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.read_buf.try_shrink();
-                            }
-                            return;
-                        }
-                    }
+                nats_proto::try_parse_client_op(&mut client.read_buf)
+            }
+        };
+        match result {
+            Ok(Some(op)) => Some(op),
+            Ok(None) => {
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client.read_buf.try_shrink();
                 }
+                None
+            }
+            Err(_) => {
+                self.remove_conn(conn_id);
+                None
             }
         }
     }

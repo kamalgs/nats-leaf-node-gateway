@@ -13,7 +13,9 @@ use tracing::warn;
 use crate::buf::LeafOp;
 #[cfg(feature = "leaf")]
 use crate::handler::forward_to_upstream;
-use crate::handler::{bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
+use crate::handler::{
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+};
 use crate::nats_proto;
 #[cfg(feature = "accounts")]
 use crate::propagation::deliver_cross_account;
@@ -26,12 +28,14 @@ use crate::sub_list::Subscription;
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
 pub(crate) struct LeafHandler;
 
-impl LeafHandler {
-    /// Dispatch a parsed leaf protocol operation.
-    ///
-    /// Returns `(HandleResult, expired_subs)`. Expired subs must be cleaned up
-    /// by the worker after regaining `&mut self` access to the connections map.
-    pub(crate) fn handle_op(
+impl ConnectionHandler for LeafHandler {
+    type Op = LeafOp;
+
+    fn parse_op(buf: &mut bytes::BytesMut) -> std::io::Result<Option<LeafOp>> {
+        nats_proto::try_parse_leaf_op(buf)
+    }
+
+    fn handle_op(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
         op: LeafOp,
@@ -62,7 +66,9 @@ impl LeafHandler {
             }
         }
     }
+}
 
+impl LeafHandler {
     fn handle_leaf_sub(
         conn: &mut ConnCtx<'_>,
         wctx: &mut WorkerCtx<'_>,
