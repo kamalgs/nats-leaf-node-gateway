@@ -18,10 +18,12 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstream};
-use crate::nats_proto::{self, GatewayOp, MsgBuilder};
 #[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account_upstream;
+use crate::handler::deliver_cross_account_upstream;
+use crate::handler::{
+    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
+};
+use crate::nats_proto::{self, GatewayOp, MsgBuilder};
 use crate::propagation::unwrap_gateway_reply_bytes;
 use crate::server::{
     GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
@@ -593,20 +595,21 @@ fn handle_gateway_op(
             // Uses Bytes::slice() for zero-copy sub-slicing.
             let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
 
-            // One-hop: skip route subs and gateway subs — messages from a gateway peer
-            // are never re-forwarded.
-            let mut dirty_writers: Vec<DirectWriter> = Vec::new();
-            let (delivered, expired) = deliver_to_subs_upstream_inner(
-                state,
+            let msg = Msg::new(
                 &subject,
                 subject_str,
                 unwrapped_reply.as_deref(),
                 headers.as_ref(),
                 &payload,
+            );
+            // One-hop: skip route subs and gateway subs — messages from a gateway peer
+            // are never re-forwarded.
+            let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+            let (delivered, expired) = deliver_to_subs_upstream_inner(
+                state,
+                &msg,
                 &mut dirty_writers,
-                #[cfg(feature = "cluster")]
-                true, // skip_routes
-                true, // skip_gateways
+                &DeliveryScope::from_gateway(),
                 #[cfg(feature = "accounts")]
                 0, // account_id — will use actual account from wire in Phase 4
             );
@@ -616,11 +619,7 @@ fn handle_gateway_op(
                 let mut expired = expired;
                 let cross_expired = deliver_cross_account_upstream(
                     state,
-                    &subject,
-                    subject_str,
-                    unwrapped_reply.as_deref(),
-                    headers.as_ref(),
-                    &payload,
+                    &msg,
                     &mut dirty_writers,
                     0, // gateway uses $G for now
                 );

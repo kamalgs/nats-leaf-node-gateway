@@ -8,20 +8,12 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
-#[cfg(feature = "leaf")]
-use crate::handler::forward_to_upstream;
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, HandleResult, WorkerCtx,
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult, Msg,
+    WorkerCtx,
 };
 use crate::nats_proto::{self, ClientOp};
-#[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account;
-#[cfg(feature = "gateway")]
-use crate::propagation::propagate_gateway_interest;
-#[cfg(feature = "hub")]
-use crate::propagation::propagate_leaf_interest;
-#[cfg(feature = "cluster")]
-use crate::propagation::propagate_route_interest;
+use crate::propagation::propagate_all_interest;
 use crate::sub_list::Subscription;
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
@@ -116,11 +108,9 @@ impl ClientHandler {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Clone for upstream + leaf propagation before moving into Subscription
+        // Clone for upstream propagation before moving into Subscription
         #[cfg(feature = "leaf")]
         let upstream_queue = queue_str.clone();
-        #[cfg(feature = "hub")]
-        let leaf_queue = queue_str.clone();
 
         let sub = Subscription {
             conn_id: conn.conn_id,
@@ -172,29 +162,8 @@ impl ClientHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate LS+ to inbound leaf connections.
-        #[cfg(feature = "hub")]
-        propagate_leaf_interest(
-            wctx.state,
-            subject_str.as_bytes(),
-            leaf_queue.as_deref().map(|q| q.as_bytes()),
-            true,
-        );
-
-        // Propagate RS+ to inbound route connections.
-        #[cfg(feature = "cluster")]
-        propagate_route_interest(
-            wctx.state,
-            subject_str.as_bytes(),
-            queue_group.as_deref(),
-            true,
-            #[cfg(feature = "accounts")]
-            wctx.state.account_name(conn.account_id).as_bytes(),
-        );
-
-        // Propagate RS+ to gateway connections.
-        #[cfg(feature = "gateway")]
-        propagate_gateway_interest(
+        // Propagate interest (LS+/RS+) to leaf, route, and gateway peers.
+        propagate_all_interest(
             wctx.state,
             subject_str.as_bytes(),
             queue_group.as_deref(),
@@ -219,18 +188,7 @@ impl ClientHandler {
                                 let _ = up.add_interest(ri.src_pattern.clone(), None);
                             }
                         }
-                        #[cfg(feature = "hub")]
-                        propagate_leaf_interest(wctx.state, ri.src_pattern.as_bytes(), None, true);
-                        #[cfg(feature = "cluster")]
-                        propagate_route_interest(
-                            wctx.state,
-                            ri.src_pattern.as_bytes(),
-                            None,
-                            true,
-                            src_acct_name,
-                        );
-                        #[cfg(feature = "gateway")]
-                        propagate_gateway_interest(
+                        propagate_all_interest(
                             wctx.state,
                             ri.src_pattern.as_bytes(),
                             None,
@@ -285,56 +243,12 @@ impl ClientHandler {
                     wctx.state
                         .has_subs
                         .store(!subs.is_empty(), Ordering::Relaxed);
-                    *conn.sub_count = conn.sub_count.saturating_sub(1);
-                    #[cfg(feature = "worker-affinity")]
-                    wctx.state
-                        .affinity
-                        .record_unsub(&removed.subject, wctx.worker_index);
-                    #[cfg(feature = "leaf")]
-                    {
-                        let mut upstreams = wctx.state.upstreams.write().unwrap();
-                        for up in upstreams.iter_mut() {
-                            up.remove_interest(&removed.subject, removed.queue.as_deref());
-                        }
-                    }
-                    gauge!(
-                        "subscriptions_active",
-                        "worker" => wctx.worker_label.to_string()
-                    )
-                    .decrement(1.0);
-                    #[cfg(feature = "hub")]
-                    propagate_leaf_interest(
-                        wctx.state,
-                        removed.subject.as_bytes(),
-                        removed.queue.as_deref().map(|q| q.as_bytes()),
-                        false,
-                    );
-                    #[cfg(feature = "cluster")]
-                    propagate_route_interest(
-                        wctx.state,
-                        removed.subject.as_bytes(),
-                        removed.queue.as_deref().map(|q| q.as_bytes()),
-                        false,
-                        #[cfg(feature = "accounts")]
-                        wctx.state.account_name(conn.account_id).as_bytes(),
-                    );
-                    #[cfg(feature = "gateway")]
-                    propagate_gateway_interest(
-                        wctx.state,
-                        removed.subject.as_bytes(),
-                        removed.queue.as_deref().map(|q| q.as_bytes()),
-                        false,
-                        #[cfg(feature = "accounts")]
-                        wctx.state.account_name(conn.account_id).as_bytes(),
-                    );
-                    // Reverse interest unsub for cross-account imports.
-                    #[cfg(feature = "accounts")]
-                    propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
-                    debug!(
-                        conn_id = conn.conn_id,
+                    cleanup_removed_sub(
+                        conn,
+                        wctx,
                         sid,
-                        subject = %removed.subject,
-                        "auto-unsubscribed (max already reached)"
+                        &removed,
+                        "auto-unsubscribed (max reached)",
                     );
                 }
             }
@@ -357,57 +271,7 @@ impl ClientHandler {
             };
 
             if let Some(ref removed) = removed {
-                *conn.sub_count = conn.sub_count.saturating_sub(1);
-                #[cfg(feature = "worker-affinity")]
-                wctx.state
-                    .affinity
-                    .record_unsub(&removed.subject, wctx.worker_index);
-                #[cfg(feature = "leaf")]
-                {
-                    let mut upstreams = wctx.state.upstreams.write().unwrap();
-                    for up in upstreams.iter_mut() {
-                        up.remove_interest(&removed.subject, removed.queue.as_deref());
-                    }
-                }
-                gauge!(
-                    "subscriptions_active",
-                    "worker" => wctx.worker_label.to_string()
-                )
-                .decrement(1.0);
-                #[cfg(feature = "hub")]
-                propagate_leaf_interest(
-                    wctx.state,
-                    removed.subject.as_bytes(),
-                    removed.queue.as_deref().map(|q| q.as_bytes()),
-                    false,
-                );
-                #[cfg(feature = "cluster")]
-                propagate_route_interest(
-                    wctx.state,
-                    removed.subject.as_bytes(),
-                    removed.queue.as_deref().map(|q| q.as_bytes()),
-                    false,
-                    #[cfg(feature = "accounts")]
-                    wctx.state.account_name(conn.account_id).as_bytes(),
-                );
-                #[cfg(feature = "gateway")]
-                propagate_gateway_interest(
-                    wctx.state,
-                    removed.subject.as_bytes(),
-                    removed.queue.as_deref().map(|q| q.as_bytes()),
-                    false,
-                    #[cfg(feature = "accounts")]
-                    wctx.state.account_name(conn.account_id).as_bytes(),
-                );
-                // Reverse interest unsub for cross-account imports.
-                #[cfg(feature = "accounts")]
-                propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
-                debug!(
-                    conn_id = conn.conn_id,
-                    sid,
-                    subject = %removed.subject,
-                    "client unsubscribed"
-                );
+                cleanup_removed_sub(conn, wctx, sid, removed, "client unsubscribed");
             }
         }
 
@@ -486,19 +350,14 @@ impl ClientHandler {
                         let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
                         let reply_str = bytes_to_str(reply_bytes);
+                        let empty = Bytes::new();
+                        let no_resp_msg =
+                            Msg::new(reply_bytes, reply_str, None, Some(&hdr), &empty);
                         deliver_to_subs(
                             wctx,
-                            reply_bytes,
-                            reply_str,
-                            None,
-                            Some(&hdr),
-                            &Bytes::new(),
+                            &no_resp_msg,
                             conn.conn_id,
-                            false, // don't skip echo — deliver to the publishing client
-                            #[cfg(feature = "cluster")]
-                            false,
-                            #[cfg(feature = "gateway")]
-                            false,
+                            &DeliveryScope::local(false),
                             #[cfg(feature = "accounts")]
                             conn.account_id,
                         );
@@ -508,65 +367,65 @@ impl ClientHandler {
             }
         }
 
-        let (_delivered, expired) = deliver_to_subs(
-            wctx,
+        let msg = Msg::new(
             &subject,
             subject_str,
             respond.as_deref(),
             headers.as_ref(),
             &payload,
+        );
+        let (_delivered, expired) = wctx.publish(
+            &msg,
             conn.conn_id,
-            !conn.echo,
-            #[cfg(feature = "cluster")]
-            false, // don't skip routes — client pubs forward to route peers
-            #[cfg(feature = "gateway")]
-            false, // don't skip gateways — client pubs forward to gateway peers
+            &DeliveryScope::local(!conn.echo),
             #[cfg(feature = "accounts")]
             conn.account_id,
         );
 
-        // Forward to optimistic gateways when no gateway sub matched.
-        #[cfg(feature = "gateway")]
-        crate::propagation::forward_to_optimistic_gateways(
-            wctx,
-            &subject,
-            subject_str,
-            respond.as_deref(),
-            headers.as_ref(),
-            &payload,
-            #[cfg(feature = "accounts")]
-            wctx.state.account_name(conn.account_id).as_bytes(),
-        );
-
-        // Cross-account forwarding: deliver to destination accounts' SubLists.
-        #[cfg(feature = "accounts")]
-        let expired = {
-            let mut expired = expired;
-            let cross_expired = deliver_cross_account(
-                wctx,
-                &subject,
-                subject_str,
-                respond.as_deref(),
-                headers.as_ref(),
-                &payload,
-                conn.account_id,
-            );
-            expired.extend(cross_expired);
-            expired
-        };
-
         #[cfg(feature = "leaf")]
-        forward_to_upstream(
-            conn.upstream_txs,
-            wctx.state,
-            subject,
-            respond,
-            headers,
-            payload,
-        );
+        conn.forward_to_upstream(wctx.state, subject, respond, headers, payload);
 
         (HandleResult::Ok, expired)
     }
+}
+
+/// Cleanup after removing a subscription: update counters, upstream interest,
+/// metrics, propagation, and reverse imports.
+fn cleanup_removed_sub(
+    conn: &mut ConnCtx<'_>,
+    wctx: &mut WorkerCtx<'_>,
+    sid: u64,
+    removed: &Subscription,
+    reason: &str,
+) {
+    *conn.sub_count = conn.sub_count.saturating_sub(1);
+    #[cfg(feature = "worker-affinity")]
+    wctx.state
+        .affinity
+        .record_unsub(&removed.subject, wctx.worker_index);
+    #[cfg(feature = "leaf")]
+    {
+        let mut upstreams = wctx.state.upstreams.write().unwrap();
+        for up in upstreams.iter_mut() {
+            up.remove_interest(&removed.subject, removed.queue.as_deref());
+        }
+    }
+    gauge!(
+        "subscriptions_active",
+        "worker" => wctx.worker_label.to_string()
+    )
+    .decrement(1.0);
+    propagate_all_interest(
+        wctx.state,
+        removed.subject.as_bytes(),
+        removed.queue.as_deref().map(|q| q.as_bytes()),
+        false,
+        #[cfg(feature = "accounts")]
+        wctx.state.account_name(conn.account_id).as_bytes(),
+    );
+    #[cfg(feature = "accounts")]
+    propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
+    debug!(conn_id = conn.conn_id, sid, subject = %removed.subject, reason);
 }
 
 /// Propagate reverse interest removal for cross-account imports.
@@ -583,7 +442,6 @@ fn propagate_reverse_unsub(
     if let Some(reverses) = wctx.state.reverse_imports.get(account_id as usize) {
         for ri in reverses {
             if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
-                #[allow(unused)]
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                 #[cfg(feature = "leaf")]
                 {
@@ -592,18 +450,7 @@ fn propagate_reverse_unsub(
                         up.remove_interest(&ri.src_pattern, None);
                     }
                 }
-                #[cfg(feature = "hub")]
-                propagate_leaf_interest(wctx.state, ri.src_pattern.as_bytes(), None, false);
-                #[cfg(feature = "cluster")]
-                propagate_route_interest(
-                    wctx.state,
-                    ri.src_pattern.as_bytes(),
-                    None,
-                    false,
-                    src_acct_name,
-                );
-                #[cfg(feature = "gateway")]
-                propagate_gateway_interest(
+                propagate_all_interest(
                     wctx.state,
                     ri.src_pattern.as_bytes(),
                     None,

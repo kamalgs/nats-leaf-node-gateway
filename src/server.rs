@@ -523,6 +523,7 @@ pub(crate) struct CrossAccountRoute {
     /// The export subject pattern to match against (e.g., "events.>").
     pub export_pattern: String,
     /// Source account that exports the subject.
+    #[allow(dead_code)]
     pub src_account_id: AccountId,
     /// Destination account that imports the subject.
     pub dst_account_id: AccountId,
@@ -1055,6 +1056,7 @@ impl AffinityMap {
 
     /// Get the preferred worker for a subject (worker with most subs for that prefix).
     /// Returns `None` if no data or all counts are zero.
+    #[allow(dead_code)]
     pub fn preferred_worker(&self, subject: &str) -> Option<usize> {
         let prefix = Self::extract_prefix(subject)?;
         let map = match self.prefix_counts.read() {

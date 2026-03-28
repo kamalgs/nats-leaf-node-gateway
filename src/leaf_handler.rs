@@ -11,18 +11,11 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::buf::LeafOp;
-#[cfg(feature = "leaf")]
-use crate::handler::forward_to_upstream;
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
 };
 use crate::nats_proto;
-#[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account;
-#[cfg(feature = "gateway")]
-use crate::propagation::propagate_gateway_interest;
-#[cfg(feature = "cluster")]
-use crate::propagation::propagate_route_interest;
+use crate::propagation::propagate_route_gateway_interest;
 use crate::sub_list::Subscription;
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
@@ -163,20 +156,8 @@ impl LeafHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate RS+ to route peers.
-        #[cfg(feature = "cluster")]
-        propagate_route_interest(
-            wctx.state,
-            subject.as_ref(),
-            queue.as_deref(),
-            true,
-            #[cfg(feature = "accounts")]
-            wctx.state.account_name(conn.account_id).as_bytes(),
-        );
-
-        // Propagate RS+ to gateway peers.
-        #[cfg(feature = "gateway")]
-        propagate_gateway_interest(
+        // Propagate RS+ to route and gateway peers (not leaf — we are the leaf).
+        propagate_route_gateway_interest(
             wctx.state,
             subject.as_ref(),
             queue.as_deref(),
@@ -240,17 +221,7 @@ impl LeafHandler {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }
             }
-            #[cfg(feature = "cluster")]
-            propagate_route_interest(
-                wctx.state,
-                removed.subject.as_bytes(),
-                removed.queue.as_deref().map(|q| q.as_bytes()),
-                false,
-                #[cfg(feature = "accounts")]
-                wctx.state.account_name(conn.account_id).as_bytes(),
-            );
-            #[cfg(feature = "gateway")]
-            propagate_gateway_interest(
+            propagate_route_gateway_interest(
                 wctx.state,
                 removed.subject.as_bytes(),
                 removed.queue.as_deref().map(|q| q.as_bytes()),
@@ -296,63 +267,24 @@ impl LeafHandler {
             }
         }
 
-        // Echo suppression: always skip delivery back to the originating leaf.
-        let (_delivered, expired) = deliver_to_subs(
-            wctx,
+        let msg = Msg::new(
             &subject,
             subject_str,
             reply.as_deref(),
             headers.as_ref(),
             &payload,
+        );
+        // Echo suppression: always skip delivery back to the originating leaf.
+        let (_delivered, expired) = wctx.publish(
+            &msg,
             conn.conn_id,
-            true, // always suppress echo for leaf connections
-            #[cfg(feature = "cluster")]
-            false, // don't skip routes — leaf msgs forward to route peers
-            #[cfg(feature = "gateway")]
-            false, // don't skip gateways — leaf msgs forward to gateway peers
+            &DeliveryScope::local(true),
             #[cfg(feature = "accounts")]
             conn.account_id,
         );
 
-        // Forward to optimistic gateways when no gateway sub matched.
-        #[cfg(feature = "gateway")]
-        crate::propagation::forward_to_optimistic_gateways(
-            wctx,
-            &subject,
-            subject_str,
-            reply.as_deref(),
-            headers.as_ref(),
-            &payload,
-            #[cfg(feature = "accounts")]
-            wctx.state.account_name(conn.account_id).as_bytes(),
-        );
-
-        // Cross-account forwarding: deliver to destination accounts' SubLists.
-        #[cfg(feature = "accounts")]
-        let expired = {
-            let mut expired = expired;
-            let cross_expired = deliver_cross_account(
-                wctx,
-                &subject,
-                subject_str,
-                reply.as_deref(),
-                headers.as_ref(),
-                &payload,
-                conn.account_id,
-            );
-            expired.extend(cross_expired);
-            expired
-        };
-
         #[cfg(feature = "leaf")]
-        forward_to_upstream(
-            conn.upstream_txs,
-            wctx.state,
-            subject,
-            reply,
-            headers,
-            payload,
-        );
+        conn.forward_to_upstream(wctx.state, subject, reply, headers, payload);
 
         (HandleResult::Ok, expired)
     }
