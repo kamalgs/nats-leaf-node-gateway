@@ -29,12 +29,10 @@ use crate::handler::{
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
+#[cfg(any(feature = "cluster", feature = "gateway"))]
+use crate::propagation::send_existing_route_subs;
 #[cfg(feature = "hub")]
 use crate::propagation::send_existing_subs;
-#[cfg(feature = "gateway")]
-use crate::propagation::send_existing_subs_to_gateway;
-#[cfg(feature = "cluster")]
-use crate::propagation::send_existing_subs_to_route;
 #[cfg(feature = "cluster")]
 use crate::route_handler::RouteHandler;
 use crate::server::ServerState;
@@ -1866,7 +1864,7 @@ impl Worker {
                         .insert(conn_id, dw);
 
                     // Send existing local subscriptions as RS+ to the new route.
-                    send_existing_subs_to_route(&self.state, &client.direct_writer);
+                    send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all routes (gossip re-broadcast).
                     crate::route_conn::broadcast_route_info(&self.state);
@@ -1972,7 +1970,7 @@ impl Worker {
 
                     // Send existing local subscriptions as RS+ to the
                     // new gateway (interest-only mode).
-                    send_existing_subs_to_gateway(&self.state, &client.direct_writer);
+                    send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all gateways (gossip).
                     crate::gateway_conn::broadcast_gateway_info(&self.state);

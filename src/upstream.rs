@@ -9,10 +9,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
-use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream};
-use crate::interest::InterestPipeline;
 #[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account_upstream;
+use crate::handler::deliver_cross_account_upstream;
+use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
+use crate::interest::InterestPipeline;
 use crate::types::HeaderMap;
 
 use crate::buf::LeafOp;
@@ -578,13 +578,16 @@ fn handle_hub_op(
         } => {
             // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
-            let (_delivered, expired) = deliver_to_subs_upstream(
-                state,
+            let msg = Msg::new(
                 &subject,
                 subject_str,
                 reply.as_deref(),
                 headers.as_ref(),
                 &payload,
+            );
+            let (_delivered, expired) = deliver_to_subs_upstream(
+                state,
+                &msg,
                 dirty_writers,
                 #[cfg(feature = "accounts")]
                 0, // account_id — upstream hub uses $G
@@ -595,11 +598,7 @@ fn handle_hub_op(
                 let mut expired = expired;
                 let cross_expired = deliver_cross_account_upstream(
                     state,
-                    &subject,
-                    subject_str,
-                    reply.as_deref(),
-                    headers.as_ref(),
-                    &payload,
+                    &msg,
                     dirty_writers,
                     0, // upstream hub uses $G
                 );

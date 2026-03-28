@@ -17,7 +17,9 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstream};
+use crate::handler::{
+    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
+};
 use crate::nats_proto::{self, MsgBuilder, RouteOp};
 use crate::server::ServerState;
 use crate::sub_list::{DirectWriter, Subscription};
@@ -608,19 +610,20 @@ fn handle_route_op(
             ..
         } => {
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
-            // One-hop: skip route subs — messages from a route peer are never
-            // re-forwarded to other route peers.
-            let (_delivered, expired) = deliver_to_subs_upstream_inner(
-                state,
+            let msg = Msg::new(
                 &subject,
                 subject_str,
                 reply.as_deref(),
                 headers.as_ref(),
                 &payload,
+            );
+            // One-hop: skip route subs — messages from a route peer are never
+            // re-forwarded to other route peers.
+            let (_delivered, expired) = deliver_to_subs_upstream_inner(
+                state,
+                &msg,
                 dirty_writers,
-                true, // skip_routes
-                #[cfg(feature = "gateway")]
-                false, // don't skip gateways — route msgs forward to gateway peers
+                &DeliveryScope::from_route(),
                 #[cfg(feature = "accounts")]
                 0, // account_id — will use actual account from wire in Phase 4
             );

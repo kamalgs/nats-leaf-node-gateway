@@ -11,15 +11,11 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-#[cfg(feature = "leaf")]
-use crate::handler::forward_to_upstream;
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
 };
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
-#[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account;
 use crate::propagation::unwrap_gateway_reply_bytes;
 use crate::sub_list::Subscription;
 
@@ -250,40 +246,16 @@ impl GatewayHandler {
         let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
         let reply_ref = unwrapped_reply.as_deref();
 
+        let msg = Msg::new(&subject, subject_str, reply_ref, headers.as_ref(), &payload);
         // One-hop: skip_routes = true and skip_gateways = true — messages from a gateway
         // are never re-forwarded to other routes or gateways.
-        let (delivered, expired) = deliver_to_subs(
-            wctx,
-            &subject,
-            subject_str,
-            reply_ref,
-            headers.as_ref(),
-            &payload,
+        let (delivered, expired) = wctx.publish(
+            &msg,
             conn.conn_id,
-            true, // suppress echo back to originating gateway
-            #[cfg(feature = "cluster")]
-            true, // skip_routes — one-hop enforcement
-            true, // skip_gateways — one-hop enforcement
+            &DeliveryScope::from_gateway(),
             #[cfg(feature = "accounts")]
             conn.account_id,
         );
-
-        // Cross-account forwarding: deliver to destination accounts' SubLists.
-        #[cfg(feature = "accounts")]
-        let expired = {
-            let mut expired = expired;
-            let cross_expired = deliver_cross_account(
-                wctx,
-                &subject,
-                subject_str,
-                reply_ref,
-                headers.as_ref(),
-                &payload,
-                conn.account_id,
-            );
-            expired.extend(cross_expired);
-            expired
-        };
 
         // Send RS- back when no local subs matched (negative interest signal).
         if delivered == 0 {
@@ -298,14 +270,7 @@ impl GatewayHandler {
 
         // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]
-        forward_to_upstream(
-            conn.upstream_txs,
-            wctx.state,
-            subject,
-            unwrapped_reply,
-            headers,
-            payload,
-        );
+        conn.forward_to_upstream(wctx.state, subject, unwrapped_reply, headers, payload);
 
         let result = if delivered == 0 {
             HandleResult::Flush

@@ -9,14 +9,10 @@ use metrics::gauge;
 use tracing::debug;
 
 use crate::buf::RouteOp;
-#[cfg(feature = "leaf")]
-use crate::handler::forward_to_upstream;
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, ConnCtx, ConnExt, ConnectionHandler, HandleResult, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
 };
 use crate::nats_proto;
-#[cfg(feature = "accounts")]
-use crate::propagation::deliver_cross_account;
 #[cfg(feature = "gateway")]
 use crate::propagation::propagate_gateway_interest;
 use crate::sub_list::Subscription;
@@ -298,64 +294,26 @@ impl RouteHandler {
         *wctx.msgs_received_bytes += payload_len;
 
         let subject_str = bytes_to_str(&subject);
-        // One-hop rule: skip_routes = true — messages from routes are never re-forwarded
-        // to other routes. Only deliver to local client subs and leaf subs.
-        let (_delivered, expired) = deliver_to_subs(
-            wctx,
+        let msg = Msg::new(
             &subject,
             subject_str,
             reply.as_deref(),
             headers.as_ref(),
             &payload,
+        );
+        // One-hop rule: skip_routes = true — messages from routes are never re-forwarded
+        // to other routes. Only deliver to local client subs and leaf subs.
+        let (_delivered, expired) = wctx.publish(
+            &msg,
             conn.conn_id,
-            true, // suppress echo back to originating route
-            true, // skip_routes — one-hop enforcement
-            #[cfg(feature = "gateway")]
-            false, // don't skip gateways — route msgs forward to gateway peers
+            &DeliveryScope::from_route(),
             #[cfg(feature = "accounts")]
             account_id,
         );
 
-        // Forward to optimistic gateways when no gateway sub matched.
-        #[cfg(feature = "gateway")]
-        crate::propagation::forward_to_optimistic_gateways(
-            wctx,
-            &subject,
-            subject_str,
-            reply.as_deref(),
-            headers.as_ref(),
-            &payload,
-            #[cfg(feature = "accounts")]
-            wctx.state.account_name(account_id).as_bytes(),
-        );
-
-        // Cross-account forwarding: deliver to destination accounts' SubLists.
-        #[cfg(feature = "accounts")]
-        let expired = {
-            let mut expired = expired;
-            let cross_expired = deliver_cross_account(
-                wctx,
-                &subject,
-                subject_str,
-                reply.as_deref(),
-                headers.as_ref(),
-                &payload,
-                account_id,
-            );
-            expired.extend(cross_expired);
-            expired
-        };
-
         // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]
-        forward_to_upstream(
-            conn.upstream_txs,
-            wctx.state,
-            subject,
-            reply,
-            headers,
-            payload,
-        );
+        conn.forward_to_upstream(wctx.state, subject, reply, headers, payload);
 
         (HandleResult::Ok, expired)
     }
