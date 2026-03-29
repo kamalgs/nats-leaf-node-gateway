@@ -1,7 +1,7 @@
 //! N-worker epoll event loop.
 //!
 //! Each worker owns one epoll instance multiplexing many client connections.
-//! DirectWriter notifies the *worker's* single eventfd, so fan-out to 100
+//! MsgWriter notifies the *worker's* single eventfd, so fan-out to 100
 //! connections on the same worker costs 1 eventfd write, not 100.
 
 use std::collections::HashMap;
@@ -24,7 +24,8 @@ use crate::client_handler::ClientHandler;
 #[cfg(feature = "gateway")]
 use crate::gateway_handler::GatewayHandler;
 use crate::handler::{
-    handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult, WorkerCtx,
+    handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
+    MessageDeliveryHub,
 };
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
@@ -36,7 +37,7 @@ use crate::propagation::send_existing_subs;
 #[cfg(feature = "cluster")]
 use crate::route_handler::RouteHandler;
 use crate::server::ServerState;
-use crate::sub_list::{create_eventfd, DirectWriter};
+use crate::sub_list::{create_eventfd, MsgWriter};
 #[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
 use crate::websocket::{self, DecodeStatus, WsCodec};
@@ -220,7 +221,7 @@ pub(crate) struct ClientState {
     _stream: TcpStream,
     read_buf: AdaptiveBuf,
     write_buf: BytesMut,
-    direct_writer: DirectWriter,
+    direct_writer: MsgWriter,
     direct_buf: Arc<Mutex<BytesMut>>,
     has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
@@ -447,7 +448,7 @@ impl Worker {
                 }
             }
 
-            // Flush any pending DirectWriter data after processing all events.
+            // Flush any pending MsgWriter data after processing all events.
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
             self.flush_pending();
@@ -542,7 +543,7 @@ impl Worker {
 
         let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
         let has_pending = Arc::new(AtomicBool::new(false));
-        let direct_writer = DirectWriter::new(
+        let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
             Arc::clone(&has_pending),
             Arc::clone(&self.event_fd),
@@ -622,7 +623,7 @@ impl Worker {
 
     /// Shared setup for inbound leaf/route/gateway connections.
     ///
-    /// Configures the socket, registers with epoll, creates DirectWriter,
+    /// Configures the socket, registers with epoll, creates MsgWriter,
     /// queues the INFO line, and inserts into the connection map.
     #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
     fn register_conn(
@@ -652,7 +653,7 @@ impl Worker {
 
         let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
         let has_pending = Arc::new(AtomicBool::new(false));
-        let direct_writer = DirectWriter::new(
+        let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
             Arc::clone(&has_pending),
             Arc::clone(&self.event_fd),
@@ -761,12 +762,12 @@ impl Worker {
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
 
-            // Unregister leaf DirectWriter from shared registry.
+            // Unregister leaf MsgWriter from shared registry.
             #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
             }
-            // Unregister route DirectWriter and peer from shared registries.
+            // Unregister route MsgWriter and peer from shared registries.
             #[cfg(feature = "cluster")]
             if client.ext.is_route() {
                 self.state.route_writers.write().unwrap().remove(&conn_id);
@@ -778,7 +779,7 @@ impl Worker {
                     self.state.route_peers.lock().unwrap().connected.remove(sid);
                 }
             }
-            // Unregister gateway DirectWriter and peer from shared registries.
+            // Unregister gateway MsgWriter and peer from shared registries.
             #[cfg(feature = "gateway")]
             if client.ext.is_gateway() {
                 self.state.gateway_writers.write().unwrap().remove(&conn_id);
@@ -804,7 +805,7 @@ impl Worker {
         }
     }
 
-    /// Scan all connections for pending DirectWriter data, drain into write_buf,
+    /// Scan all connections for pending MsgWriter data, drain into write_buf,
     /// and try to flush to socket.
     fn flush_pending(&mut self) {
         let epoll_fd = self.epoll_fd.as_raw_fd();
@@ -1855,7 +1856,7 @@ impl Worker {
                     // (one-hop enforcement prevents message loops) and avoids
                     // a retry storm when outbound dedup rejects connections.
 
-                    // Register route DirectWriter.
+                    // Register route MsgWriter.
                     let dw = client.direct_writer.clone();
                     self.state
                         .route_writers
@@ -1950,7 +1951,7 @@ impl Worker {
                         *peer_gateway_name = peer_gw_name.clone();
                     }
 
-                    // Register gateway DirectWriter.
+                    // Register gateway MsgWriter.
                     let dw = client.direct_writer.clone();
                     self.state
                         .gateway_writers
@@ -2056,7 +2057,7 @@ impl Worker {
                         }
                         client.write_buf.extend_from_slice(b"PING\r\n");
 
-                        // Register leaf DirectWriter so interest can be propagated.
+                        // Register leaf MsgWriter so interest can be propagated.
                         let dw = client.direct_writer.clone();
                         self.state
                             .leaf_writers
@@ -2186,7 +2187,7 @@ impl Worker {
         let (result, expired) = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             let mut conn_ctx = client.conn_ctx(conn_id);
-            let mut worker_ctx = WorkerCtx {
+            let mut worker_ctx = MessageDeliveryHub {
                 state: &self.state,
                 event_fd: self.event_fd.as_raw_fd(),
                 pending_notify: &mut self.pending_notify,

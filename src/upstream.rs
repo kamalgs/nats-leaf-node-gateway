@@ -18,7 +18,7 @@ use crate::types::HeaderMap;
 use crate::buf::LeafOp;
 use crate::leaf_conn::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 use crate::server::{HubCredentials, ServerState};
-use crate::sub_list::DirectWriter;
+use crate::sub_list::MsgWriter;
 
 /// Commands sent from the Upstream handle to the background writer thread.
 #[derive(Debug)]
@@ -451,7 +451,7 @@ fn run_leaf_reader(
     cmd_tx: mpsc::Sender<UpstreamCmd>,
     state: Arc<ServerState>,
 ) {
-    let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+    let mut dirty_writers: Vec<MsgWriter> = Vec::new();
     loop {
         match reader.read_leaf_op() {
             Ok(Some(op)) => {
@@ -567,7 +567,7 @@ fn handle_hub_op(
     op: LeafOp,
     cmd_tx: &mpsc::Sender<UpstreamCmd>,
     state: &ServerState,
-    dirty_writers: &mut Vec<DirectWriter>,
+    dirty_writers: &mut Vec<MsgWriter>,
 ) -> std::io::Result<()> {
     match op {
         LeafOp::LeafMsg {

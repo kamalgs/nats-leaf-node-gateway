@@ -2,7 +2,7 @@
 //!
 //! Organized into two submodules:
 //! - `conn` — Connection types and handler interface (ConnCtx, ConnExt, ConnectionHandler)
-//! - `delivery` — Message delivery pipeline (Msg, WorkerCtx, deliver_to_subs, publish)
+//! - `delivery` — Message delivery pipeline (Msg, MessageDeliveryHub, deliver_to_subs, publish)
 
 mod conn;
 mod delivery;

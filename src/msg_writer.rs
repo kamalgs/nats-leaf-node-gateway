@@ -1,4 +1,4 @@
-//! DirectWriter — shared buffer + eventfd notification for zero-channel message delivery.
+//! MsgWriter — shared buffer + eventfd notification for cross-worker message delivery.
 //!
 //! Instead of sending structs through an mpsc channel, the upstream reader formats
 //! MSG/HMSG wire bytes directly into this shared buffer. The worker thread is
@@ -31,10 +31,10 @@ pub(crate) fn create_eventfd() -> OwnedFd {
 /// formats MSG/HMSG wire bytes directly into this shared buffer. The worker
 /// thread is notified via a shared eventfd to flush the buffer to TCP.
 ///
-/// Multiple DirectWriters on the same worker share one eventfd, so fan-out
+/// Multiple `MsgWriter`s on the same worker share one eventfd, so fan-out
 /// to N connections on one worker costs only 1 eventfd write.
 #[derive(Clone)]
-pub(crate) struct DirectWriter {
+pub(crate) struct MsgWriter {
     buf: Arc<Mutex<BytesMut>>,
     event_fd: Arc<OwnedFd>,
     has_pending: Arc<AtomicBool>,
@@ -42,8 +42,8 @@ pub(crate) struct DirectWriter {
     msg_builder: Arc<Mutex<MsgBuilder>>,
 }
 
-impl DirectWriter {
-    /// Create a DirectWriter with an externally-owned eventfd (shared by worker).
+impl MsgWriter {
+    /// Create a MsgWriter with an externally-owned eventfd (shared by worker).
     pub(crate) fn new(
         buf: Arc<Mutex<BytesMut>>,
         has_pending: Arc<AtomicBool>,
@@ -57,7 +57,7 @@ impl DirectWriter {
         }
     }
 
-    /// Create a standalone DirectWriter with its own eventfd (for tests/benchmarks).
+    /// Create a standalone MsgWriter with its own eventfd (for tests/benchmarks).
     pub(crate) fn new_dummy() -> Self {
         let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
         let has_pending = Arc::new(AtomicBool::new(false));
@@ -182,9 +182,9 @@ impl DirectWriter {
     }
 }
 
-impl std::fmt::Debug for DirectWriter {
+impl std::fmt::Debug for MsgWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DirectWriter").finish()
+        f.debug_struct("MsgWriter").finish()
     }
 }
 
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_clone_shares_buffer() {
-        let writer1 = DirectWriter::new_dummy();
+        let writer1 = MsgWriter::new_dummy();
         let writer2 = writer1.clone();
 
         writer1.write_msg(b"a", b"1", None, None, b"x");
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_batches_multiple_writes() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
 
         writer.write_msg(b"a", b"1", None, None, b"one");
         writer.write_msg(b"b", b"2", None, None, b"two");
@@ -224,13 +224,13 @@ mod tests {
 
     #[test]
     fn test_drain_empty() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         assert!(writer.drain().is_none());
     }
 
     #[test]
     fn test_drain_resets_buffer() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
 
         writer.write_msg(b"a", b"1", None, None, b"x");
         let _ = writer.drain().unwrap();
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_notify_wakes() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let writer2 = writer.clone();
 
         std::thread::spawn(move || {
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn test_notify_stores_permit() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
 
         writer.write_msg(b"test", b"1", None, None, b"early");
         writer.notify();
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_fast_producer_slow_consumer() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let producer_writer = writer.clone();
         let total_msgs = 10_000;
 
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_producer_finishes_before_consumer() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let total_msgs = 1_000;
 
         for i in 0..total_msgs {
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_write_then_drain_clears_pending() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
 
         assert!(!writer.has_pending.load(Ordering::Acquire));
 

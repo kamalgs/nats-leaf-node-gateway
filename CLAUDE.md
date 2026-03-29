@@ -19,8 +19,8 @@ src/
 ├── server.rs            # Accept loop, worker spawning, shutdown
 ├── worker.rs            # Per-thread epoll event loop, connection state machine
 ├── nats_proto.rs        # Zero-copy protocol parser + MsgBuilder
-├── sub_list.rs          # SubList (exact + wildcard subscription matching)
-├── direct_writer.rs     # DirectWriter: shared buffer + eventfd fan-out
+├── sub_list.rs          # SubscriptionManager (exact + wildcard subscription matching)
+├── msg_writer.rs        # MsgWriter: shared buffer + eventfd cross-worker delivery
 ├── handler.rs           # Shared handler types, ConnExt, deliver_to_subs
 ├── propagation.rs       # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
 ├── client_handler.rs    # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
@@ -153,7 +153,7 @@ Always run `cargo +nightly fmt` before committing.
 ### Key Design Points
 
 - **N-worker epoll model**: N worker threads, each with one epoll instance multiplexing many connections.
-- **DirectWriter**: Cross-worker message delivery via shared buffers + eventfd notifications.
+- **MsgWriter**: Cross-worker message delivery via shared buffers + eventfd notifications.
   Fan-out to N conns on same worker = 1 eventfd write. Batched notifications reduce syscalls.
 - **Zero-copy parsing**: Protocol parsed directly from read buffers via `nats_proto.rs`.
 - **No async runtime**: Pure `std::thread` + `epoll` + `std::sync::mpsc`.
@@ -171,8 +171,8 @@ Always run `cargo +nightly fmt` before committing.
 | `load_config` | `config.rs` | Go nats-server `.conf` file parser |
 | `Worker` | `worker.rs` | Per-thread epoll event loop |
 | `NatsProto` / `MsgBuilder` | `nats_proto.rs` | Protocol parser + message builder |
-| `SubList` | `sub_list.rs` | Subscription storage + wildcard matching |
-| `DirectWriter` | `direct_writer.rs` | Shared buffer + eventfd fan-out delivery |
+| `SubscriptionManager` | `sub_list.rs` | Subscription storage + wildcard matching |
+| `MsgWriter` | `msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
 | `ServerConn` | `buf.rs` | Connection I/O wrapper (test-only) |
 | `LeafConn` | `leaf_conn.rs` | Leaf connection I/O wrapper |
 | `AdaptiveBuf` | `buf.rs` | Dynamic read buffer |

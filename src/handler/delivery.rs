@@ -1,7 +1,7 @@
 //! Message delivery pipeline.
 //!
 //! Contains the full publish → deliver → notify flow:
-//! - `WorkerCtx::publish()` — entry point from all handlers
+//! - `MessageDeliveryHub::publish()` — entry point from all handlers
 //! - `deliver_to_subs()` — iterate subs, dispatch to each
 //! - `deliver_to_sub_inner()` — write MSG/LMSG/RMSG per sub type
 //! - `forward_to_optimistic_gateways()` — optimistic gateway delivery
@@ -22,13 +22,13 @@ use tracing::debug;
 
 use super::ConnCtx;
 use crate::server::ServerState;
-use crate::sub_list::DirectWriter;
+use crate::sub_list::MsgWriter;
 use crate::types::HeaderMap;
 #[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
 
 /// Worker-level context for delivery and notification.
-pub(crate) struct WorkerCtx<'a> {
+pub(crate) struct MessageDeliveryHub<'a> {
     pub state: &'a Arc<ServerState>,
     pub event_fd: RawFd,
     pub pending_notify: &'a mut [RawFd; 16],
@@ -43,7 +43,7 @@ pub(crate) struct WorkerCtx<'a> {
     pub worker_index: usize,
 }
 
-impl WorkerCtx<'_> {
+impl MessageDeliveryHub<'_> {
     /// Queue an eventfd notification for a remote worker, deduplicating within the batch.
     ///
     /// Skips notification for our own worker (flush_pending handles it).
@@ -154,7 +154,7 @@ impl DeliveryScope {
 // Publish entry point
 // ---------------------------------------------------------------------------
 
-impl WorkerCtx<'_> {
+impl MessageDeliveryHub<'_> {
     /// Publish a message: deliver to local subs, optimistic gateways, and cross-account.
     ///
     /// Encapsulates the 3-step pipeline that every handler's publish path uses.
@@ -256,7 +256,7 @@ pub(crate) fn deliver_to_sub_inner(
 #[inline]
 #[allow(unused_variables)]
 fn deliver_to_subs_core<F>(
-    subs: &crate::sub_list::SubList,
+    subs: &crate::sub_list::SubscriptionManager,
     msg: &Msg<'_>,
     skip_conn_id: u64,
     scope: &DeliveryScope,
@@ -321,7 +321,7 @@ where
 /// Deliver a message to all matching subscriptions in the global sub list.
 ///
 /// Writes MSG (for client subs) or LMSG (for leaf subs) directly to each
-/// matching subscription's `DirectWriter`. Accumulates eventfd notifications
+/// matching subscription's `MsgWriter`. Accumulates eventfd notifications
 /// for remote workers (deduplicating within the batch).
 ///
 /// Returns `(delivered_count, expired_subs)` where `delivered_count` is the
@@ -329,7 +329,7 @@ where
 /// subs), and expired_subs contains `(conn_id, sid)` pairs for subscriptions
 /// that reached their delivery limit.
 pub(crate) fn deliver_to_subs(
-    wctx: &mut WorkerCtx<'_>,
+    wctx: &mut MessageDeliveryHub<'_>,
     msg: &Msg<'_>,
     skip_conn_id: u64,
     scope: &DeliveryScope,
@@ -382,7 +382,7 @@ pub(crate) fn deliver_to_subs(
 pub(crate) fn deliver_to_subs_upstream(
     state: &ServerState,
     msg: &Msg<'_>,
-    dirty_writers: &mut Vec<DirectWriter>,
+    dirty_writers: &mut Vec<MsgWriter>,
     #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     deliver_to_subs_upstream_inner(
@@ -403,7 +403,7 @@ pub(crate) fn deliver_to_subs_upstream(
 pub(crate) fn deliver_to_subs_upstream_inner(
     state: &ServerState,
     msg: &Msg<'_>,
-    dirty_writers: &mut Vec<DirectWriter>,
+    dirty_writers: &mut Vec<MsgWriter>,
     scope: &DeliveryScope,
     #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
@@ -583,12 +583,12 @@ pub(crate) fn handle_expired_subs_upstream(
 
 /// Forward a message to outbound gateways in optimistic mode.
 ///
-/// Called after `deliver_to_subs` when gateway subs may not exist in SubList
+/// Called after `deliver_to_subs` when gateway subs may not exist in SubscriptionManager
 /// (because the remote hasn't sent RS+ yet). In optimistic mode, we forward
 /// unless the subject is in the gateway's negative interest set.
 #[cfg(feature = "gateway")]
 pub(crate) fn forward_to_optimistic_gateways(
-    wctx: &mut WorkerCtx<'_>,
+    wctx: &mut MessageDeliveryHub<'_>,
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
@@ -634,13 +634,13 @@ pub(crate) fn forward_to_optimistic_gateways(
 ///
 /// Called after same-account `deliver_to_subs()`. For each cross-account route
 /// whose export pattern matches the published subject, delivers to the
-/// destination account's SubList (optionally remapping the subject).
+/// destination account's SubscriptionManager (optionally remapping the subject).
 ///
 /// Single-hop: cross-account delivery does NOT recursively trigger more
 /// cross-account forwarding.
 #[cfg(feature = "accounts")]
 pub(crate) fn deliver_cross_account(
-    wctx: &mut WorkerCtx<'_>,
+    wctx: &mut MessageDeliveryHub<'_>,
     msg: &Msg<'_>,
     src_account_id: crate::server::AccountId,
 ) -> Vec<(u64, u64)> {
@@ -704,7 +704,7 @@ pub(crate) fn deliver_cross_account(
 pub(crate) fn deliver_cross_account_upstream(
     state: &ServerState,
     msg: &Msg<'_>,
-    dirty_writers: &mut Vec<DirectWriter>,
+    dirty_writers: &mut Vec<MsgWriter>,
     src_account_id: crate::server::AccountId,
 ) -> Vec<(u64, u64)> {
     let routes = match state.cross_account_routes.get(src_account_id as usize) {
@@ -1276,7 +1276,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Flow 8: WorkerCtx::publish pipeline
+    // Flow 8: MessageDeliveryHub::publish pipeline
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1298,7 +1298,7 @@ mod tests {
         let mut msgs_received_bytes = 0u64;
         let mut msgs_delivered = 0u64;
         let mut msgs_delivered_bytes = 0u64;
-        let mut wctx = WorkerCtx {
+        let mut wctx = MessageDeliveryHub {
             state: &state,
             event_fd: -1,
             pending_notify: &mut pending_notify,

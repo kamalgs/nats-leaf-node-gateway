@@ -9,15 +9,13 @@ to source locations (`file:line`) so you can jump straight to the code.
 
 1. [Type Relationships](#1-type-relationships)
 2. [Connection Lifecycle State Machine](#2-connection-lifecycle-state-machine)
-3. [Client PUB → Delivery → Socket](#3-client-pub--delivery--socket)
-4. [Route RMSG → Local Delivery](#4-route-rmsg--local-delivery)
-5. [Client SUB → Interest Propagation](#5-client-sub--interest-propagation)
-6. [Upstream Leaf Connection Flow](#6-upstream-leaf-connection-flow)
-7. [Worker Event Loop](#7-worker-event-loop)
-8. [DirectWriter Cross-Worker Delivery](#8-directwriter-cross-worker-delivery)
-9. [Inbound Leaf Handshake](#9-inbound-leaf-handshake)
-10. [Inbound Route Handshake](#10-inbound-route-handshake)
-11. [Gateway Interest Modes](#11-gateway-interest-modes)
+3. [Message Delivery Pipeline](#3-message-delivery-pipeline)
+4. [Client SUB → Interest Propagation](#4-client-sub--interest-propagation)
+5. [Upstream Leaf Connection Flow](#5-upstream-leaf-connection-flow)
+6. [Worker Event Loop](#6-worker-event-loop)
+7. [MsgWriter Cross-Worker Delivery](#7-msgwriter-cross-worker-delivery)
+8. [Inbound Peer Handshake](#8-inbound-peer-handshake)
+9. [Gateway Interest Modes](#9-gateway-interest-modes)
 
 ---
 
@@ -34,7 +32,7 @@ classDiagram
     }
 
     class ServerState {
-        +sub_list: SubList
+        +sub_list: SubscriptionManager
         +route_writers: RwLock~HashMap~
         +gateway_writers: RwLock~HashMap~
         +upstream_txs: Mutex~Vec~
@@ -54,7 +52,7 @@ classDiagram
         +phase: ConnPhase
         +ext: ConnExt
         +write_buf: BytesMut
-        +direct_writer: DirectWriter
+        +msg_writer: MsgWriter
         +subs: HashMap~u64, Subscription~
         %%  worker.rs:218
     }
@@ -75,7 +73,7 @@ classDiagram
     class ConnCtx {
         +conn_id: u64
         +write_buf: &mut BytesMut
-        +direct_writer: &DirectWriter
+        +direct_writer: &MsgWriter
         +echo: bool
         +no_responders: bool
         +permissions: &Option~Permissions~
@@ -84,7 +82,7 @@ classDiagram
         %%  handler/conn.rs:46
     }
 
-    class WorkerCtx {
+    class MessageDeliveryHub {
         +state: &Arc~ServerState~
         +dirty_eventfds: &mut Vec~RawFd~
         +publish()
@@ -93,7 +91,7 @@ classDiagram
         %%  handler/delivery.rs:31
     }
 
-    class SubList {
+    class SubscriptionManager {
         +exact: HashMap~Bytes, Vec~Subscription~~
         +wildcards: WildTrie
         +insert()
@@ -107,14 +105,14 @@ classDiagram
         +sid: u64
         +subject: Bytes
         +queue: Option~Bytes~
-        +writer: DirectWriter
+        +writer: MsgWriter
         +is_leaf: bool
         +is_route: bool
         +is_gateway: bool
         %%  sub_list.rs:10
     }
 
-    class DirectWriter {
+    class MsgWriter {
         +buf: Arc~Mutex~BytesMut~~
         +has_pending: Arc~AtomicBool~
         +event_fd: Arc~OwnedFd~
@@ -122,7 +120,7 @@ classDiagram
         +write_lmsg()
         +write_rmsg()
         +drain()
-        %%  direct_writer.rs:37
+        %%  msg_writer.rs:37
     }
 
     class Msg {
@@ -145,16 +143,16 @@ classDiagram
     }
 
     LeafServer --> ServerState : creates
-    ServerState --> SubList : owns
+    ServerState --> SubscriptionManager : owns
     Worker --> ServerState : Arc ref
     Worker --> ClientState : owns many
     ClientState --> ConnExt : owns
-    ClientState --> DirectWriter : owns
+    ClientState --> MsgWriter : owns
     ConnCtx --> ConnExt : borrows
-    ConnCtx --> DirectWriter : borrows
-    WorkerCtx --> ServerState : borrows
-    Subscription --> DirectWriter : clones
-    SubList --> Subscription : stores
+    ConnCtx --> MsgWriter : borrows
+    MessageDeliveryHub --> ServerState : borrows
+    Subscription --> MsgWriter : clones
+    SubscriptionManager --> Subscription : stores
 ```
 
 ---
@@ -207,98 +205,69 @@ stateDiagram-v2
 
 ---
 
-## 3. Client PUB → Delivery → Socket
+## 3. Message Delivery Pipeline
 
-The most common flow: a client publishes a message that reaches subscribers.
+All message sources (client PUB, route RMSG, gateway RMSG, leaf LMSG)
+share the same delivery pipeline. The common flow is shown once below,
+with per-source differences captured in the scope variants table.
 
 ```mermaid
 sequenceDiagram
-    participant C as Client Socket
+    participant Src as Source Connection
     participant W as Worker<br/>worker.rs:275
-    participant CH as ClientHandler<br/>client_handler.rs:20
-    participant WCtx as WorkerCtx<br/>handler/delivery.rs:31
-    participant SL as SubList<br/>sub_list.rs:375
-    participant DW as DirectWriter<br/>direct_writer.rs:37
+    participant H as Handler<br/>(ClientHandler / RouteHandler / etc.)
+    participant MDH as MessageDeliveryHub<br/>handler/delivery.rs:31
+    participant SM as SubscriptionManager<br/>sub_list.rs:375
+    participant MW as MsgWriter<br/>msg_writer.rs:37
     participant S as Subscriber Socket
 
-    C->>W: PUB subject reply payload
-    W->>W: process_active<ClientHandler>()
-    W->>CH: parse_op(buf) → ClientOp::Pub
-    Note over CH: nats_proto.rs:153<br/>try_parse_client_op()
+    Src->>W: PUB / RMSG / LMSG
+    W->>W: process_active[Handler]()
+    W->>H: parse_op(buf) → Op variant
+    W->>H: handle_op(conn, mdh, op)
 
-    W->>CH: handle_op(conn, wctx, op)
-    CH->>CH: handle_pub()<br/>client_handler.rs:281
-    CH->>CH: check permissions, payload size
-    CH->>CH: Msg::new(subject, reply, hdr, payload)<br/>handler/delivery.rs:75
+    H->>H: Msg::new(subject, reply, hdr, payload)<br/>handler/delivery.rs:75
+    H->>MDH: publish(&msg, scope, conn_id, ...)<br/>handler/delivery.rs:162
+    MDH->>MDH: deliver_to_subs(mdh, &msg, ...)<br/>handler/delivery.rs:331
 
-    CH->>WCtx: publish(&msg, scope, conn_id, ...)<br/>handler/delivery.rs:162
-    WCtx->>WCtx: deliver_to_subs(wctx, &msg, ...)<br/>handler/delivery.rs:331
-
-    WCtx->>SL: for_each_match(subject, callback)<br/>sub_list.rs:495
-    SL-->>WCtx: matching Subscription[]
+    MDH->>SM: for_each_match(subject, callback)<br/>sub_list.rs:495
+    SM-->>MDH: matching Subscription[]
 
     loop Each matching sub
-        WCtx->>WCtx: deliver_to_sub_inner(sub, &msg)<br/>handler/delivery.rs:210
-        WCtx->>DW: sub.writer.write_msg(sid, subject, reply, hdr, payload)<br/>direct_writer.rs:74
-        DW->>DW: lock buf, append MSG bytes, set has_pending=true
-        WCtx->>WCtx: record_delivery(len)<br/>queue_notify(event_fd)
-    end
-
-    Note over WCtx: Also calls:<br/>forward_to_optimistic_gateways()<br/>deliver_cross_account()<br/>handler/delivery.rs:590, 642
-
-    CH->>CH: forward_to_upstream(&msg)<br/>handler/delivery.rs:448
-    Note over CH: mpsc::Sender → upstream thread
-
-    W->>W: batch: deduplicate dirty_eventfds
-    W->>DW: eventfd write(1) per unique worker
-    DW-->>S: Worker wakes → drain() → socket write
-```
-
----
-
-## 4. Route RMSG → Local Delivery
-
-A message arriving from a route peer is delivered to local clients only
-(one-hop enforcement).
-
-```mermaid
-sequenceDiagram
-    participant R as Route Peer Socket
-    participant W as Worker<br/>worker.rs:275
-    participant RH as RouteHandler<br/>route_handler.rs:21
-    participant WCtx as WorkerCtx<br/>handler/delivery.rs:31
-    participant SL as SubList<br/>sub_list.rs:375
-    participant DW as DirectWriter<br/>direct_writer.rs:37
-
-    R->>W: RMSG $G subject reply payload
-    W->>W: process_active<RouteHandler>()
-    W->>RH: parse_op(buf) → RouteOp::Rmsg
-    Note over RH: nats_proto.rs:838
-
-    W->>RH: handle_op(conn, wctx, op)
-    RH->>RH: handle_rmsg()<br/>route_handler.rs
-
-    RH->>RH: Msg::new(subject, reply, hdr, payload)
-    RH->>WCtx: publish(&msg, DeliveryScope::from_route(), ...)<br/>handler/delivery.rs:162
-
-    Note over WCtx: DeliveryScope::from_route()<br/>skip_routes=true, skip_gateways=false<br/>handler/delivery.rs:104
-
-    WCtx->>SL: for_each_match(subject, callback)
-
-    loop Each matching sub
-        alt sub.is_route == true
-            WCtx->>WCtx: SKIP (one-hop rule)
-        else sub.is_route == false
-            WCtx->>DW: write_msg() or write_lmsg()
+        MDH->>MDH: deliver_to_sub_inner(sub, &msg)<br/>handler/delivery.rs:210
+        alt scope skips this sub type
+            MDH->>MDH: SKIP (scope filter)
+        else deliver
+            MDH->>MW: sub.writer.write_msg/write_lmsg/write_rmsg<br/>msg_writer.rs:74
+            MW->>MW: lock buf, append wire bytes, set has_pending=true
+            MDH->>MDH: record_delivery(len), queue_notify(event_fd)
         end
     end
 
-    Note over WCtx: forward_to_optimistic_gateways()<br/>Forwards to gateway peers
+    Note over MDH: Also calls:<br/>forward_to_optimistic_gateways()<br/>deliver_cross_account()<br/>handler/delivery.rs:590, 642
+
+    H->>H: forward_to_upstream(&msg)<br/>handler/delivery.rs:448
+    Note over H: mpsc::Sender → upstream thread
+
+    W->>W: batch: deduplicate dirty_eventfds
+    W->>MW: eventfd write(1) per unique worker
+    MW-->>S: Worker wakes → drain() → socket write
 ```
+
+### Scope Variants
+
+How `DeliveryScope` differs per message origin:
+
+| Origin | Handler | DeliveryScope | Skips |
+|--------|---------|---------------|-------|
+| Client PUB | `ClientHandler` | `local(echo)` | echo if `!echo` |
+| Route RMSG | `RouteHandler` | `from_route()` | route subs (one-hop rule) |
+| Gateway RMSG | `GatewayHandler` | `from_gateway()` | route + gateway subs |
+| Leaf LMSG | `LeafHandler` | `local(false)` | originating leaf |
 
 ---
 
-## 5. Client SUB → Interest Propagation
+## 4. Client SUB → Interest Propagation
 
 When a client subscribes, interest is propagated to upstream, routes,
 leafs, and gateways.
@@ -307,7 +276,7 @@ leafs, and gateways.
 sequenceDiagram
     participant C as Client Socket
     participant CH as ClientHandler<br/>client_handler.rs:20
-    participant SL as SubList<br/>sub_list.rs:375
+    participant SM as SubscriptionManager<br/>sub_list.rs:375
     participant US as Upstream<br/>upstream.rs:76
     participant P as Propagation<br/>propagation.rs
     participant LW as Leaf Writers
@@ -317,7 +286,7 @@ sequenceDiagram
     C->>CH: SUB subject [queue] sid
     CH->>CH: handle_sub()<br/>client_handler.rs:72
     CH->>CH: create Subscription<br/>sub_list.rs:10
-    CH->>SL: insert(subscription)<br/>sub_list.rs:389
+    CH->>SM: insert(subscription)<br/>sub_list.rs:389
 
     CH->>US: UpstreamCmd::AddInterest(subject, queue)<br/>upstream.rs:25
     Note over US: InterestPipeline applies<br/>subject-mapping + collapse<br/>interest.rs:131
@@ -338,7 +307,7 @@ sequenceDiagram
 
 ---
 
-## 6. Upstream Leaf Connection Flow
+## 5. Upstream Leaf Connection Flow
 
 The upstream module connects to a hub server using the leaf node protocol.
 
@@ -381,7 +350,7 @@ sequenceDiagram
 
 ---
 
-## 7. Worker Event Loop
+## 6. Worker Event Loop
 
 Each worker thread runs a tight epoll loop processing socket events
 and cross-worker notifications.
@@ -403,14 +372,14 @@ stateDiagram-v2
         state EventFd {
             [*] --> ReadEventFd
             ReadEventFd --> ScanPending
-            ScanPending --> DrainDirectBuf : has_pending == true
-            DrainDirectBuf --> WriteSocket
+            ScanPending --> DrainMsgBuf : has_pending == true
+            DrainMsgBuf --> WriteSocket
         }
         note right of EventFd
             handle_eventfd()
             worker.rs:476
             Scans ALL conns for pending
-            direct_writer data
+            MsgWriter data
         end note
 
         state ClientFd {
@@ -430,7 +399,7 @@ stateDiagram-v2
             }
         }
         note right of ClientFd
-            process_active<H>()
+            process_active[H]()
             worker.rs:2152
             Generic over ConnectionHandler
             handler/conn.rs:25
@@ -449,29 +418,29 @@ stateDiagram-v2
 
 ---
 
-## 8. DirectWriter Cross-Worker Delivery
+## 7. MsgWriter Cross-Worker Delivery
 
 How messages cross worker boundaries using shared buffers and eventfd.
 
-> [`DirectWriter`](../src/direct_writer.rs#L37) — `direct_writer.rs:37`
+> [`MsgWriter`](../src/msg_writer.rs#L37) — `msg_writer.rs:37`
 
 ```mermaid
 sequenceDiagram
     participant PW as Publisher Worker
-    participant DW as DirectWriter<br/>direct_writer.rs:37
+    participant MW as MsgWriter<br/>msg_writer.rs:37
     participant EFD as eventfd (kernel)
     participant SW as Subscriber Worker
     participant SS as Subscriber Socket
 
     Note over PW: Processing PUB from client
 
-    PW->>DW: write_msg(sid, subject, reply, hdr, payload)<br/>direct_writer.rs:74
-    DW->>DW: lock buf (Arc<Mutex<BytesMut>>)
-    DW->>DW: append MSG wire bytes
-    DW->>DW: set has_pending = true (AtomicBool)
-    DW->>DW: unlock buf
+    PW->>MW: write_msg(sid, subject, reply, hdr, payload)<br/>msg_writer.rs:74
+    MW->>MW: lock buf (Arc Mutex BytesMut)
+    MW->>MW: append MSG wire bytes
+    MW->>MW: set has_pending = true (AtomicBool)
+    MW->>MW: unlock buf
 
-    PW->>PW: queue_notify(event_fd)<br/>handler/delivery.rs — WorkerCtx
+    PW->>PW: queue_notify(event_fd)<br/>handler/delivery.rs — MessageDeliveryHub
     Note over PW: Dedup: collect unique eventfds<br/>across all deliveries in batch
 
     PW->>EFD: write(1) — one per unique worker
@@ -481,11 +450,11 @@ sequenceDiagram
     SW->>SW: handle_eventfd()<br/>worker.rs:476
 
     loop Each conn on this worker
-        SW->>DW: check has_pending (AtomicBool)
+        SW->>MW: check has_pending (AtomicBool)
         alt has_pending == true
-            SW->>DW: drain()<br/>direct_writer.rs:157
-            DW->>DW: lock buf, split_to(len)
-            DW-->>SW: Bytes chunk
+            SW->>MW: drain()<br/>msg_writer.rs:157
+            MW->>MW: lock buf, split_to(len)
+            MW-->>SW: Bytes chunk
             SW->>SS: write(chunk) to socket
         end
     end
@@ -493,80 +462,62 @@ sequenceDiagram
 
 ---
 
-## 9. Inbound Leaf Handshake
+## 8. Inbound Peer Handshake
 
-Hub accepting a leaf node connection.
-
-```mermaid
-sequenceDiagram
-    participant Leaf as Leaf Node
-    participant A as Acceptor<br/>server.rs:1699
-    participant W as Worker<br/>worker.rs:275
-
-    Leaf->>A: TCP connect to leafnode_port
-    A->>W: WorkerCmd::NewLeafConn(fd)
-    W->>W: register fd, phase = SendInfo
-
-    W->>Leaf: INFO {"server_id": "...", "leafnode": true}
-    W->>W: phase = WaitConnect
-
-    Leaf->>W: CONNECT {"verbose": false, ...}
-    W->>W: validate auth, create ConnExt::Leaf
-    Note over W: ConnExt::Leaf {<br/>  leaf_sid_counter: 0,<br/>  leaf_sids: HashMap::new()<br/>}<br/>handler/conn.rs:72
-
-    W->>Leaf: PING
-    Leaf->>W: PONG
-    W->>W: phase = Active
-
-    Note over W: send_existing_subs()<br/>propagation.rs<br/>Sends LS+ for all local subs
-
-    loop Active
-        Leaf->>W: LS+ subject / LS- subject / LMSG / PING
-        W->>W: process_active<LeafHandler>()
-        Note over W: LeafHandler<br/>leaf_handler.rs:22
-    end
-```
-
----
-
-## 10. Inbound Route Handshake
-
-Cluster peer connecting via route protocol.
+All inbound peer connections (leaf, route, gateway) follow a common
+handshake template. The worker accepts the connection, exchanges
+INFO/CONNECT, creates the appropriate `ConnExt` variant, syncs existing
+subscriptions, then enters the active protocol loop.
 
 ```mermaid
 sequenceDiagram
-    participant Peer as Route Peer
+    participant Peer as Peer Node
     participant A as Acceptor<br/>server.rs:1699
     participant W as Worker<br/>worker.rs:275
 
-    Peer->>A: TCP connect to cluster_port
-    A->>W: WorkerCmd::NewRouteConn(fd)
+    Peer->>A: TCP connect to peer port
+    A->>W: WorkerCmd::NewPeerConn(fd)
     W->>W: register fd, phase = SendInfo
 
-    W->>Peer: INFO {"server_id": "...", "cluster": "..."}
+    W->>Peer: INFO (server_id, cluster/leafnode metadata)
     W->>W: phase = WaitConnect
 
-    Peer->>W: INFO {"server_id": "peer-id", ...}
-    Note over W: Skip peer INFO (already have it)
-    Peer->>W: CONNECT {"verbose": false, ...}
-    W->>W: validate, create ConnExt::Route
-    Note over W: ConnExt::Route {<br/>  route_sid_counter: 0,<br/>  route_sids: HashMap::new(),<br/>  peer_server_id: Some("peer-id")<br/>}<br/>handler/conn.rs:78
+    opt Route/Gateway peers send INFO first
+        Peer->>W: INFO (peer metadata)
+        Note over W: Store or skip peer INFO
+    end
 
-    W->>Peer: PONG
+    Peer->>W: CONNECT (verbose, auth, ...)
+    W->>W: validate auth, create ConnExt variant
+
+    alt Leaf peer
+        W->>Peer: PING
+        Peer->>W: PONG
+    else Route/Gateway peer
+        W->>Peer: PONG
+    end
+
     W->>W: phase = Active
 
-    Note over W: send_existing_route_subs()<br/>propagation.rs<br/>Sends RS+ for all local subs
+    Note over W: Sync existing subscriptions<br/>to new peer (see variants table)
 
     loop Active
-        Peer->>W: RS+ $G subject / RS- $G subject / RMSG / PING
-        W->>W: process_active<RouteHandler>()
-        Note over W: RouteHandler<br/>route_handler.rs:21
+        Peer->>W: protocol ops (LS+/RS+/LMSG/RMSG/PING)
+        W->>W: process_active[Handler]()
     end
 ```
 
+### Handshake Variants
+
+| Peer Type | Port | ConnExt | Interest Sync | Handler | Protocol Ops |
+|-----------|------|---------|---------------|---------|--------------|
+| Leaf | `leafnode_port` | `Leaf { leaf_sid_counter, leaf_sids }` | `send_existing_subs()` (LS+) | `LeafHandler` | LS+/LS-/LMSG |
+| Route | `cluster_port` | `Route { route_sid_counter, route_sids }` | `send_existing_route_subs()` (RS+) | `RouteHandler` | RS+/RS-/RMSG |
+| Gateway | `gateway_port` | `Gateway { gateway_sid_counter, gateway_sids }` | `send_existing_route_subs()` (RS+) | `GatewayHandler` | RS+/RS-/RMSG |
+
 ---
 
-## 11. Gateway Interest Modes
+## 9. Gateway Interest Modes
 
 Gateways use two interest modes to optimize cross-cluster traffic.
 
@@ -625,10 +576,10 @@ Quick reference linking diagram elements to source code.
 | `ConnExt` | `handler/conn.rs` | 67 |
 | `ConnKind` | `handler/conn.rs` | 97 |
 | `HandleResult` | `handler/conn.rs` | 179 |
-| `WorkerCtx` | `handler/delivery.rs` | 31 |
+| `MessageDeliveryHub` | `handler/delivery.rs` | 31 |
 | `Msg` | `handler/delivery.rs` | 75 |
 | `DeliveryScope` | `handler/delivery.rs` | 104 |
-| `WorkerCtx::publish()` | `handler/delivery.rs` | 162 |
+| `MessageDeliveryHub::publish()` | `handler/delivery.rs` | 162 |
 | `deliver_to_sub_inner()` | `handler/delivery.rs` | 210 |
 | `deliver_to_subs_core()` | `handler/delivery.rs` | 258 |
 | `deliver_to_subs()` | `handler/delivery.rs` | 331 |
@@ -636,16 +587,16 @@ Quick reference linking diagram elements to source code.
 | `handle_expired_subs()` | `handler/delivery.rs` | 503 |
 | `forward_to_optimistic_gateways()` | `handler/delivery.rs` | 590 |
 | `deliver_cross_account()` | `handler/delivery.rs` | 642 |
-| `SubList` | `sub_list.rs` | 375 |
+| `SubscriptionManager` | `sub_list.rs` | 375 |
 | `Subscription` | `sub_list.rs` | 10 |
-| `SubList::insert()` | `sub_list.rs` | 389 |
-| `SubList::remove()` | `sub_list.rs` | 397 |
-| `SubList::for_each_match()` | `sub_list.rs` | 495 |
-| `DirectWriter` | `direct_writer.rs` | 37 |
-| `DirectWriter::write_msg()` | `direct_writer.rs` | 74 |
-| `DirectWriter::write_lmsg()` | `direct_writer.rs` | 92 |
-| `DirectWriter::write_rmsg()` | `direct_writer.rs` | 109 |
-| `DirectWriter::drain()` | `direct_writer.rs` | 157 |
+| `SubscriptionManager::insert()` | `sub_list.rs` | 389 |
+| `SubscriptionManager::remove()` | `sub_list.rs` | 397 |
+| `SubscriptionManager::for_each_match()` | `sub_list.rs` | 495 |
+| `MsgWriter` | `msg_writer.rs` | 37 |
+| `MsgWriter::write_msg()` | `msg_writer.rs` | 74 |
+| `MsgWriter::write_lmsg()` | `msg_writer.rs` | 92 |
+| `MsgWriter::write_rmsg()` | `msg_writer.rs` | 109 |
+| `MsgWriter::drain()` | `msg_writer.rs` | 157 |
 | `ClientOp` | `nats_proto.rs` | 153 |
 | `LeafOp` | `nats_proto.rs` | 546 |
 | `RouteOp` | `nats_proto.rs` | 838 |
