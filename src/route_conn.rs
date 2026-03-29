@@ -2,7 +2,7 @@
 //!
 //! Each outbound route connection spawns a reader thread that processes
 //! RS+/RS-/RMSG from the remote peer, and a writer thread that drains
-//! the DirectWriter buffer to TCP.
+//! the MsgWriter buffer to TCP.
 //!
 //! One-hop rule: messages received from a route are never re-forwarded
 //! to other routes (enforced by deliver_to_subs_upstream skipping route subs).
@@ -22,7 +22,7 @@ use crate::handler::{
 };
 use crate::nats_proto::{self, MsgBuilder, RouteOp};
 use crate::server::ServerState;
-use crate::sub_list::{DirectWriter, Subscription};
+use crate::sub_list::{MsgWriter, Subscription};
 use crate::upstream::Backoff;
 
 /// Virtual connection ID range for outbound route connections.
@@ -335,8 +335,8 @@ fn connect_route(
         peers.connected.insert(peer_server_id.clone(), addr.clone());
     }
 
-    // --- Create DirectWriter for this route ---
-    let direct_writer = DirectWriter::new_dummy();
+    // --- Create MsgWriter for this route ---
+    let direct_writer = MsgWriter::new_dummy();
 
     // Register in route_writers
     {
@@ -380,7 +380,7 @@ fn connect_route(
     broadcast_route_info(state);
 
     // --- Spawn writer thread ---
-    // The writer thread polls the DirectWriter's eventfd and drains buffered
+    // The writer thread polls the MsgWriter's eventfd and drains buffered
     // RMSG/RS+ data to the TCP socket.
     let writer_dw = direct_writer.clone();
     let writer_shutdown = Arc::clone(shutdown);
@@ -398,7 +398,7 @@ fn connect_route(
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
 
-    // Remove all route subs for this connection from SubList
+    // Remove all route subs for this connection from SubscriptionManager
     {
         #[cfg(feature = "accounts")]
         {
@@ -438,8 +438,8 @@ fn connect_route(
     result
 }
 
-/// Writer thread: waits on DirectWriter's eventfd and flushes buffered data to TCP.
-fn run_route_writer(tcp: TcpStream, dw: DirectWriter, shutdown: Arc<AtomicBool>) {
+/// Writer thread: waits on MsgWriter's eventfd and flushes buffered data to TCP.
+fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
     let efd = dw.event_raw_fd();
     let mut pfds = [libc::pollfd {
         fd: efd,
@@ -497,9 +497,9 @@ fn run_route_reader(
     read_buf: &mut BytesMut,
     conn_id: u64,
     state: &ServerState,
-    direct_writer: &DirectWriter,
+    direct_writer: &MsgWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+    let mut dirty_writers: Vec<MsgWriter> = Vec::new();
     let mut route_sid_counter: u64 = 0;
     let mut route_sids: HashMap<(bytes::Bytes, Option<bytes::Bytes>), u64> = HashMap::new();
     let mut tmp = [0u8; 65536];
@@ -539,9 +539,9 @@ fn handle_route_op(
     op: RouteOp,
     conn_id: u64,
     state: &ServerState,
-    direct_writer: &DirectWriter,
+    direct_writer: &MsgWriter,
     tcp: &TcpStream,
-    dirty_writers: &mut Vec<DirectWriter>,
+    dirty_writers: &mut Vec<MsgWriter>,
     route_sid_counter: &mut u64,
     route_sids: &mut HashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>,
 ) -> io::Result<()> {

@@ -10,7 +10,8 @@ use tracing::debug;
 
 use crate::buf::RouteOp;
 use crate::handler::{
-    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
+    MessageDeliveryHub, Msg,
 };
 use crate::nats_proto;
 #[cfg(feature = "gateway")]
@@ -29,7 +30,7 @@ impl ConnectionHandler for RouteHandler {
 
     fn handle_op(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         op: RouteOp,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         match op {
@@ -132,7 +133,7 @@ impl ConnectionHandler for RouteHandler {
 impl RouteHandler {
     fn handle_route_sub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
         #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
@@ -212,7 +213,7 @@ impl RouteHandler {
 
     fn handle_route_unsub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
     ) -> HandleResult {
@@ -282,7 +283,7 @@ impl RouteHandler {
 
     fn handle_rmsg(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
         headers: Option<crate::types::HeaderMap>,

@@ -12,7 +12,8 @@ use metrics::gauge;
 use tracing::debug;
 
 use crate::handler::{
-    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
+    MessageDeliveryHub, Msg,
 };
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
@@ -31,7 +32,7 @@ impl ConnectionHandler for GatewayHandler {
 
     fn handle_op(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         op: GatewayOp,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         match op {
@@ -92,7 +93,7 @@ impl ConnectionHandler for GatewayHandler {
 impl GatewayHandler {
     fn handle_gateway_sub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
     ) -> HandleResult {
@@ -165,7 +166,7 @@ impl GatewayHandler {
 
     fn handle_gateway_unsub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
     ) -> HandleResult {
         // RS- doesn't include queue in the wire format, so look up by subject via index.
@@ -229,7 +230,7 @@ impl GatewayHandler {
 
     fn handle_gmsg(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
         headers: Option<crate::types::HeaderMap>,

@@ -9,7 +9,7 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 
 use crate::server::Permissions;
-use crate::sub_list::DirectWriter;
+use crate::sub_list::MsgWriter;
 
 #[cfg(feature = "leaf")]
 use crate::upstream::UpstreamCmd;
@@ -35,7 +35,7 @@ pub(crate) trait ConnectionHandler {
     /// Dispatch a parsed operation, returning the result and any expired subs.
     fn handle_op(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut super::WorkerCtx<'_>,
+        wctx: &mut super::MessageDeliveryHub<'_>,
         op: Self::Op,
     ) -> (HandleResult, Vec<(u64, u64)>);
 }
@@ -46,7 +46,7 @@ pub(crate) trait ConnectionHandler {
 pub(crate) struct ConnCtx<'a> {
     pub conn_id: u64,
     pub write_buf: &'a mut BytesMut,
-    pub direct_writer: &'a DirectWriter,
+    pub direct_writer: &'a MsgWriter,
     pub echo: bool,
     /// When true, send 503 no-responders status for request-reply with zero subscribers.
     pub no_responders: bool,

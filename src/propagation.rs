@@ -8,7 +8,7 @@ use crate::nats_proto;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use crate::server::ServerState;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::sub_list::DirectWriter;
+use crate::sub_list::MsgWriter;
 
 #[cfg(feature = "gateway")]
 use std::cell::RefCell;
@@ -51,14 +51,14 @@ pub(crate) fn propagate_leaf_interest(
     }
 }
 
-/// Send LS+ for all existing client subscriptions to a given leaf's DirectWriter.
+/// Send LS+ for all existing client subscriptions to a given leaf's MsgWriter.
 ///
 /// Filters by the leaf's publish permissions — only sends LS+ for subjects that
 /// the leaf is allowed to publish on (controls what the leaf can export).
 #[cfg(feature = "hub")]
 pub(crate) fn send_existing_subs(
     state: &ServerState,
-    writer: &DirectWriter,
+    writer: &MsgWriter,
     leaf_perms: &Option<std::sync::Arc<crate::server::Permissions>>,
 ) {
     let mut builder = nats_proto::MsgBuilder::new();
@@ -151,13 +151,13 @@ pub(crate) fn propagate_route_interest(
     }
 }
 
-/// Send RS+ for all existing local subscriptions to a given route or gateway's DirectWriter.
+/// Send RS+ for all existing local subscriptions to a given route or gateway's MsgWriter.
 ///
 /// Both route and gateway peers use the same RS+ wire format, so this single
 /// function replaces the old `send_existing_subs_to_route` and
 /// `send_existing_subs_to_gateway`.
 #[cfg(any(feature = "cluster", feature = "gateway"))]
-pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &DirectWriter) {
+pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) {
     let mut builder = nats_proto::MsgBuilder::new();
 
     #[cfg(feature = "accounts")]
@@ -470,10 +470,10 @@ mod tests {
         use std::sync::Arc;
 
         use crate::server::{Permission, Permissions};
-        use crate::sub_list::DirectWriter;
+        use crate::sub_list::MsgWriter;
 
         let state = test_server_state();
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
 
         let perms = Permissions {
             publish: Permission {
@@ -507,11 +507,11 @@ mod tests {
     #[test]
     #[cfg(feature = "hub")]
     fn test_propagate_leaf_sends_to_all_leaves() {
-        use crate::sub_list::DirectWriter;
+        use crate::sub_list::MsgWriter;
 
         let state = test_server_state();
-        let w1 = DirectWriter::new_dummy();
-        let w2 = DirectWriter::new_dummy();
+        let w1 = MsgWriter::new_dummy();
+        let w2 = MsgWriter::new_dummy();
 
         {
             let mut writers = state.leaf_writers.write().unwrap();
@@ -531,7 +531,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::server::{Permission, Permissions};
-        use crate::sub_list::{DirectWriter, Subscription};
+        use crate::sub_list::{MsgWriter, Subscription};
 
         let state = test_server_state();
 
@@ -554,7 +554,7 @@ mod tests {
             ));
         }
 
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let perms = Permissions {
             publish: Permission {
                 allow: Vec::new(),

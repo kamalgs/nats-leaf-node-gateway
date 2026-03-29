@@ -1,4 +1,4 @@
-# ADR-002: DirectWriter for Fan-Out
+# ADR-002: MsgWriter for Fan-Out
 
 **Status:** Accepted
 
@@ -15,7 +15,7 @@ across the entire fan-out.
 
 ## Decision
 
-Replace per-subscriber channels with `DirectWriter`: a `Mutex<BytesMut>` shared
+Replace per-subscriber channels with `MsgWriter`: a `Mutex<BytesMut>` shared
 between the writer (any thread doing fan-out) and the reader (the owning worker
 thread). Each worker has one `eventfd`; all connections on that worker share it.
 Fields:

@@ -6,11 +6,11 @@
 
 pub(crate) mod buf;
 pub mod config;
-pub(crate) mod direct_writer;
 #[cfg(feature = "leaf")]
 pub(crate) mod interest;
 #[cfg(feature = "leaf")]
 pub(crate) mod leaf_conn;
+pub(crate) mod msg_writer;
 pub mod nats_proto;
 pub mod server;
 pub mod sub_list;

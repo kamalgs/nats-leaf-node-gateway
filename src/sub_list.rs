@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
-pub(crate) use crate::direct_writer::{create_eventfd, DirectWriter};
+pub(crate) use crate::msg_writer::{create_eventfd, MsgWriter};
+
+/// Backward-compatible alias for `MsgWriter`.
+pub(crate) type DirectWriter = MsgWriter;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -15,9 +18,9 @@ pub struct Subscription {
     pub sid_bytes: Bytes,
     pub subject: String,
     pub queue: Option<String>,
-    /// Direct writer to the client's shared write buffer.
+    /// Message writer to the client's shared write buffer.
     /// Formats MSG bytes synchronously, bypassing mpsc channel overhead.
-    pub(crate) writer: DirectWriter,
+    pub(crate) writer: MsgWriter,
     /// Maximum messages to deliver before auto-unsubscribe. 0 = no limit.
     /// Atomic because `for_each_match` holds a read lock while multiple workers deliver.
     pub(crate) max_msgs: AtomicU64,
@@ -366,13 +369,13 @@ impl WildTrie {
     }
 }
 
-/// Subscription list supporting NATS wildcard matching.
+/// Manages subscription lifecycle (insert/remove) and subject-based lookup.
 ///
 /// Splits subscriptions into exact (HashMap) and wildcard (trie) for fast
 /// lookups: exact subjects get O(1) HashMap lookup, wildcard patterns use
 /// O(depth) trie traversal.
 #[derive(Debug, Default)]
-pub struct SubList {
+pub struct SubscriptionManager {
     /// Exact (non-wildcard) subscriptions indexed by subject.
     exact: HashMap<String, Vec<Subscription>>,
     /// Wildcard subscriptions (patterns with `*` or `>`) stored in a trie.
@@ -381,7 +384,10 @@ pub struct SubList {
     queue_counter: AtomicUsize,
 }
 
-impl SubList {
+/// Backward-compatible alias for `SubscriptionManager`.
+pub type SubList = SubscriptionManager;
+
+impl SubscriptionManager {
     pub fn new() -> Self {
         Self::default()
     }
