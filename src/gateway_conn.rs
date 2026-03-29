@@ -2,7 +2,7 @@
 //!
 //! Each outbound gateway connection spawns a reader thread that processes
 //! RS+/RS-/RMSG from the remote cluster, and a writer thread that drains
-//! the DirectWriter buffer to TCP.
+//! the MsgWriter buffer to TCP.
 //!
 //! One-hop rule: messages received from a gateway are never re-forwarded
 //! to other gateways (enforced by deliver_to_subs skipping gateway subs).
@@ -29,7 +29,7 @@ use crate::server::{
     GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
     GATEWAY_MAX_NI_BEFORE_SWITCH,
 };
-use crate::sub_list::{DirectWriter, Subscription};
+use crate::sub_list::{MsgWriter, Subscription};
 use crate::upstream::Backoff;
 
 /// Virtual connection ID range for outbound gateway connections.
@@ -262,8 +262,8 @@ fn connect_gateway(
             .insert(conn_id);
     }
 
-    // --- Create DirectWriter for this gateway ---
-    let direct_writer = DirectWriter::new_dummy();
+    // --- Create MsgWriter for this gateway ---
+    let direct_writer = MsgWriter::new_dummy();
 
     // Register in gateway_writers
     {
@@ -306,7 +306,7 @@ fn connect_gateway(
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
 
-    // Remove all gateway subs for this connection from SubList
+    // Remove all gateway subs for this connection from SubscriptionManager
     {
         #[cfg(feature = "accounts")]
         {
@@ -364,8 +364,8 @@ fn connect_gateway(
     result
 }
 
-/// Writer thread: waits on DirectWriter's eventfd and flushes buffered data to TCP.
-fn run_gateway_writer(tcp: TcpStream, dw: DirectWriter, shutdown: Arc<AtomicBool>) {
+/// Writer thread: waits on MsgWriter's eventfd and flushes buffered data to TCP.
+fn run_gateway_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
     let efd = dw.event_raw_fd();
     let mut pfds = [libc::pollfd {
         fd: efd,
@@ -423,7 +423,7 @@ fn run_gateway_reader(
     read_buf: &mut BytesMut,
     conn_id: u64,
     state: &ServerState,
-    direct_writer: &DirectWriter,
+    direct_writer: &MsgWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_notify: [RawFd; 16] = [0; 16];
     let mut pending_notify_count: usize = 0;
@@ -471,7 +471,7 @@ fn handle_gateway_op(
     op: GatewayOp,
     conn_id: u64,
     state: &ServerState,
-    direct_writer: &DirectWriter,
+    direct_writer: &MsgWriter,
     tcp: &TcpStream,
     pending_notify: &mut [RawFd; 16],
     pending_notify_count: &mut usize,
@@ -487,7 +487,7 @@ fn handle_gateway_op(
                     if gis.mode == GatewayInterestMode::Optimistic {
                         let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
                         gis.ni.remove(subject_str);
-                        // In optimistic mode, we don't need to track gateway subs in SubList.
+                        // In optimistic mode, we don't need to track gateway subs in SubscriptionManager.
                         // The remote is telling us it now wants this subject (positive override).
                         debug!(conn_id, subject = %subject_str, "optimistic: cleared negative interest");
                         return Ok(());
@@ -495,7 +495,7 @@ fn handle_gateway_op(
                 }
             }
 
-            // InterestOnly mode: insert gateway subscription into SubList.
+            // InterestOnly mode: insert gateway subscription into SubscriptionManager.
             *gateway_sid_counter += 1;
             let sid = *gateway_sid_counter;
             gateway_sids.insert((subject.clone(), queue.clone()), sid);
@@ -568,7 +568,7 @@ fn handle_gateway_op(
                 return Ok(());
             }
 
-            // InterestOnly mode: RS- = remove gateway subscription from SubList.
+            // InterestOnly mode: RS- = remove gateway subscription from SubscriptionManager.
             let key = (subject.clone(), None);
             if let Some(sid) = gateway_sids.remove(&key) {
                 let mut subs = state
@@ -604,7 +604,7 @@ fn handle_gateway_op(
             );
             // One-hop: skip route subs and gateway subs — messages from a gateway peer
             // are never re-forwarded.
-            let mut dirty_writers: Vec<DirectWriter> = Vec::new();
+            let mut dirty_writers: Vec<MsgWriter> = Vec::new();
             let (delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &msg,
@@ -774,7 +774,7 @@ fn transition_to_interest_only(
     conn_id: u64,
     state: &ServerState,
     tcp: &TcpStream,
-    _direct_writer: &DirectWriter,
+    _direct_writer: &MsgWriter,
 ) -> io::Result<()> {
     info!(conn_id, "gateway transitioning to interest-only mode");
 
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn gateway_interest_state_defaults() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let gis = GatewayInterestState {
             mode: GatewayInterestMode::Optimistic,
             ni: std::collections::HashSet::new(),
@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn gateway_interest_negative_interest_tracking() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let mut gis = GatewayInterestState {
             mode: GatewayInterestMode::Optimistic,
             ni: std::collections::HashSet::new(),
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn gateway_interest_mode_transitions() {
-        let writer = DirectWriter::new_dummy();
+        let writer = MsgWriter::new_dummy();
         let mut gis = GatewayInterestState {
             mode: GatewayInterestMode::Optimistic,
             ni: std::collections::HashSet::new(),

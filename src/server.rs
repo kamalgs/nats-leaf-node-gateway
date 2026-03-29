@@ -26,8 +26,8 @@ use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::buf::BufConfig;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::sub_list::DirectWriter;
-use crate::sub_list::SubList;
+use crate::sub_list::MsgWriter;
+use crate::sub_list::SubscriptionManager;
 #[cfg(feature = "leaf")]
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
@@ -971,7 +971,7 @@ pub(crate) struct GatewayPeerRegistry {
 /// Gateways start in **Optimistic** mode (forward everything unless the remote
 /// has signaled negative interest via RS-). After accumulating enough RS- signals,
 /// the gateway transitions through **Transitioning** (send all current local RS+)
-/// to **InterestOnly** (only forward when a matching RS+ sub exists in SubList).
+/// to **InterestOnly** (only forward when a matching RS+ sub exists in SubscriptionManager).
 #[cfg(feature = "gateway")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GatewayInterestMode {
@@ -979,7 +979,7 @@ pub(crate) enum GatewayInterestMode {
     Optimistic,
     /// Sending all current local RS+ subs before switching to InterestOnly.
     Transitioning,
-    /// Only forward messages when a matching gateway RS+ subscription exists in SubList.
+    /// Only forward messages when a matching gateway RS+ subscription exists in SubscriptionManager.
     InterestOnly,
 }
 
@@ -992,8 +992,8 @@ pub(crate) struct GatewayInterestState {
     pub ni: HashSet<String>,
     /// Total RS- signals received from this gateway peer.
     pub ni_count: u64,
-    /// DirectWriter for this outbound gateway (for optimistic forwarding).
-    pub writer: DirectWriter,
+    /// MsgWriter for this outbound gateway (for optimistic forwarding).
+    pub writer: MsgWriter,
 }
 
 /// Number of RS- signals before switching from Optimistic to InterestOnly mode.
@@ -1098,10 +1098,10 @@ pub(crate) struct ServerState {
     pub auth_timeout_ms: AtomicU64,
     pub max_pings_outstanding: AtomicU32,
     #[cfg(not(feature = "accounts"))]
-    pub subs: std::sync::RwLock<SubList>,
+    pub subs: std::sync::RwLock<SubscriptionManager>,
     /// Per-account subscription lists, indexed by AccountId.
     #[cfg(feature = "accounts")]
-    pub account_subs: Vec<std::sync::RwLock<SubList>>,
+    pub account_subs: Vec<std::sync::RwLock<SubscriptionManager>>,
     /// Maps account names ↔ numeric IDs.
     #[cfg(feature = "accounts")]
     pub account_registry: AccountRegistry,
@@ -1145,19 +1145,19 @@ pub(crate) struct ServerState {
     /// `None` when hub mode is not enabled.
     #[cfg(feature = "hub")]
     pub leafnode_port: Option<u16>,
-    /// Registry of DirectWriters for inbound leaf connections.
+    /// Registry of MsgWriters for inbound leaf connections.
     /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
     /// Each entry stores the writer and the leaf's optional publish permissions.
     #[cfg(feature = "hub")]
     #[allow(clippy::type_complexity)]
-    pub leaf_writers: std::sync::RwLock<HashMap<u64, (DirectWriter, Option<Arc<Permissions>>)>>,
+    pub leaf_writers: std::sync::RwLock<HashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
     /// Inbound leaf node authentication configuration.
     #[cfg(feature = "hub")]
     pub leaf_auth: LeafAuth,
-    /// Registry of DirectWriters for inbound route connections.
+    /// Registry of MsgWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "cluster")]
-    pub route_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    pub route_writers: std::sync::RwLock<HashMap<u64, MsgWriter>>,
     /// Port for inbound route connections. `None` when cluster mode is not enabled.
     #[cfg(feature = "cluster")]
     pub cluster_port: Option<u16>,
@@ -1174,9 +1174,9 @@ pub(crate) struct ServerState {
     /// are sent here to trigger outbound connections.
     #[cfg(feature = "cluster")]
     pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-    /// Registry of DirectWriters for inbound gateway connections.
+    /// Registry of MsgWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
-    pub gateway_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    pub gateway_writers: std::sync::RwLock<HashMap<u64, MsgWriter>>,
     /// Port for inbound gateway connections.
     #[cfg(feature = "gateway")]
     pub gateway_port: Option<u16>,
@@ -1284,13 +1284,13 @@ impl ServerState {
             auth_timeout_ms: AtomicU64::new(auth_timeout.as_millis() as u64),
             max_pings_outstanding: AtomicU32::new(max_pings_outstanding),
             #[cfg(not(feature = "accounts"))]
-            subs: std::sync::RwLock::new(SubList::new()),
+            subs: std::sync::RwLock::new(SubscriptionManager::new()),
             #[cfg(feature = "accounts")]
             account_subs: {
                 let registry = AccountRegistry::new(&accounts);
                 let count = registry.count();
                 (0..count)
-                    .map(|_| std::sync::RwLock::new(SubList::new()))
+                    .map(|_| std::sync::RwLock::new(SubscriptionManager::new()))
                     .collect()
             },
             #[cfg(feature = "accounts")]
@@ -1381,12 +1381,12 @@ impl ServerState {
     }
 
     /// Get the subscription list for the given account.
-    /// When the `accounts` feature is disabled, always returns the global SubList.
+    /// When the `accounts` feature is disabled, always returns the global SubscriptionManager.
     #[inline]
     pub(crate) fn get_subs(
         &self,
         #[cfg(feature = "accounts")] account_id: AccountId,
-    ) -> &std::sync::RwLock<SubList> {
+    ) -> &std::sync::RwLock<SubscriptionManager> {
         #[cfg(feature = "accounts")]
         {
             &self.account_subs[account_id as usize]
@@ -2153,13 +2153,13 @@ impl LeafServer {
             {
                 for account_subs in &self.state.account_subs {
                     let mut subs = account_subs.write().unwrap();
-                    *subs = SubList::new();
+                    *subs = SubscriptionManager::new();
                 }
             }
             #[cfg(not(feature = "accounts"))]
             {
                 let mut subs = self.state.subs.write().unwrap();
-                *subs = SubList::new();
+                *subs = SubscriptionManager::new();
             }
         }
 

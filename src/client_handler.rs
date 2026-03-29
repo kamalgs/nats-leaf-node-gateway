@@ -9,8 +9,8 @@ use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
 use crate::handler::{
-    bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult, Msg,
-    WorkerCtx,
+    bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult,
+    MessageDeliveryHub, Msg,
 };
 use crate::nats_proto::{self, ClientOp};
 use crate::propagation::propagate_all_interest;
@@ -28,7 +28,7 @@ impl ConnectionHandler for ClientHandler {
 
     fn handle_op(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         op: ClientOp,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         match op {
@@ -71,7 +71,7 @@ impl ConnectionHandler for ClientHandler {
 impl ClientHandler {
     fn handle_sub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         sid: u64,
         subject: Bytes,
         queue_group: Option<Bytes>,
@@ -212,7 +212,7 @@ impl ClientHandler {
 
     fn handle_unsub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         sid: u64,
         max: Option<u64>,
     ) -> HandleResult {
@@ -280,7 +280,7 @@ impl ClientHandler {
 
     fn handle_pub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         payload: Bytes,
         respond: Option<Bytes>,
@@ -393,7 +393,7 @@ impl ClientHandler {
 /// metrics, propagation, and reverse imports.
 fn cleanup_removed_sub(
     conn: &mut ConnCtx<'_>,
-    wctx: &mut WorkerCtx<'_>,
+    wctx: &mut MessageDeliveryHub<'_>,
     sid: u64,
     removed: &Subscription,
     reason: &str,
@@ -435,7 +435,7 @@ fn cleanup_removed_sub(
 /// upstream/leaf/route/gateway peers.
 #[cfg(feature = "accounts")]
 fn propagate_reverse_unsub(
-    wctx: &mut WorkerCtx<'_>,
+    wctx: &mut MessageDeliveryHub<'_>,
     account_id: crate::server::AccountId,
     subject: &str,
 ) {

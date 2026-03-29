@@ -12,7 +12,8 @@ use tracing::warn;
 
 use crate::buf::LeafOp;
 use crate::handler::{
-    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult, Msg, WorkerCtx,
+    bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
+    MessageDeliveryHub, Msg,
 };
 use crate::nats_proto;
 use crate::propagation::propagate_route_gateway_interest;
@@ -30,7 +31,7 @@ impl ConnectionHandler for LeafHandler {
 
     fn handle_op(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         op: LeafOp,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         match op {
@@ -64,7 +65,7 @@ impl ConnectionHandler for LeafHandler {
 impl LeafHandler {
     fn handle_leaf_sub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
     ) -> HandleResult {
@@ -178,7 +179,7 @@ impl LeafHandler {
 
     fn handle_leaf_unsub(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
     ) -> HandleResult {
@@ -247,7 +248,7 @@ impl LeafHandler {
 
     fn handle_lmsg(
         conn: &mut ConnCtx<'_>,
-        wctx: &mut WorkerCtx<'_>,
+        wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
         headers: Option<crate::types::HeaderMap>,

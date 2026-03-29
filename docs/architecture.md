@@ -67,9 +67,9 @@ Features marked `[leaf]` require the `leaf` Cargo feature; `[hub]` requires
 | `server.rs` | Accept loop, worker spawning, shutdown | `LeafServer`, `ServerState` | — |
 | `worker.rs` | Per-thread epoll event loop | `Worker`, `ClientState`, `ConnPhase` | — |
 | `nats_proto.rs` | Zero-copy protocol parser and message builder | `ClientOp`, `LeafOp`, `MsgBuilder` | `leaf\|hub`* |
-| `sub_list.rs` | Subscription storage, wildcard matching | `SubList`, `Subscription` | — |
-| `direct_writer.rs` | Shared buffer + eventfd fan-out delivery | `DirectWriter` | — |
-| `handler.rs` | Shared handler types and delivery | `ConnCtx`, `WorkerCtx`, `ConnExt` | — |
+| `sub_list.rs` | Subscription storage, wildcard matching | `SubscriptionManager`, `Subscription` | — |
+| `msg_writer.rs` | Shared buffer + eventfd cross-worker delivery | `MsgWriter` | — |
+| `handler.rs` | Shared handler types and delivery | `ConnCtx`, `MessageDeliveryHub`, `ConnExt` | — |
 | `propagation.rs` | Interest propagation (LS+/LS-, RS+/RS-) | propagate functions | — |
 | `client_handler.rs` | Client protocol dispatch | `ClientHandler` | — |
 | `leaf_handler.rs` | Inbound leaf protocol dispatch | `LeafHandler` | `hub` |
@@ -116,7 +116,7 @@ socket to its epoll instance and manages state transitions inline.
   PUB "foo" ──EPOLLIN──►    │                       │
        │            for_each_match("foo")            │
        │                     │                       │
-       │              DirectWriter::write_msg()      │
+       │              MsgWriter::write_msg()      │
        │                     │──► shared buf ────────┤
        │                     │                       │
        │         flush_pending() (no eventfd)        │
@@ -124,7 +124,7 @@ socket to its epoll instance and manages state transitions inline.
 ```
 
 When publisher and subscriber are on the same worker, `flush_pending()` drains
-the subscriber's `DirectWriter` buffer directly — no eventfd wake is needed.
+the subscriber's `MsgWriter` buffer directly — no eventfd wake is needed.
 
 ## Message Flow: Cross-Worker Pub/Sub
 
@@ -135,7 +135,7 @@ the subscriber's `DirectWriter` buffer directly — no eventfd wake is needed.
        │                                          │
   for_each_match()                                │
        │                                          │
-  DirectWriter::write_msg()                       │
+  MsgWriter::write_msg()                       │
   (into subscriber's shared buf)                  │
        │                                          │
   accumulate eventfd in pending_notify[]          │
@@ -161,7 +161,7 @@ See [ADR-005](adr/005-batched-notifications.md).
        │                    │◄── LMSG foo payload ──│
        │                    │                       │
        │   for_each_match("foo")                    │
-       │◄── DirectWriter ──┘                        │
+       │◄── MsgWriter ──┘                        │
        │                                            │
   PUB "bar" ────────────────► LMSG bar payload ────►│
 ```
@@ -204,7 +204,7 @@ and the worker epoll loop (inbound, multiplexed like client connections).
 
 ## Subscription Model
 
-`SubList` splits subscriptions into two collections:
+`SubscriptionManager` splits subscriptions into two collections:
 
 - **Exact subjects** — `HashMap<String, Vec<Subscription>>`, O(1) lookup.
 - **Wildcard patterns** (`*`, `>`) — `Vec<Subscription>`, linear scan.
@@ -212,14 +212,14 @@ and the worker epoll loop (inbound, multiplexed like client connections).
 `for_each_match(subject, callback)` avoids allocation by invoking a closure
 on each match rather than collecting into a `Vec`.
 
-Each `Subscription` holds a `DirectWriter` (defined in `direct_writer.rs`)
+Each `Subscription` holds a `MsgWriter` (defined in `msg_writer.rs`)
 that points to the subscriber's shared buffer. Fan-out is lock → memcpy →
 unlock per subscriber, with a single eventfd notification per remote worker.
 
 ## See Also
 
 - [ADR-001: epoll over Tokio](adr/001-epoll-over-tokio.md)
-- [ADR-002: DirectWriter](adr/002-direct-writer.md)
+- [ADR-002: MsgWriter](adr/002-direct-writer.md)
 - [ADR-003: Zero-copy parsing](adr/003-zero-copy-parsing.md)
 - [ADR-004: Adaptive buffers](adr/004-adaptive-buffers.md)
 - [ADR-005: Batched notifications](adr/005-batched-notifications.md)
