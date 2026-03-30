@@ -19,6 +19,13 @@ use tracing::{debug, info, warn};
 
 #[cfg(feature = "cluster")]
 use crate::cluster::RouteHandler;
+#[cfg(feature = "cluster")]
+use crate::core::buf::RouteOp;
+use crate::core::buf::{AdaptiveBuf, ClientOp};
+use crate::core::nats_proto;
+use crate::core::server::ServerState;
+use crate::core::sub_list::{create_eventfd, MsgWriter};
+use crate::core::websocket::{self, DecodeStatus, WsCodec};
 #[cfg(feature = "gateway")]
 use crate::gateway::GatewayHandler;
 use crate::handler::client::ClientHandler;
@@ -30,13 +37,6 @@ use crate::handler::{
     handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
     MessageDeliveryHub,
 };
-#[cfg(feature = "cluster")]
-use crate::infra::buf::RouteOp;
-use crate::infra::buf::{AdaptiveBuf, ClientOp};
-use crate::infra::nats_proto;
-use crate::infra::server::ServerState;
-use crate::infra::sub_list::{create_eventfd, MsgWriter};
-use crate::infra::websocket::{self, DecodeStatus, WsCodec};
 #[cfg(feature = "hub")]
 use crate::leaf::LeafHandler;
 #[cfg(feature = "leaf")]
@@ -275,10 +275,10 @@ pub(crate) struct ClientState {
     /// Number of active subscriptions for this connection.
     pub(crate) sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
-    permissions: Option<crate::infra::server::Permissions>,
+    permissions: Option<crate::core::server::Permissions>,
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
-    account_id: crate::infra::server::AccountId,
+    account_id: crate::core::server::AccountId,
 }
 
 impl ClientState {

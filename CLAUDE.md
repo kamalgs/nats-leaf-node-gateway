@@ -15,17 +15,23 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 src/
 ├── main.rs              # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
 ├── lib.rs               # Module declarations + public re-exports
-├── infra/               # Shared infrastructure
-│   ├── mod.rs           # Facade re-exports
-│   ├── server.rs        # LeafServer, ServerState, accept loop
-│   ├── worker.rs        # N-worker epoll reactor
+├── core/                # Shared infrastructure
+│   ├── mod.rs           # Facade re-exports (protocol, io, pubsub + convenience re-exports)
+│   ├── protocol/
+│   │   ├── mod.rs       # types + nats_proto
+│   │   ├── types.rs     # ServerInfo, ConnectInfo, HeaderMap
+│   │   └── nats_proto.rs # ClientOp/LeafOp/RouteOp, MsgBuilder, parsers
+│   ├── io/
+│   │   ├── mod.rs       # buf + msg_writer + websocket
+│   │   ├── buf.rs       # AdaptiveBuf, BufConfig, Backoff, op re-exports
+│   │   ├── msg_writer.rs # MsgWriter, create_eventfd
+│   │   └── websocket.rs # WsCodec, HTTP upgrade, SHA-1/Base64
+│   ├── pubsub/
+│   │   ├── mod.rs       # sub_list
+│   │   └── sub_list.rs  # SubscriptionManager, WildTrie, Subscription
 │   ├── config.rs        # Go nats-server .conf file parser
-│   ├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
-│   ├── sub_list.rs      # SubscriptionManager (exact + wildcard matching)
-│   ├── msg_writer.rs    # MsgWriter: cross-worker delivery via eventfd
-│   ├── buf.rs           # AdaptiveBuf, BufConfig, Backoff
-│   ├── types.rs         # ServerInfo, ConnectInfo, HeaderMap
-│   └── websocket.rs     # HTTP upgrade handshake, WS frame codec
+│   ├── server.rs        # LeafServer, LeafServerConfig, ServerState
+│   └── worker.rs        # Worker epoll event loop
 ├── handler/             # Handler framework + client protocol + propagation
 │   ├── mod.rs           # Facade re-exports
 │   ├── conn.rs          # ConnectionHandler trait, ConnCtx, ConnExt
@@ -177,16 +183,16 @@ Always run `cargo +nightly fmt` before committing.
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `LeafServer` | `infra/server.rs` | Public API entry point |
-| `LeafServerConfig` | `infra/server.rs` | Server configuration |
-| `load_config` | `infra/config.rs` | Go nats-server `.conf` file parser |
-| `Worker` | `infra/worker.rs` | Per-thread epoll event loop |
-| `NatsProto` / `MsgBuilder` | `infra/nats_proto.rs` | Protocol parser + message builder |
-| `SubscriptionManager` | `infra/sub_list.rs` | Subscription storage + wildcard matching |
-| `MsgWriter` | `infra/msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
-| `ServerConn` | `infra/buf.rs` | Connection I/O wrapper (test-only) |
-| `Backoff` | `infra/buf.rs` | Exponential backoff with jitter |
-| `AdaptiveBuf` | `infra/buf.rs` | Dynamic read buffer |
+| `LeafServer` | `core/server.rs` | Public API entry point |
+| `LeafServerConfig` | `core/server.rs` | Server configuration |
+| `load_config` | `core/config.rs` | Go nats-server `.conf` file parser |
+| `Worker` | `core/worker.rs` | Per-thread epoll event loop |
+| `NatsProto` / `MsgBuilder` | `core/protocol/nats_proto.rs` | Protocol parser + message builder |
+| `SubscriptionManager` | `core/pubsub/sub_list.rs` | Subscription storage + wildcard matching |
+| `MsgWriter` | `core/io/msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
+| `ServerConn` | `core/io/buf.rs` | Connection I/O wrapper (test-only) |
+| `Backoff` | `core/io/buf.rs` | Exponential backoff with jitter |
+| `AdaptiveBuf` | `core/io/buf.rs` | Dynamic read buffer |
 | `LeafConn` | `leaf/conn.rs` | Leaf connection I/O wrapper |
 | `Upstream` | `leaf/upstream.rs` | Hub connection management |
 | `InterestPipeline` | `leaf/interest.rs` | Subject mapping + interest collapse |

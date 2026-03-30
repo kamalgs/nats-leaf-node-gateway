@@ -18,10 +18,10 @@ use std::fmt;
 use std::path::Path;
 
 #[cfg(feature = "leaf")]
-use crate::infra::server::HubCredentials;
+use crate::core::server::HubCredentials;
 #[cfg(feature = "accounts")]
-use crate::infra::server::{AccountConfig, ExportRule, ImportRule};
-use crate::infra::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
+use crate::core::server::{AccountConfig, ExportRule, ImportRule};
+use crate::core::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
 
 /// Errors that can occur during config parsing.
 #[derive(Debug)]
@@ -931,8 +931,7 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
                         if akey == "users" {
                             if let Some(arr) = aval.as_array() {
                                 let leaf_users = parse_leaf_users_array(arr)?;
-                                config.leaf_auth =
-                                    crate::infra::server::LeafAuth::Users(leaf_users);
+                                config.leaf_auth = crate::core::server::LeafAuth::Users(leaf_users);
                             }
                         }
                     }
@@ -950,7 +949,7 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
 #[cfg(feature = "hub")]
 fn parse_leaf_users_array(
     arr: &[Value],
-) -> Result<Vec<crate::infra::server::LeafUserConfig>, ConfigError> {
+) -> Result<Vec<crate::core::server::LeafUserConfig>, ConfigError> {
     let mut users = Vec::new();
     for item in arr {
         if let Some(entries) = item.as_map() {
@@ -972,7 +971,7 @@ fn parse_leaf_users_array(
                 }
             }
             if !user.is_empty() && !pass.is_empty() {
-                users.push(crate::infra::server::LeafUserConfig {
+                users.push(crate::core::server::LeafUserConfig {
                     user,
                     pass,
                     permissions: perms,
@@ -1023,7 +1022,7 @@ fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
 /// Parse a `gateway { ... }` block.
 #[cfg(feature = "gateway")]
 fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
-    use crate::infra::server::GatewayRemote;
+    use crate::core::server::GatewayRemote;
 
     let entries = match value.as_map() {
         Some(e) => e,
@@ -1242,7 +1241,7 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
     }
 
     if !url.is_empty() {
-        let hub_remote = crate::infra::server::HubRemote {
+        let hub_remote = crate::core::server::HubRemote {
             url: url.clone(),
             credentials: if has_creds {
                 Some(hub_creds.clone())
@@ -1977,7 +1976,7 @@ leafnodes {
 "#;
         let config = load_config_str(input).unwrap();
         match &config.leaf_auth {
-            crate::infra::server::LeafAuth::Users(users) => {
+            crate::core::server::LeafAuth::Users(users) => {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].user, "leaf1");
                 assert_eq!(users[0].pass, "pass1");
@@ -2003,7 +2002,7 @@ leafnodes {
         let config = load_config_str(input).unwrap();
         assert!(matches!(
             config.leaf_auth,
-            crate::infra::server::LeafAuth::None
+            crate::core::server::LeafAuth::None
         ));
     }
 }

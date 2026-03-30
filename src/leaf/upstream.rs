@@ -9,15 +9,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
+use crate::core::types::HeaderMap;
 #[cfg(feature = "accounts")]
 use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
-use crate::infra::types::HeaderMap;
 use crate::leaf::InterestPipeline;
 
-use crate::infra::buf::LeafOp;
-use crate::infra::server::{HubCredentials, ServerState};
-use crate::infra::sub_list::MsgWriter;
+use crate::core::buf::LeafOp;
+use crate::core::server::{HubCredentials, ServerState};
+use crate::core::sub_list::MsgWriter;
 use crate::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 
 /// Commands sent from the Upstream handle to the background writer thread.
@@ -36,7 +36,7 @@ pub(crate) enum UpstreamCmd {
     Shutdown,
 }
 
-use crate::infra::buf::Backoff;
+use crate::core::buf::Backoff;
 
 /// Manages connection to an upstream NATS hub server using the leaf node protocol.
 /// Sends LS+/LS- for subscription interest and LMSG for messages.
@@ -211,7 +211,7 @@ fn connect_and_run(
     let stream_shutdown = tcp.try_clone()?;
 
     let mut leaf = if parsed.use_tls {
-        let tls_config = crate::infra::server::build_tls_client_config();
+        let tls_config = crate::core::server::build_tls_client_config();
         let server_name = rustls_pki_types::ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("invalid TLS server name '{}': {e}", parsed.host))?;
         let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
