@@ -15,14 +15,14 @@
 //!
 //! Builds outgoing `MSG`/`HMSG`/`LMSG` protocol lines using direct
 //! `extend_from_slice` appends instead of `write!()` formatting, eliminating
-//! the `core::fmt` machinery from the hot path.
+//! the `std::fmt` machinery from the hot path.
 
 use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 
 #[cfg(any(feature = "leaf", feature = "hub"))]
-use crate::infra::types::ServerInfo;
-use crate::infra::types::{ConnectInfo, HeaderMap};
+use crate::core::types::ServerInfo;
+use crate::core::types::{ConnectInfo, HeaderMap};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Itoa: format integers as decimal ASCII bytes.

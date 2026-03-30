@@ -22,13 +22,13 @@ use std::time::Instant;
 use metrics::counter;
 use tracing::{error, info, warn};
 
-use crate::infra::types::{ConnectInfo, ServerInfo};
+use crate::core::types::{ConnectInfo, ServerInfo};
 
-use crate::infra::buf::BufConfig;
+use crate::core::buf::BufConfig;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::infra::sub_list::MsgWriter;
-use crate::infra::sub_list::SubscriptionManager;
-use crate::infra::worker::{Worker, WorkerHandle};
+use crate::core::sub_list::MsgWriter;
+use crate::core::sub_list::SubscriptionManager;
+use crate::core::worker::{Worker, WorkerHandle};
 #[cfg(feature = "leaf")]
 use crate::leaf::{Upstream, UpstreamCmd};
 
@@ -322,7 +322,7 @@ impl Permission {
         if self
             .deny
             .iter()
-            .any(|p| crate::infra::sub_list::subject_matches(p, subject))
+            .any(|p| crate::core::sub_list::subject_matches(p, subject))
         {
             return false;
         }
@@ -331,7 +331,7 @@ impl Permission {
         }
         self.allow
             .iter()
-            .any(|p| crate::infra::sub_list::subject_matches(p, subject))
+            .any(|p| crate::core::sub_list::subject_matches(p, subject))
     }
 }
 
@@ -627,8 +627,8 @@ pub(crate) fn resolve_cross_account_routes(
             }
             let src_acct = &accounts[src_acct_idx];
             let matching_export = src_acct.exports.iter().find(|e| {
-                crate::infra::sub_list::subject_matches(&e.subject, &import.subject)
-                    || crate::infra::sub_list::subject_matches(&import.subject, &e.subject)
+                crate::core::sub_list::subject_matches(&e.subject, &import.subject)
+                    || crate::core::sub_list::subject_matches(&import.subject, &e.subject)
             });
             let export_pattern = match matching_export {
                 Some(e) => e.subject.clone(),
@@ -2176,7 +2176,7 @@ impl LeafServer {
     /// Reload configuration from file. Updates hot-reloadable values.
     fn reload_config(&self, path: &str) {
         info!(path, "reloading configuration");
-        match crate::infra::config::load_config(std::path::Path::new(path)) {
+        match crate::core::config::load_config(std::path::Path::new(path)) {
             Ok(new_config) => {
                 // Hot-reload numeric limits
                 self.state
