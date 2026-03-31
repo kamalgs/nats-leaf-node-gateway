@@ -5,8 +5,6 @@
 
 use bytes::{BufMut, BytesMut};
 
-// ---- SHA-1 (RFC 3174) ----
-
 fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h0: u32 = 0x67452301;
     let mut h1: u32 = 0xEFCDAB89;
@@ -14,7 +12,6 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     let mut h3: u32 = 0x10325476;
     let mut h4: u32 = 0xC3D2E1F0;
 
-    // Pre-processing: pad message
     let bit_len = (data.len() as u64) * 8;
     let mut msg = Vec::with_capacity(data.len() + 72);
     msg.extend_from_slice(data);
@@ -24,7 +21,6 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    // Process each 512-bit (64-byte) chunk
     for chunk in msg.chunks_exact(64) {
         let mut w = [0u32; 80];
         for i in 0..16 {
@@ -77,8 +73,6 @@ fn sha1(data: &[u8]) -> [u8; 20] {
     result
 }
 
-// ---- Base64 encode ----
-
 const B64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn base64_encode(data: &[u8]) -> String {
@@ -105,8 +99,6 @@ fn base64_encode(data: &[u8]) -> String {
     // SAFETY: B64_CHARS and '=' are all ASCII
     unsafe { String::from_utf8_unchecked(out) }
 }
-
-// ---- WebSocket upgrade handshake ----
 
 /// NATS-specific WebSocket GUID used by the Go nats.go client library.
 /// The NATS client validates the Sec-WebSocket-Accept header against this GUID
@@ -177,8 +169,6 @@ fn extract_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
     }
     None
 }
-
-// ---- WebSocket frame codec ----
 
 /// WebSocket opcodes.
 const OP_CONTINUATION: u8 = 0x0;
@@ -298,12 +288,10 @@ impl WsCodec {
             match effective_opcode {
                 OP_TEXT | OP_BINARY => {
                     if fin && opcode != OP_CONTINUATION && self.partial.is_none() {
-                        // Single complete frame — fast path
                         out.extend_from_slice(&payload);
                         return Ok(DecodeStatus::Complete);
                     }
 
-                    // Fragmented: accumulate
                     if opcode != OP_CONTINUATION {
                         self.partial = Some(PartialFrame {
                             opcode,
@@ -320,16 +308,10 @@ impl WsCodec {
                             return Ok(DecodeStatus::Complete);
                         }
                     }
-                    // Not fin — continue reading more frames
                 }
                 OP_CLOSE => return Ok(DecodeStatus::Close),
-                OP_PING => {
-                    // We'll handle ping in the caller by sending pong
-                    // For now just consume and continue
-                }
-                OP_PONG => {
-                    // Ignore pong
-                }
+                OP_PING => {}
+                OP_PONG => {}
                 _ => return Err("unknown opcode"),
             }
         }
@@ -338,7 +320,6 @@ impl WsCodec {
     /// Encode a NATS payload as a WebSocket binary frame (server→client, unmasked).
     pub fn encode(payload: &[u8], out: &mut BytesMut) {
         let len = payload.len();
-        // FIN + Binary opcode
         out.put_u8(0x82);
 
         if len < 126 {
@@ -356,13 +337,10 @@ impl WsCodec {
 
     /// Build a WebSocket close frame (server→client, unmasked).
     pub fn encode_close(out: &mut BytesMut) {
-        // FIN + Close opcode, 0 payload length
         out.put_u8(0x88);
         out.put_u8(0x00);
     }
 }
-
-// ---- Tests ----
 
 #[cfg(test)]
 mod tests {

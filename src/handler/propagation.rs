@@ -344,7 +344,6 @@ pub(crate) fn rewrite_gateway_reply(
     state: &ServerState,
 ) -> Option<bytes::Bytes> {
     let reply = reply?;
-    // Don't double-rewrite
     if reply.starts_with(b"_GR_.") {
         return Some(bytes::Bytes::copy_from_slice(reply));
     }

@@ -41,23 +41,17 @@ impl Read for HubStream {
             HubStream::Plain(s) => s.read(buf),
             HubStream::Tls { tls, tcp } => {
                 let mut conn = tls.lock().unwrap();
-                // Feed encrypted data from socket into TLS engine
                 match conn.read_tls(tcp) {
                     Ok(0) => return Ok(0),
                     Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No data available on socket, but maybe we have buffered plaintext
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e),
                 }
                 conn.process_new_packets()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 match conn.reader().read(buf) {
                     Ok(n) => Ok(n),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No plaintext available yet
-                        Err(e)
-                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
                     Err(e) => Err(e),
                 }
             }

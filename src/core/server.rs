@@ -46,12 +46,10 @@ pub struct LeafServer {
 pub struct LeafServerConfig {
     /// Address to listen on (e.g., "0.0.0.0").
     pub host: String,
-    /// Port to listen on.
     pub port: u16,
     /// Optional upstream hub URL (e.g., "nats://hub:4222").
     #[cfg(feature = "leaf")]
     pub hub_url: Option<String>,
-    /// Server name.
     pub server_name: String,
     /// Max per-client read buffer capacity in bytes (default: 64 KB).
     /// The buffer starts small (512B) and grows adaptively up to this limit.
@@ -347,9 +345,7 @@ pub struct Permissions {
 /// A user entry with credentials and optional permissions.
 #[derive(Debug, Clone)]
 pub struct UserConfig {
-    /// Username.
     pub user: String,
-    /// Password.
     pub pass: String,
     /// Optional per-user permissions.
     pub permissions: Option<Permissions>,
@@ -455,9 +451,7 @@ impl ClientAuth {
 #[cfg(feature = "hub")]
 #[derive(Debug, Clone)]
 pub struct LeafUserConfig {
-    /// Username.
     pub user: String,
-    /// Password.
     pub pass: String,
     /// Optional per-user permissions.
     pub permissions: Option<Permissions>,
@@ -608,7 +602,6 @@ pub(crate) fn resolve_cross_account_routes(
     for (dst_idx, dst_acct) in accounts.iter().enumerate() {
         let dst_id = (dst_idx + 1) as AccountId;
         for import in &dst_acct.imports {
-            // Look up the source account
             let src_id = match registry.id_by_name(&import.account) {
                 Some(id) => id,
                 None => {
@@ -620,7 +613,6 @@ pub(crate) fn resolve_cross_account_routes(
                     continue;
                 }
             };
-            // Verify the source account has a matching export
             let src_acct_idx = (src_id - 1) as usize;
             if src_acct_idx >= accounts.len() {
                 continue;
@@ -708,7 +700,6 @@ fn fnv_hash_base36(s: &str) -> String {
         h ^= *b as u64;
         h = h.wrapping_mul(FNV_PRIME);
     }
-    // Convert to base36, take first 6 chars
     let mut buf = String::with_capacity(6);
     let mut val = h;
     for _ in 0..6 {
@@ -771,10 +762,8 @@ fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io:
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
 
-    // Parse the path from "GET /path HTTP/1.x"
     let path = request_line.split_whitespace().nth(1).unwrap_or("/");
 
-    // Consume remaining headers
     loop {
         let mut line = String::new();
         reader.read_line(&mut line)?;
@@ -1616,7 +1605,6 @@ impl LeafServer {
         next_worker: &mut usize,
         is_websocket: bool,
     ) {
-        // Enforce max_connections limit.
         let max = self.state.max_connections.load(Ordering::Relaxed);
         if max > 0 {
             let current = self.state.active_connections.load(Ordering::Relaxed);
@@ -1709,7 +1697,6 @@ impl LeafServer {
         #[cfg(feature = "leaf")]
         self.connect_upstream();
 
-        // Spawn outbound route connections to seed peers
         #[cfg(feature = "mesh")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
@@ -1772,7 +1759,6 @@ impl LeafServer {
         #[cfg(not(feature = "gateway"))]
         let gateway_listener: Option<TcpListener> = None;
 
-        // Spawn outbound gateway connections to remote clusters
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
@@ -1788,7 +1774,6 @@ impl LeafServer {
             || cluster_listener.is_some()
             || gateway_listener.is_some();
         if has_extra_listeners {
-            // Poll multiple listeners
             listener.set_nonblocking(true)?;
             if let Some(ref wl) = ws_listener {
                 wl.set_nonblocking(true)?;
@@ -1924,7 +1909,6 @@ impl LeafServer {
         #[cfg(feature = "leaf")]
         self.connect_upstream();
 
-        // Spawn outbound route connections to seed peers
         #[cfg(feature = "mesh")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
@@ -1992,7 +1976,6 @@ impl LeafServer {
         #[cfg(not(feature = "gateway"))]
         let gateway_listener: Option<TcpListener> = None;
 
-        // Spawn outbound gateway connections to remote clusters
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
@@ -2043,7 +2026,6 @@ impl LeafServer {
                 break;
             }
 
-            // Check for config reload (SIGHUP)
             if reload.load(Ordering::Relaxed) {
                 reload.store(false, Ordering::Relaxed);
                 if let Some(path) = config_path {
@@ -2110,8 +2092,6 @@ impl LeafServer {
             }
         }
 
-        // --- Lame duck mode shutdown ---
-        // 1. Build INFO with ldm: true and send to all workers
         let mut ldm_info = self.state.info.clone();
         ldm_info.lame_duck_mode = true;
         let ldm_json = serde_json::to_string(&ldm_info).unwrap_or_default();
@@ -2125,21 +2105,17 @@ impl LeafServer {
             w.send_lame_duck(ldm_line.clone());
         }
 
-        // 2. Sleep for lame_duck_duration (stop accepting)
         let end = std::time::Instant::now() + self.config.lame_duck_duration;
         while std::time::Instant::now() < end {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // 3. Drain all connections (flush pending, remove subs, disconnect)
         info!("draining connections");
         for w in &workers {
             w.send_drain();
         }
-        // Give workers time to flush
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        // 4. Shutdown workers
         for w in &workers {
             w.shutdown();
         }
@@ -2147,7 +2123,6 @@ impl LeafServer {
             w.join();
         }
 
-        // Cleanup: clear all subscriptions.
         {
             #[cfg(feature = "accounts")]
             {
@@ -2163,7 +2138,6 @@ impl LeafServer {
             }
         }
 
-        // Drop all upstreams
         #[cfg(feature = "leaf")]
         {
             self.state.upstream_txs.write().unwrap().clear();
@@ -2178,7 +2152,6 @@ impl LeafServer {
         info!(path, "reloading configuration");
         match crate::config::load_config(std::path::Path::new(path)) {
             Ok(new_config) => {
-                // Hot-reload numeric limits
                 self.state
                     .max_payload
                     .store(new_config.max_payload, Ordering::Relaxed);
@@ -2203,7 +2176,6 @@ impl LeafServer {
                     Ordering::Relaxed,
                 );
 
-                // Warn about non-reloadable fields
                 if new_config.host != self.config.host {
                     warn!("host change requires restart (ignored)");
                 }
@@ -2233,8 +2205,6 @@ impl LeafServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- is_required / needs_nonce ---
 
     #[test]
     fn none_not_required() {
@@ -2267,16 +2237,12 @@ mod tests {
         assert!(auth.needs_nonce());
     }
 
-    // --- ClientAuth::None ---
-
     #[test]
     fn none_always_passes() {
         let auth = ClientAuth::None;
         let info = ConnectInfo::default();
         assert!(auth.validate(&info, ""));
     }
-
-    // --- ClientAuth::Token ---
 
     #[test]
     fn token_match() {
@@ -2304,8 +2270,6 @@ mod tests {
         let info = ConnectInfo::default();
         assert!(!auth.validate(&info, ""));
     }
-
-    // --- ClientAuth::UserPass ---
 
     #[test]
     fn userpass_match() {
@@ -2347,8 +2311,6 @@ mod tests {
         };
         assert!(!auth.validate(&info, ""));
     }
-
-    // --- ClientAuth::NKey ---
 
     #[test]
     fn nkey_valid_signature() {
@@ -2418,8 +2380,6 @@ mod tests {
         assert!(!auth.validate(&info, "nonce"));
     }
 
-    // --- generate_nonce ---
-
     #[test]
     fn generate_nonce_length() {
         let nonce = generate_nonce();
@@ -2431,8 +2391,6 @@ mod tests {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
-    // --- install_metrics_exporter ---
-
     #[test]
     fn install_metrics_exporter_does_not_panic() {
         // Port 0 lets the OS pick an available port. install() sets a global
@@ -2441,15 +2399,11 @@ mod tests {
         let _ = install_metrics_exporter(0);
     }
 
-    // --- metrics_port config ---
-
     #[test]
     fn default_metrics_port_is_none() {
         let config = LeafServerConfig::default();
         assert!(config.metrics_port.is_none());
     }
-
-    // --- ClientAuth::Users ---
 
     #[test]
     fn users_match() {
@@ -2510,8 +2464,6 @@ mod tests {
         assert!(!auth.needs_nonce());
     }
 
-    // --- Permission ---
-
     #[test]
     fn permission_allow_all_by_default() {
         let perm = Permission::default();
@@ -2548,8 +2500,6 @@ mod tests {
         assert!(!perm.is_allowed("_SYS.monitor"));
     }
 
-    // --- lookup_permissions ---
-
     #[test]
     fn lookup_permissions_found() {
         let auth = ClientAuth::Users(vec![UserConfig {
@@ -2580,15 +2530,11 @@ mod tests {
         assert!(auth.lookup_permissions(&info).is_none());
     }
 
-    // --- auth_timeout default ---
-
     #[test]
     fn default_auth_timeout() {
         let config = LeafServerConfig::default();
         assert_eq!(config.auth_timeout, std::time::Duration::from_secs(2));
     }
-
-    // --- Cross-account route resolution ---
 
     #[cfg(feature = "accounts")]
     mod cross_account_tests {
@@ -2715,7 +2661,6 @@ mod tests {
         }
     }
 
-    // --- LeafAuth tests ---
     #[cfg(feature = "hub")]
     mod leaf_auth_tests {
         use super::*;
@@ -2833,8 +2778,6 @@ mod tests {
             assert!(auth.validate(&info2).is_none());
         }
     }
-
-    // --- AffinityMap ---
 
     #[cfg(feature = "worker-affinity")]
     #[test]

@@ -48,14 +48,12 @@ impl RouteConnManager {
         let shutdown = Arc::new(AtomicBool::new(false));
         let seeds = state.cluster_seeds.clone();
 
-        // Create the coordinator channel and store sender in state.
         let (coord_tx, coord_rx) = std::sync::mpsc::channel::<String>();
         {
             let mut tx_lock = state.route_connect_tx.lock().unwrap();
             *tx_lock = Some(coord_tx);
         }
 
-        // Spawn seed supervisors.
         for seed_url in &seeds {
             let st = Arc::clone(&state);
             let sd = Arc::clone(&shutdown);
@@ -69,7 +67,6 @@ impl RouteConnManager {
                 .expect("failed to spawn route supervisor");
         }
 
-        // Spawn coordinator thread for gossip-discovered routes.
         {
             let st = Arc::clone(&state);
             let sd = Arc::clone(&shutdown);
@@ -100,13 +97,11 @@ fn run_route_coordinator(
     state: Arc<ServerState>,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Track which URLs already have active supervisors.
     let mut active_urls: HashSet<String> = HashSet::new();
     for seed in &seeds {
         active_urls.insert(normalize_route_url(seed));
     }
 
-    // Also add own cluster address.
     if let Some(cp) = state.cluster_port {
         active_urls.insert(format!("0.0.0.0:{cp}"));
         active_urls.insert(format!("127.0.0.1:{cp}"));
@@ -117,7 +112,6 @@ fn run_route_coordinator(
             return;
         }
 
-        // Block with timeout so we can check shutdown.
         let url = match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(url) => url,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -126,7 +120,6 @@ fn run_route_coordinator(
 
         let normalized = normalize_route_url(&url);
 
-        // Skip own address.
         if let Some(cp) = state.cluster_port {
             if normalized == format!("0.0.0.0:{cp}")
                 || normalized == format!("127.0.0.1:{cp}")
@@ -225,7 +218,6 @@ pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) 
     for url in connect_urls {
         let normalized = normalize_route_url(url);
         if peers.known_urls.insert(normalized.clone()) {
-            // New URL discovered via gossip — notify coordinator.
             if let Some(ref sender) = *tx {
                 let _ = sender.send(normalized);
             }
@@ -250,7 +242,6 @@ fn connect_route(
     let tcp_writer = tcp.try_clone()?;
     let tcp_shutdown = tcp.try_clone()?;
 
-    // --- Read peer's INFO ---
     read_into_buf(&tcp, &mut read_buf)?;
     let peer_info = match nats_proto::try_parse_route_op(&mut read_buf)? {
         Some(RouteOp::Info(info)) => {
@@ -270,7 +261,6 @@ fn connect_route(
         }
     };
 
-    // --- server_id dedup check ---
     let peer_server_id = peer_info.server_id.clone();
     {
         let peers = state.route_peers.lock().unwrap();
@@ -283,12 +273,10 @@ fn connect_route(
         }
     }
 
-    // Process connect_urls from peer INFO.
     if !peer_info.connect_urls.is_empty() {
         process_gossip_urls(state, &peer_info.connect_urls);
     }
 
-    // --- Send our INFO + CONNECT + PING ---
     {
         let mut w = io::BufWriter::new(&tcp_writer);
         w.write_all(build_route_info(state).as_bytes())?;
@@ -297,7 +285,6 @@ fn connect_route(
         w.flush()?;
     }
 
-    // --- Wait for PONG (process handshake ops) ---
     loop {
         match try_parse_or_read(&tcp, &mut read_buf)? {
             RouteOp::Pong => {
@@ -322,7 +309,6 @@ fn connect_route(
         }
     }
 
-    // --- Register peer in RoutePeerRegistry (double-check for races) ---
     {
         let mut peers = state.route_peers.lock().unwrap();
         if peers.connected.contains_key(&peer_server_id) {
@@ -335,16 +321,13 @@ fn connect_route(
         peers.connected.insert(peer_server_id.clone(), addr.clone());
     }
 
-    // --- Create MsgWriter for this route ---
     let direct_writer = MsgWriter::new_dummy();
 
-    // Register in route_writers
     {
         let mut writers = state.route_writers.write().unwrap();
         writers.insert(conn_id, direct_writer.clone());
     }
 
-    // --- Send RS+ for existing local subs ---
     {
         let mut w = io::BufWriter::new(&tcp_writer);
         let subs = state
@@ -376,10 +359,8 @@ fn connect_route(
         w.flush()?;
     }
 
-    // --- Broadcast updated INFO to all route peers (topology changed) ---
     broadcast_route_info(state);
 
-    // --- Spawn writer thread ---
     // The writer thread polls the MsgWriter's eventfd and drains buffered
     // RMSG/RS+ data to the TCP socket.
     let writer_dw = direct_writer.clone();
@@ -391,14 +372,11 @@ fn connect_route(
         })
         .expect("failed to spawn route writer");
 
-    // --- Run reader loop ---
     let result = run_route_reader(&tcp, &mut read_buf, conn_id, state, &direct_writer);
 
-    // --- Cleanup ---
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
 
-    // Remove all route subs for this connection from SubscriptionManager
     {
         #[cfg(feature = "accounts")]
         {
@@ -422,13 +400,11 @@ fn connect_route(
         }
     }
 
-    // Remove from route_writers
     {
         let mut writers = state.route_writers.write().unwrap();
         writers.remove(&conn_id);
     }
 
-    // Remove from RoutePeerRegistry
     {
         let mut peers = state.route_peers.lock().unwrap();
         peers.connected.remove(&peer_server_id);
@@ -450,7 +426,6 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            // Final drain
             if let Some(data) = dw.drain() {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();
@@ -470,14 +445,12 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
         }
 
         if pfds[0].revents & libc::POLLIN != 0 {
-            // Consume eventfd
             let mut val: u64 = 0;
             unsafe {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
             }
         }
 
-        // Drain any pending data
         if let Some(data) = dw.drain() {
             if let Err(e) = tcp_out.write_all(&data) {
                 debug!(error = %e, "route writer TCP error");
@@ -505,7 +478,6 @@ fn run_route_reader(
     let mut tmp = [0u8; 65536];
 
     loop {
-        // Try to parse all ops already in the buffer
         while let Some(op) = nats_proto::try_parse_route_op(read_buf)? {
             handle_route_op(
                 op,
@@ -519,12 +491,10 @@ fn run_route_reader(
             )?;
         }
 
-        // Notify all dirty writers from this batch
         for w in dirty_writers.drain(..) {
             w.notify();
         }
 
-        // Read more data from TCP
         let n = (&*tcp).read(&mut tmp)?;
         if n == 0 {
             return Ok(());
@@ -588,7 +558,6 @@ fn handle_route_op(
             debug!(conn_id, sid, subject = %subject_str, "outbound route sub");
         }
         RouteOp::RouteUnsub { subject, .. } => {
-            // RS- doesn't carry queue; remove matching (subject, None) entry
             let key = (subject.clone(), None);
             if let Some(sid) = route_sids.remove(&key) {
                 let mut subs = state
@@ -641,7 +610,6 @@ fn handle_route_op(
         }
         RouteOp::Pong => {}
         RouteOp::Info(info) => {
-            // Gossip: process connect_urls from active-phase INFO updates.
             if !info.connect_urls.is_empty() {
                 process_gossip_urls(state, &info.connect_urls);
             }
@@ -659,7 +627,6 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
     let cluster_port = state.cluster_port.unwrap_or(0);
 
-    // Collect known route URLs for gossip.
     let connect_urls = {
         let peers = state.route_peers.lock().unwrap();
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();

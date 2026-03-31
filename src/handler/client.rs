@@ -60,10 +60,7 @@ impl ConnectionHandler for ClientHandler {
                 headers,
                 ..
             } => Self::handle_pub(conn, wctx, subject, payload, respond, headers),
-            ClientOp::Connect(_) => {
-                // Duplicate CONNECT in active phase, ignore.
-                (HandleResult::Ok, Vec::new())
-            }
+            ClientOp::Connect(_) => (HandleResult::Ok, Vec::new()),
         }
     }
 }
@@ -76,12 +73,10 @@ impl ClientHandler {
         subject: Bytes,
         queue_group: Option<Bytes>,
     ) -> HandleResult {
-        // Silently reject SUB during drain
         if conn.draining {
             return HandleResult::Ok;
         }
 
-        // Check subscribe permissions
         if let Some(ref perms) = conn.permissions {
             let subj = bytes_to_str(&subject);
             if !perms.subscribe.is_allowed(subj) {
@@ -162,7 +157,6 @@ impl ClientHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate interest (LS+/RS+) to leaf, route, and gateway peers.
         propagate_all_interest(
             wctx.state,
             subject_str.as_bytes(),
@@ -217,7 +211,6 @@ impl ClientHandler {
         max: Option<u64>,
     ) -> HandleResult {
         if let Some(n) = max {
-            // UNSUB with max: set delivery limit, auto-remove when reached.
             let subs = wctx
                 .state
                 .get_subs(
@@ -253,7 +246,6 @@ impl ClientHandler {
                 }
             }
         } else {
-            // Immediate unsubscribe
             let removed = {
                 let mut subs = wctx
                     .state
@@ -286,7 +278,6 @@ impl ClientHandler {
         respond: Option<Bytes>,
         headers: Option<crate::types::HeaderMap>,
     ) -> (HandleResult, Vec<(u64, u64)>) {
-        // Check publish permissions
         if let Some(ref perms) = conn.permissions {
             let subj = bytes_to_str(&subject);
             if !perms.publish.is_allowed(subj) {
@@ -346,7 +337,6 @@ impl ClientHandler {
                     drop(subs);
 
                     if !has_sub {
-                        // Build 503 No Responders header and deliver to reply subject.
                         let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
                         let reply_str = bytes_to_str(reply_bytes);

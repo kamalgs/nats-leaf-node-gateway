@@ -247,10 +247,6 @@ impl From<std::io::Error> for ConfigError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Lexer
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     LBrace,
@@ -465,10 +461,6 @@ impl<'a> Lexer<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AST / Value
-// ---------------------------------------------------------------------------
-
 /// A parsed configuration value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -544,10 +536,6 @@ impl Value {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
 
 struct Parser<'a> {
     lexer: Lexer<'a>,
@@ -724,10 +712,6 @@ pub fn parse(input: &str) -> Result<Value, ConfigError> {
     parser.parse_top_level()
 }
 
-// ---------------------------------------------------------------------------
-// Size / Duration helpers
-// ---------------------------------------------------------------------------
-
 /// Parse a string with optional size suffix into bytes.
 /// Supports: `k`/`kb`/`kib` (×1024), `m`/`mb`/`mib` (×1024²), `g`/`gb`/`gib` (×1024³).
 fn parse_size(v: &Value) -> Result<usize, ConfigError> {
@@ -845,10 +829,6 @@ fn as_string(v: &Value) -> Result<String, ConfigError> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Listen address parsing
-// ---------------------------------------------------------------------------
-
 /// Parse a `listen` value like `"127.0.0.1:4225"` or just `"4225"`.
 fn parse_listen(s: &str) -> Result<(Option<String>, Option<u16>), ConfigError> {
     let s = s.trim();
@@ -866,10 +846,6 @@ fn parse_listen(s: &str) -> Result<(Option<String>, Option<u16>), ConfigError> {
         Ok((Some(s.to_string()), None))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Go nats-server keys that we silently ignore (log at debug)
-// ---------------------------------------------------------------------------
 
 const IGNORED_KEYS: &[&str] = &[
     "jetstream",
@@ -895,10 +871,6 @@ const IGNORED_KEYS: &[&str] = &[
     "no_tls",
     "strict",
 ];
-
-// ---------------------------------------------------------------------------
-// Config builder
-// ---------------------------------------------------------------------------
 
 /// Load a Go nats-server `.conf` file and produce a [`LeafServerConfig`].
 ///
@@ -1556,15 +1528,9 @@ fn parse_permission_rule(val: &Value) -> Result<Permission, ConfigError> {
     Ok(perm)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Lexer tests ---
 
     fn lex_all(input: &str) -> Vec<Token> {
         let mut lexer = Lexer::new(input.as_bytes());
@@ -1657,8 +1623,6 @@ mod tests {
         assert_eq!(strs, vec!["foo", "bar", "baz"]);
     }
 
-    // --- Size parsing tests ---
-
     #[test]
     fn parse_size_suffixes() {
         assert_eq!(parse_size_str("1024").unwrap(), 1024);
@@ -1672,8 +1636,6 @@ mod tests {
         assert_eq!(parse_size_str("1gb").unwrap(), 1024 * 1024 * 1024);
     }
 
-    // --- Duration parsing tests ---
-
     #[test]
     fn parse_duration_suffixes() {
         assert_eq!(parse_duration_str("120").unwrap(), 120);
@@ -1681,8 +1643,6 @@ mod tests {
         assert_eq!(parse_duration_str("2m").unwrap(), 120);
         assert_eq!(parse_duration_str("1h").unwrap(), 3600);
     }
-
-    // --- Parser tests ---
 
     #[test]
     fn parse_minimal_config() {

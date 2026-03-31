@@ -168,15 +168,12 @@ impl InterestPipeline {
         subject: &str,
         queue: Option<&str>,
     ) -> Option<(String, Option<String>)> {
-        // Queue group subs bypass the pipeline entirely
         if queue.is_some() {
             return Some((subject.to_string(), queue.map(|q| q.to_string())));
         }
 
-        // Stage 1: mapping
         let mapped = self.map_subject(subject);
 
-        // Stage 2: collapse
         #[cfg(feature = "interest-collapse")]
         if let Some(ref mut collapser) = self.collapser {
             return match collapser.on_subscribe(&mapped) {
@@ -198,15 +195,12 @@ impl InterestPipeline {
         subject: &str,
         queue: Option<&str>,
     ) -> Option<(String, Option<String>)> {
-        // Queue group subs bypass the pipeline entirely
         if queue.is_some() {
             return Some((subject.to_string(), queue.map(|q| q.to_string())));
         }
 
-        // Stage 1: mapping
         let mapped = self.map_subject(subject);
 
-        // Stage 2: collapse
         #[cfg(feature = "interest-collapse")]
         if let Some(ref mut collapser) = self.collapser {
             return match collapser.on_unsubscribe(&mapped) {
@@ -318,8 +312,6 @@ fn collapse_key(subject: &str, templates: &[String]) -> Option<String> {
 mod tests {
     use super::*;
 
-    // --- collapse_key ---
-
     #[cfg(feature = "interest-collapse")]
     #[test]
     fn collapse_key_matching_gt() {
@@ -382,8 +374,6 @@ mod tests {
         assert!(collapse_key("anything", &templates).is_none());
     }
 
-    // --- SubjectMapper ---
-
     #[cfg(feature = "subject-mapping")]
     #[test]
     fn mapper_prefix_rewrite() {
@@ -430,8 +420,6 @@ mod tests {
         assert_eq!(mapper.map_subject("local.foo.bar"), "specific.bar");
         assert_eq!(mapper.map_subject("local.baz.qux"), "general.baz.qux");
     }
-
-    // --- InterestPipeline ---
 
     #[test]
     fn pipeline_no_transforms_passthrough() {

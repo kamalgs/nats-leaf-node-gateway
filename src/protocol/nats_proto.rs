@@ -24,10 +24,6 @@ use std::io;
 use crate::types::ServerInfo;
 use crate::types::{ConnectInfo, HeaderMap};
 
-// ────────────────────────────────────────────────────────────────────────────
-// Itoa: format integers as decimal ASCII bytes.
-// ────────────────────────────────────────────────────────────────────────────
-
 macro_rules! int_to_buf {
     ($name:ident, $ty:ty) => {
         #[inline]
@@ -50,10 +46,6 @@ macro_rules! int_to_buf {
 
 int_to_buf!(usize_to_buf, usize);
 int_to_buf!(u64_to_buf, u64);
-
-// ────────────────────────────────────────────────────────────────────────────
-// Parse helpers
-// ────────────────────────────────────────────────────────────────────────────
 
 macro_rules! parse_int {
     ($name:ident, $ty:ty, $max_digits:expr, $label:expr) => {
@@ -120,10 +112,6 @@ fn split_args<const N: usize>(line: &[u8]) -> ([&[u8]; N], usize) {
     }
     (args, count)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Client-side parsed operations
-// ────────────────────────────────────────────────────────────────────────────
 
 /// A parsed client protocol operation. Subjects and reply-to are raw `Bytes`
 /// slices to avoid allocation on the hot path.
@@ -298,7 +286,6 @@ fn skip_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     if line_end < 4 {
         return proto_err(buf, "PUB too short");
     }
-    // Find the last argument (size) by scanning backwards
     let args_bytes = &buf[4..line_end];
     let size_arg = match args_bytes.iter().rposition(|&b| b == b' ' || b == b'\t') {
         Some(i) => &args_bytes[i + 1..],
@@ -310,7 +297,6 @@ fn skip_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return Ok(None);
     }
     buf.advance(total_needed);
-    // Return Pong as sentinel — caller knows this means "skipped publish"
     Ok(Some(ClientOp::Pong))
 }
 
@@ -324,7 +310,6 @@ fn skip_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     if line_end < 5 {
         return proto_err(buf, "HPUB too short");
     }
-    // Find the last argument (total_len) by scanning backwards
     let args_bytes = &buf[5..line_end];
     let total_size_arg = match args_bytes.iter().rposition(|&b| b == b' ' || b == b'\t') {
         Some(i) => &args_bytes[i + 1..],
@@ -358,7 +343,6 @@ fn parse_connect(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         Some(i) => i,
         None => return Ok(None),
     };
-    // "CONNECT {...}\r\n"  — find the space after CONNECT
     let line = &buf[..nl];
     let space = match memchr::memchr(b' ', line) {
         Some(i) => i,
@@ -372,14 +356,12 @@ fn parse_connect(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
 }
 
 fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    // PUB subject [reply] size\r\n[payload]\r\n
     let nl = match find_newline(buf) {
         Some(i) => i,
         None => return Ok(None),
     };
 
     let line_end = trim_cr(&buf[..], nl);
-    // Skip "PUB " (4 bytes)
     if line_end < 4 {
         return proto_err(buf, "PUB too short");
     }
@@ -394,13 +376,11 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
 
     let payload_len = parse_size(size_arg)?;
 
-    // Check if we have the full payload + trailing \r\n
     let total_needed = nl + 1 + payload_len + 2;
     if buf.len() < total_needed {
         return Ok(None);
     }
 
-    // Compute offsets relative to buf start for zero-copy slicing
     let buf_ptr = buf.as_ptr() as usize;
     let subj_off = subject.as_ptr() as usize - buf_ptr;
     let subj_len = subject.len();
@@ -411,9 +391,7 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         off..off + r.len()
     });
 
-    // Freeze the header line — zero-copy from the read buffer
     let header_line = buf.split_to(nl + 1).freeze();
-    // Sub-slice: just Arc refcount bumps, no heap alloc
     let subject = header_line.slice(subj_off..subj_off + subj_len);
     let size_bytes = header_line.slice(size_off..size_off + size_len);
     let respond = respond_range.map(|r| header_line.slice(r));
@@ -431,7 +409,6 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
 }
 
 fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    // HPUB subject [reply] hdr_len total_len\r\n[headers+payload]\r\n
     let nl = match find_newline(buf) {
         Some(i) => i,
         None => return Ok(None),
@@ -462,7 +439,6 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return Ok(None);
     }
 
-    // Compute offsets for zero-copy slicing
     let buf_ptr = buf.as_ptr() as usize;
     let subj_off = subject.as_ptr() as usize - buf_ptr;
     let subj_len = subject.len();
@@ -473,7 +449,6 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         off..off + r.len()
     });
 
-    // Freeze the header line — zero-copy
     let header_line = buf.split_to(nl + 1).freeze();
     let subject = header_line.slice(subj_off..subj_off + subj_len);
     let size_bytes = header_line.slice(size_off..size_off + size_len);
@@ -495,7 +470,6 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
 }
 
 fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    // SUB subject [queue] sid\r\n
     let nl = match find_newline(buf) {
         Some(i) => i,
         None => return Ok(None),
@@ -540,7 +514,6 @@ fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
 }
 
 fn parse_unsub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    // UNSUB sid [max]\r\n
     let nl = match find_newline(buf) {
         Some(i) => i,
         None => return Ok(None),
@@ -578,7 +551,6 @@ fn trim_cr(_buf: &[u8], nl_pos: usize) -> usize {
 }
 
 fn proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
-    // Consume up to the first newline so we don't loop on the same bad data
     if let Some(nl) = find_newline(buf) {
         buf.advance(nl + 1);
     } else {
@@ -586,10 +558,6 @@ fn proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     }
     Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Leaf-side parsed operations
-// ────────────────────────────────────────────────────────────────────────────
 
 /// Try to parse the next hub→leaf operation from `buf`.
 #[cfg(any(feature = "leaf", feature = "hub"))]
@@ -637,10 +605,8 @@ pub fn try_parse_leaf_op(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
                 None => return Ok(None),
             };
             let line_end = trim_cr(buf, nl);
-            // "-ERR 'msg'" — skip "-ERR "
             let msg = if line_end > 5 {
                 let raw = &buf[5..line_end];
-                // SAFETY: error messages are ASCII
                 let s = std::str::from_utf8(raw).unwrap_or("<invalid>");
                 s.trim_matches('\'').to_string()
             } else {
@@ -1120,10 +1086,6 @@ fn route_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Header parser (shared)
-// ────────────────────────────────────────────────────────────────────────────
-
 pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
     let text = std::str::from_utf8(data)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8"))?;
@@ -1170,10 +1132,6 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
 
     Ok(headers)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Message builder — direct byte assembly, no write!() formatting
-// ────────────────────────────────────────────────────────────────────────────
 
 impl MsgBuilder {
     pub fn new() -> Self {
@@ -1533,10 +1491,6 @@ pub fn sid_to_bytes(sid: u64) -> Bytes {
     let s = u64_to_buf(sid, &mut tmp);
     Bytes::copy_from_slice(s)
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Tests
-// ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
