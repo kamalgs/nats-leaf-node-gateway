@@ -53,7 +53,6 @@ impl GatewayConnManager {
     pub(crate) fn spawn(state: Arc<ServerState>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        // Spawn per-remote supervisor threads (one outbound per remote cluster).
         for remote in &state.gateway_remotes {
             let st = Arc::clone(&state);
             let sd = Arc::clone(&shutdown);
@@ -92,7 +91,6 @@ fn run_gateway_supervisor(
             return;
         }
 
-        // Round-robin through remote URLs
         let url = &remote.urls[url_idx % remote.urls.len()];
         url_idx += 1;
 
@@ -165,7 +163,6 @@ fn connect_gateway(
     let tcp_writer = tcp.try_clone()?;
     let tcp_shutdown = tcp.try_clone()?;
 
-    // --- Read peer's INFO ---
     read_into_buf(&tcp, &mut read_buf)?;
     let peer_info = match nats_proto::try_parse_gateway_op(&mut read_buf)? {
         Some(GatewayOp::Info(info)) => {
@@ -185,7 +182,6 @@ fn connect_gateway(
         }
     };
 
-    // Verify the remote gateway name matches expected
     #[cfg(feature = "gateway")]
     if let Some(ref gw_name) = peer_info.gateway {
         if gw_name != expected_name {
@@ -197,7 +193,6 @@ fn connect_gateway(
         }
     }
 
-    // Process gateway_urls from peer INFO.
     #[cfg(feature = "gateway")]
     if let Some(ref urls) = peer_info.gateway_urls {
         if !urls.is_empty() {
@@ -222,7 +217,6 @@ fn connect_gateway(
 
     let _ = &peer_info;
 
-    // --- Send our INFO + CONNECT + PING ---
     {
         let mut w = io::BufWriter::new(&tcp_writer);
         w.write_all(get_gateway_info(state).as_bytes())?;
@@ -231,7 +225,6 @@ fn connect_gateway(
         w.flush()?;
     }
 
-    // --- Wait for PONG (process handshake ops) ---
     loop {
         match try_parse_or_read(&tcp, &mut read_buf)? {
             GatewayOp::Pong => {
@@ -252,7 +245,6 @@ fn connect_gateway(
         }
     }
 
-    // --- Register peer in GatewayPeerRegistry ---
     {
         let mut peers = state.gateway_peers.lock().unwrap();
         peers
@@ -262,16 +254,13 @@ fn connect_gateway(
             .insert(conn_id);
     }
 
-    // --- Create MsgWriter for this gateway ---
     let direct_writer = MsgWriter::new_dummy();
 
-    // Register in gateway_writers
     {
         let mut writers = state.gateway_writers.write().unwrap();
         writers.insert(conn_id, direct_writer.clone());
     }
 
-    // --- Register optimistic interest state (no RS+ sent upfront) ---
     // In optimistic mode, messages are forwarded to the remote unless the remote
     // has signaled negative interest (RS-). RS+ subs are only sent during the
     // transition to interest-only mode.
@@ -289,7 +278,6 @@ fn connect_gateway(
         state.has_gateway_interest.store(true, Ordering::Release);
     }
 
-    // --- Spawn writer thread ---
     let writer_dw = direct_writer.clone();
     let writer_shutdown = Arc::clone(shutdown);
     let writer_handle = std::thread::Builder::new()
@@ -299,14 +287,11 @@ fn connect_gateway(
         })
         .expect("failed to spawn gateway writer");
 
-    // --- Run reader loop ---
     let result = run_gateway_reader(&tcp, &mut read_buf, conn_id, state, &direct_writer);
 
-    // --- Cleanup ---
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
 
-    // Remove all gateway subs for this connection from SubscriptionManager
     {
         #[cfg(feature = "accounts")]
         {
@@ -330,13 +315,11 @@ fn connect_gateway(
         }
     }
 
-    // Remove from gateway_writers
     {
         let mut writers = state.gateway_writers.write().unwrap();
         writers.remove(&conn_id);
     }
 
-    // Remove from gateway_interest
     {
         let mut gi = state.gateway_interest.write().unwrap();
         gi.remove(&conn_id);
@@ -345,7 +328,6 @@ fn connect_gateway(
         }
     }
 
-    // Remove from GatewayPeerRegistry
     {
         let mut peers = state.gateway_peers.lock().unwrap();
         if let Some(ids) = peers.connected.get_mut(expected_name) {
@@ -376,7 +358,6 @@ fn run_gateway_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) 
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            // Final drain
             if let Some(data) = dw.drain() {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();
@@ -396,14 +377,12 @@ fn run_gateway_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) 
         }
 
         if pfds[0].revents & libc::POLLIN != 0 {
-            // Consume eventfd
             let mut val: u64 = 0;
             unsafe {
                 libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
             }
         }
 
-        // Drain any pending data
         if let Some(data) = dw.drain() {
             if let Err(e) = tcp_out.write_all(&data) {
                 debug!(error = %e, "gateway writer TCP error");
@@ -432,7 +411,6 @@ fn run_gateway_reader(
     let mut tmp = [0u8; 65536];
 
     loop {
-        // Try to parse all ops already in the buffer
         while let Some(op) = nats_proto::try_parse_gateway_op(read_buf)? {
             handle_gateway_op(
                 op,
@@ -447,7 +425,6 @@ fn run_gateway_reader(
             )?;
         }
 
-        // Notify all accumulated eventfds from this batch
         for fd in pending_notify.iter().take(pending_notify_count).copied() {
             let val: u64 = 1;
             unsafe {
@@ -456,7 +433,6 @@ fn run_gateway_reader(
         }
         pending_notify_count = 0;
 
-        // Read more data from TCP
         let n = (&*tcp).read(&mut tmp)?;
         if n == 0 {
             return Ok(());
@@ -495,7 +471,6 @@ fn handle_gateway_op(
                 }
             }
 
-            // InterestOnly mode: insert gateway subscription into SubscriptionManager.
             *gateway_sid_counter += 1;
             let sid = *gateway_sid_counter;
             gateway_sids.insert((subject.clone(), queue.clone()), sid);
@@ -544,7 +519,6 @@ fn handle_gateway_op(
                 let mut gi = state.gateway_interest.write().unwrap();
                 if let Some(gis) = gi.get_mut(&conn_id) {
                     if gis.mode == GatewayInterestMode::Optimistic {
-                        // Optimistic mode: RS- = negative interest signal.
                         gis.ni.insert(subject_str.to_string());
                         gis.ni_count += 1;
                         debug!(
@@ -563,12 +537,10 @@ fn handle_gateway_op(
             };
 
             if transition {
-                // Transition: Optimistic → Transitioning → InterestOnly
                 transition_to_interest_only(conn_id, state, tcp, direct_writer)?;
                 return Ok(());
             }
 
-            // InterestOnly mode: RS- = remove gateway subscription from SubscriptionManager.
             let key = (subject.clone(), None);
             if let Some(sid) = gateway_sids.remove(&key) {
                 let mut subs = state
@@ -591,8 +563,6 @@ fn handle_gateway_op(
         } => {
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
 
-            // Unwrap _GR_ reply prefix if present.
-            // Uses Bytes::slice() for zero-copy sub-slicing.
             let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
 
             let msg = Msg::new(

@@ -184,15 +184,11 @@ impl Upstream {
 
 impl Drop for Upstream {
     fn drop(&mut self) {
-        // Signal supervisor to stop.
         self.shutdown.store(true, Ordering::Release);
-        // Shut down the TCP stream if we have one — breaks the reader thread.
         if let Some(ref stream) = self.stream_shutdown {
             stream.shutdown(Shutdown::Both).ok();
         }
-        // Send shutdown to the writer thread (if channel still open).
         let _ = self.cmd_tx.send(UpstreamCmd::Shutdown);
-        // Threads are detached — they'll exit on their own.
     }
 }
 
@@ -216,9 +212,7 @@ fn connect_and_run(
             .map_err(|e| format!("invalid TLS server name '{}': {e}", parsed.host))?;
         let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
             .map_err(|e| format!("TLS client connection failed: {e}"))?;
-        // Perform TLS handshake using blocking I/O via StreamOwned
         let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
-        // Force handshake by flushing (rustls completes handshake on first I/O)
         tls_stream.flush()?;
         let (tls_conn, tcp) = tls_stream.into_parts();
         LeafConn::new_tls(tcp, tls_conn, state.buf_config)
@@ -228,7 +222,6 @@ fn connect_and_run(
 
     let merged = merge_hub_credentials(&parsed.creds, config_creds);
 
-    // --- Handshake ---
     let hub_nonce = match leaf.read_leaf_op()? {
         Some(LeafOp::Info(hub_info)) => {
             debug!("received INFO from hub");
@@ -276,7 +269,6 @@ fn connect_and_run(
         }
     }
 
-    // Sync interests through the pipeline (mapping + collapse dedup)
     {
         let interests: Vec<(String, Option<String>)> = {
             let subs = state
@@ -295,7 +287,6 @@ fn connect_and_run(
         let mut sent_collapse_keys: HashSet<String> = HashSet::new();
         for (subject, queue) in &interests {
             if let Some(q) = queue {
-                // Queue subs: apply mapping only, no collapse
                 let mapped = pipeline.transform_for_sync(subject);
                 leaf.send_leaf_sub_queue(&mapped, q)?;
             } else {
@@ -310,7 +301,6 @@ fn connect_and_run(
         leaf.flush()?;
     }
 
-    // Spawn reader/writer threads
     let (leaf_reader, leaf_writer) = leaf.split()?;
     let (cmd_tx, cmd_rx) = mpsc::channel();
 
@@ -361,7 +351,6 @@ fn run_supervisor(
                 backoff.reset();
                 info!("connected to upstream hub");
 
-                // Update this slot in the global upstream_txs so workers send to this connection.
                 {
                     let mut txs = state.upstream_txs.write().unwrap();
                     if idx < txs.len() {
@@ -442,7 +431,6 @@ fn run_leaf_reader(
                         return;
                     }
                 }
-                // Notify all dirty writers once after draining the batch
                 for w in dirty_writers.drain(..) {
                     w.notify();
                 }
@@ -457,7 +445,6 @@ fn run_leaf_reader(
             }
         }
     }
-    // Signal writer to shut down
     let _ = cmd_tx.send(UpstreamCmd::Shutdown);
 }
 
@@ -472,7 +459,6 @@ fn run_leaf_writer(mut writer: LeafWriter, cmd_rx: mpsc::Receiver<UpstreamCmd>) 
             error!(error = %e, "upstream write error");
             break;
         }
-        // Batch: drain any remaining commands without blocking
         while let Ok(cmd) = cmd_rx.try_recv() {
             if matches!(cmd, UpstreamCmd::Shutdown) {
                 debug!("upstream writer received shutdown");
@@ -520,9 +506,7 @@ fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Result<()
         UpstreamCmd::Pong => {
             writer.send_pong()?;
         }
-        UpstreamCmd::Shutdown => {
-            // Handled by caller
-        }
+        UpstreamCmd::Shutdown => {}
     }
     Ok(())
 }
@@ -543,7 +527,6 @@ fn handle_hub_op(
             headers,
             payload,
         } => {
-            // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let msg = Msg::new(
                 &subject,
@@ -580,15 +563,10 @@ fn handle_hub_op(
             );
         }
         LeafOp::Ping => {
-            // Send PONG via the writer thread
             let _ = cmd_tx.send(UpstreamCmd::Pong);
         }
-        LeafOp::Pong | LeafOp::Ok => {
-            // No action needed
-        }
-        LeafOp::LeafSub { .. } | LeafOp::LeafUnsub { .. } => {
-            // Hub interest changes; ignored for now
-        }
+        LeafOp::Pong | LeafOp::Ok => {}
+        LeafOp::LeafSub { .. } | LeafOp::LeafUnsub { .. } => {}
         LeafOp::Info(_) => {
             debug!("received updated INFO from hub");
         }
@@ -627,7 +605,6 @@ fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> 
 
     let mut creds = HubCredentials::default();
 
-    // Check for userinfo@ — use rfind('@') to handle passwords with '@'
     let host_port = if let Some(at_pos) = stripped.rfind('@') {
         let userinfo = &stripped[..at_pos];
         let rest = &stripped[at_pos + 1..];
@@ -645,7 +622,6 @@ fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> 
         stripped
     };
 
-    // Extract hostname (before port) for TLS SNI
     let host = if let Some(colon_pos) = host_port.rfind(':') {
         host_port[..colon_pos].to_string()
     } else {
@@ -655,7 +631,6 @@ fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> 
     let addr = if host_port.contains(':') {
         host_port.to_string()
     } else {
-        // Default leafnode port
         format!("{host_port}:7422")
     };
 
@@ -760,7 +735,6 @@ fn build_upstream_creds(
         out.sig = Some(data_encoding::BASE64URL_NOPAD.encode(&sig_bytes));
     }
 
-    // Explicit user/pass/token override creds-file fields
     if let Some(ref u) = creds.user {
         out.user = Some(u.clone());
     }
@@ -787,8 +761,6 @@ fn has_any_creds(c: &UpstreamConnectCreds) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- parse_hub_url ---
 
     #[test]
     fn parse_bare_host_port() {
@@ -860,8 +832,6 @@ mod tests {
         assert!(!parsed.use_tls);
     }
 
-    // --- merge_hub_credentials ---
-
     #[test]
     fn merge_config_wins() {
         let url = HubCredentials {
@@ -889,8 +859,6 @@ mod tests {
         assert_eq!(merged.token.as_deref(), Some("t"));
     }
 
-    // --- parse_creds_file ---
-
     #[test]
     fn parse_creds_file_valid() {
         let kp = nkeys::KeyPair::new_user();
@@ -917,8 +885,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    // --- extract_between ---
-
     #[test]
     fn extract_between_works() {
         let text = "AAA---BEGIN---\nhello\n---END---BBB";
@@ -932,13 +898,10 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // --- Backoff ---
-
     #[test]
     fn backoff_initial_delay() {
         let mut b = Backoff::new(Duration::from_millis(250), Duration::from_secs(30));
         let d = b.next_delay();
-        // Should be ~250ms ±25% (187..312)
         assert!(d.as_millis() >= 187, "too small: {}ms", d.as_millis());
         assert!(d.as_millis() <= 313, "too large: {}ms", d.as_millis());
     }
@@ -977,8 +940,6 @@ mod tests {
         assert!(d.as_millis() <= 125, "too large: {}ms", d.as_millis());
     }
 
-    // --- add_interest / remove_interest with pipeline ---
-
     use crate::connector::leaf::InterestPipeline;
 
     /// Helper: create an Upstream with a pipeline but no real connection.
@@ -1008,7 +969,6 @@ mod tests {
         let (mut up, rx) = test_upstream(vec!["app.*.sessions.>".to_string()]);
 
         up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
-        // Should send the collapsed wildcard
         match rx.try_recv().unwrap() {
             UpstreamCmd::Subscribe(subj, queue) => {
                 assert_eq!(subj, "app.n1.sessions.>");
@@ -1017,7 +977,6 @@ mod tests {
             other => panic!("expected Subscribe, got {other:?}"),
         }
 
-        // Second matching sub should NOT send another LS+
         up.add_interest("app.n1.sessions.s2".into(), None).unwrap();
         assert!(rx.try_recv().is_err());
     }
@@ -1029,11 +988,9 @@ mod tests {
 
         up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
         up.add_interest("app.n1.sessions.s2".into(), None).unwrap();
-        // Drain the subscribe
         let _ = rx.try_recv();
 
         up.remove_interest("app.n1.sessions.s1", None);
-        // Still one left — no LS-
         assert!(rx.try_recv().is_err());
 
         up.remove_interest("app.n1.sessions.s2", None);

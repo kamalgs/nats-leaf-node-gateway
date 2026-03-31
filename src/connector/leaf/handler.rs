@@ -54,10 +54,7 @@ impl ConnectionHandler for LeafHandler {
                 headers,
                 payload,
             } => Self::handle_lmsg(conn, wctx, subject, reply, headers, payload),
-            LeafOp::Info(_) | LeafOp::Ok | LeafOp::Err(_) => {
-                // Ignore INFO/+OK/-ERR from inbound leaf in Active phase.
-                (HandleResult::Ok, Vec::new())
-            }
+            LeafOp::Info(_) | LeafOp::Ok | LeafOp::Err(_) => (HandleResult::Ok, Vec::new()),
         }
     }
 }
@@ -86,13 +83,11 @@ impl LeafHandler {
 
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Capture permissions for later delivery-path filtering.
         let leaf_perms_arc = conn
             .permissions
             .as_ref()
             .map(|p| std::sync::Arc::new(p.clone()));
 
-        // Generate synthetic SID for this leaf subscription.
         let sid = match conn.ext {
             ConnExt::Leaf {
                 ref mut leaf_sid_counter,
@@ -157,7 +152,6 @@ impl LeafHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate RS+ to route and gateway peers (not leaf — we are the leaf).
         propagate_route_gateway_interest(
             wctx.state,
             subject.as_ref(),
@@ -275,7 +269,6 @@ impl LeafHandler {
             headers.as_ref(),
             &payload,
         );
-        // Echo suppression: always skip delivery back to the originating leaf.
         let (_delivered, expired) = wctx.publish(
             &msg,
             conn.conn_id,

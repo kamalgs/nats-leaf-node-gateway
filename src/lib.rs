@@ -14,7 +14,6 @@ pub(crate) mod io;
 pub mod protocol;
 pub mod pubsub;
 
-// Convenience re-exports (were in core/mod.rs).
 pub(crate) use io::buf;
 pub(crate) use io::msg_writer;
 pub(crate) use io::websocket;
@@ -22,7 +21,6 @@ pub use protocol::nats_proto;
 pub use protocol::types;
 pub use pubsub::sub_list;
 
-// Public re-exports for external consumers (main.rs, tests, benchmarks).
 pub use core::server;
 
 #[cfg(all(feature = "leaf", feature = "subject-mapping"))]

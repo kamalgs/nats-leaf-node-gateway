@@ -150,10 +150,6 @@ impl DeliveryScope {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Publish entry point
-// ---------------------------------------------------------------------------
-
 impl MessageDeliveryHub<'_> {
     /// Publish a message: deliver to local subs, optimistic gateways, and cross-account.
     ///
@@ -196,10 +192,6 @@ impl MessageDeliveryHub<'_> {
         (delivered, expired)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Core delivery
-// ---------------------------------------------------------------------------
 
 /// Inner dispatch for writing a message to a single subscription based on its type.
 ///
@@ -269,7 +261,6 @@ where
 {
     let mut delivered: usize = 0;
     let (_match_count, expired) = subs.for_each_match(msg.subject_str, |sub| {
-        // Suppress echo: don't deliver to the publisher itself.
         if scope.skip_echo && sub.conn_id == skip_conn_id {
             return;
         }
@@ -283,7 +274,6 @@ where
         if scope.skip_gateways && sub.is_gateway {
             return;
         }
-        // Dispatch: gateway subs get reply-rewritten RMSG, others go through deliver_to_sub_inner.
         #[cfg(feature = "gateway")]
         if sub.is_gateway {
             let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
@@ -342,7 +332,6 @@ pub(crate) fn deliver_to_subs(
     #[cfg(feature = "accounts")]
     let acct_name = acct_name_str.as_bytes();
 
-    // Clone Arc so `wctx` is free for mutable capture by the closure.
     #[cfg(feature = "gateway")]
     let gw_state = Arc::clone(wctx.state);
 
@@ -438,10 +427,6 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     (delivered, expired)
 }
 
-// ---------------------------------------------------------------------------
-// Upstream forwarding
-// ---------------------------------------------------------------------------
-
 /// Forward a publish to all upstream hubs. If a writer thread has gone,
 /// refresh the senders from global state.
 #[cfg(feature = "leaf")]
@@ -491,10 +476,6 @@ impl ConnCtx<'_> {
         forward_to_upstream(self.upstream_txs, state, subject, reply, headers, payload);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Expired subscription cleanup
-// ---------------------------------------------------------------------------
 
 /// Handle expired subscriptions after delivery.
 ///
@@ -577,10 +558,6 @@ pub(crate) fn handle_expired_subs_upstream(
     state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
 }
 
-// ---------------------------------------------------------------------------
-// Gateway optimistic forwarding
-// ---------------------------------------------------------------------------
-
 /// Forward a message to outbound gateways in optimistic mode.
 ///
 /// Called after `deliver_to_subs` when gateway subs may not exist in SubscriptionManager
@@ -625,10 +602,6 @@ pub(crate) fn forward_to_optimistic_gateways(
         wctx.queue_notify(gis.writer.event_raw_fd());
     }
 }
-
-// ---------------------------------------------------------------------------
-// Cross-account delivery
-// ---------------------------------------------------------------------------
 
 /// Deliver a message to cross-account subscribers (worker context).
 ///
@@ -904,10 +877,6 @@ mod tests {
         )
     }
 
-    // -----------------------------------------------------------------------
-    // Flow 1: deliver_to_subs → write_msg
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_deliver_to_subs_writes_msg() {
         let writer = DirectWriter::new_dummy();
@@ -968,10 +937,6 @@ mod tests {
         assert_eq!(delivered, 0);
         assert!(writer.drain().is_none());
     }
-
-    // -----------------------------------------------------------------------
-    // Flow 2: DeliveryScope filtering
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_skip_echo_suppresses_publisher() {
@@ -1085,10 +1050,6 @@ mod tests {
         assert_eq!(delivered, total_expected);
     }
 
-    // -----------------------------------------------------------------------
-    // Flow 3: Leaf LMSG delivery
-    // -----------------------------------------------------------------------
-
     #[test]
     #[cfg(feature = "hub")]
     fn test_deliver_to_leaf_sub_writes_lmsg() {
@@ -1141,10 +1102,6 @@ mod tests {
         assert!(writer.drain().is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Flow 4: Route RMSG delivery
-    // -----------------------------------------------------------------------
-
     #[test]
     #[cfg(feature = "mesh")]
     fn test_deliver_to_route_sub_writes_rmsg() {
@@ -1166,10 +1123,6 @@ mod tests {
         assert!(s.starts_with("RMSG"), "expected RMSG format: {s}");
     }
 
-    // -----------------------------------------------------------------------
-    // Flow 5: Expired subscription cleanup
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_deliver_to_subs_returns_expired() {
         let writer = DirectWriter::new_dummy();
@@ -1185,10 +1138,6 @@ mod tests {
         assert_eq!(expired.len(), 1, "sub should be expired after 1 delivery");
         assert_eq!(expired[0], (10, 5));
     }
-
-    // -----------------------------------------------------------------------
-    // Flow 6: Queue group delivery
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_queue_group_delivers_to_one() {
@@ -1239,10 +1188,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Flow 7: Upstream delivery variant
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_deliver_to_subs_upstream_collects_dirty_writers() {
         let state = test_server_state();
@@ -1274,10 +1219,6 @@ mod tests {
         assert!(w1.drain().is_some());
         assert!(w2.drain().is_some());
     }
-
-    // -----------------------------------------------------------------------
-    // Flow 8: MessageDeliveryHub::publish pipeline
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_publish_delivers_to_local_subs() {
@@ -1327,10 +1268,6 @@ mod tests {
         assert_eq!(msgs_delivered_bytes, 5);
         assert!(writer.drain().is_some());
     }
-
-    // -----------------------------------------------------------------------
-    // Wildcard matching
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_deliver_wildcard_match() {

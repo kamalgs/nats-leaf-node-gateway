@@ -107,7 +107,6 @@ impl ConnectionHandler for RouteHandler {
                 )
             }
             RouteOp::Info(info) => {
-                // Gossip: process connect_urls from active-phase INFO updates.
                 if !info.connect_urls.is_empty() {
                     let mut peers = wctx.state.route_peers.lock().unwrap();
                     let tx = wctx.state.route_connect_tx.lock().unwrap();
@@ -122,10 +121,7 @@ impl ConnectionHandler for RouteHandler {
                 }
                 (HandleResult::Ok, Vec::new())
             }
-            RouteOp::Connect(_) => {
-                // Ignore CONNECT from inbound route in Active phase.
-                (HandleResult::Ok, Vec::new())
-            }
+            RouteOp::Connect(_) => (HandleResult::Ok, Vec::new()),
         }
     }
 }
@@ -141,7 +137,6 @@ impl RouteHandler {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Generate synthetic SID for this route subscription.
         let sid = match conn.ext {
             ConnExt::Route {
                 ref mut route_sid_counter,
@@ -190,7 +185,6 @@ impl RouteHandler {
 
         *conn.sub_count += 1;
 
-        // Propagate RS+ to gateway peers.
         #[cfg(feature = "gateway")]
         propagate_gateway_interest(
             wctx.state,
@@ -223,11 +217,9 @@ impl RouteHandler {
             ConnExt::Route {
                 ref mut route_sids, ..
             } => {
-                // First try exact match with no queue
                 if let Some(s) = route_sids.remove(&(subject.clone(), None)) {
                     s
                 } else {
-                    // Try to find any entry with this subject
                     let key = route_sids.keys().find(|(s, _)| *s == subject).cloned();
                     match key {
                         Some(k) => route_sids.remove(&k).unwrap(),
@@ -312,7 +304,6 @@ impl RouteHandler {
             account_id,
         );
 
-        // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]
         conn.forward_to_upstream(wctx.state, subject, reply, headers, payload);
 

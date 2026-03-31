@@ -335,7 +335,6 @@ impl Worker {
                 assert!(epoll_fd >= 0, "epoll_create1 failed");
                 let epoll_fd = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
 
-                // Register eventfd with epoll (level-triggered)
                 let mut ev = libc::epoll_event {
                     events: libc::EPOLLIN as u32,
                     u64: EVENT_FD_KEY,
@@ -453,10 +452,8 @@ impl Worker {
             // without needing an eventfd round-trip.
             self.flush_pending();
 
-            // Flush accumulated message counters to the global metrics recorder.
             self.flush_metrics();
 
-            // Check for idle connections, keepalive PINGs, and auth timeouts.
             if epoll_timeout_ms > 0 {
                 self.check_pings();
                 self.check_auth_timeout();
@@ -467,7 +464,6 @@ impl Worker {
             }
         }
 
-        // Clean up all connections on shutdown.
         let conn_ids: Vec<u64> = self.conns.keys().copied().collect();
         for conn_id in conn_ids {
             self.remove_conn(conn_id);
@@ -475,7 +471,6 @@ impl Worker {
     }
 
     fn handle_eventfd(&mut self) {
-        // Consume eventfd counter
         let mut val: u64 = 0;
         unsafe {
             libc::read(
@@ -485,7 +480,6 @@ impl Worker {
             );
         }
 
-        // Check for new connections / shutdown / lame duck
         while let Ok(cmd) = self.rx.try_recv() {
             match cmd {
                 WorkerCmd::NewConn {
@@ -529,7 +523,6 @@ impl Worker {
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        // Register with epoll (EPOLLIN, level-triggered)
         let mut ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,
             u64: id,
@@ -550,7 +543,6 @@ impl Worker {
         );
 
         let (phase, transport, write_buf) = if is_websocket {
-            // WS: wait for HTTP upgrade before sending INFO
             (
                 ConnPhase::WsHandshake,
                 Transport::WebSocket {
@@ -561,7 +553,6 @@ impl Worker {
                 BytesMut::with_capacity(4096),
             )
         } else if let Some(ref tls_config) = self.state.tls_config {
-            // TLS: perform handshake before sending INFO
             let tls_conn = ServerConnection::new(Arc::clone(tls_config))
                 .expect("failed to create TLS connection");
             (
@@ -574,7 +565,6 @@ impl Worker {
                 BytesMut::with_capacity(4096),
             )
         } else {
-            // Raw TCP: send INFO immediately
             let mut wb = BytesMut::with_capacity(4096);
             wb.extend_from_slice(&self.info_line);
             (ConnPhase::SendInfo, Transport::Raw, wb)
@@ -616,7 +606,6 @@ impl Worker {
             debug!(id, addr = %addr, "accepted websocket connection on worker");
         } else {
             debug!(id, addr = %addr, "accepted connection on worker");
-            // Try to flush INFO immediately
             self.try_flush_conn(id);
         }
     }
@@ -762,12 +751,10 @@ impl Worker {
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
 
-            // Unregister leaf MsgWriter from shared registry.
             #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
             }
-            // Unregister route MsgWriter and peer from shared registries.
             #[cfg(feature = "mesh")]
             if client.ext.is_route() {
                 self.state.route_writers.write().unwrap().remove(&conn_id);
@@ -779,7 +766,6 @@ impl Worker {
                     self.state.route_peers.lock().unwrap().connected.remove(sid);
                 }
             }
-            // Unregister gateway MsgWriter and peer from shared registries.
             #[cfg(feature = "gateway")]
             if client.ext.is_gateway() {
                 self.state.gateway_writers.write().unwrap().remove(&conn_id);
@@ -1103,7 +1089,6 @@ impl Worker {
                 to_remove.push(*conn_id);
                 continue;
             }
-            // Send PING and register EPOLLOUT
             client.write_buf.extend_from_slice(b"PING\r\n");
             client.pings_outstanding += 1;
             client.last_activity = now;
@@ -1177,14 +1162,11 @@ impl Worker {
                 Some(ConnPhase::Active)
             );
             if !is_active {
-                // Non-active connections: disconnect immediately
                 self.remove_conn(conn_id);
                 continue;
             }
-            // Active connections: flush direct_buf, try to flush socket, then remove
             if let Some(client) = self.conns.get_mut(&conn_id) {
                 client.phase = ConnPhase::Draining;
-                // Drain direct_buf into write_buf
                 {
                     let mut dbuf = client.direct_buf.lock().unwrap();
                     if !dbuf.is_empty() {
@@ -1194,7 +1176,6 @@ impl Worker {
                 }
             }
             self.try_flush_conn(conn_id);
-            // Remove all subs for this connection
             cleanup_conn(conn_id, &self.state);
             self.remove_conn(conn_id);
         }
@@ -1204,13 +1185,11 @@ impl Worker {
     /// For WebSocket connections, write_buf is encoded into ws_out first.
     /// For TLS connections, delegates to tls_flush_encrypted.
     fn try_flush_conn(&mut self, conn_id: u64) {
-        // TLS connections use their own flush path
         if matches!(
             self.conns.get(&conn_id).map(|c| &c.transport),
             Some(Transport::Tls(..))
         ) {
             self.tls_flush_encrypted(conn_id);
-            // Phase transition: SendInfo → WaitConnect
             if let Some(client) = self.conns.get_mut(&conn_id) {
                 if matches!(client.phase, ConnPhase::SendInfo) {
                     if let Transport::Tls(ref tls) = client.transport {
@@ -1282,7 +1261,6 @@ impl Worker {
             client.epoll_has_out = false;
         }
 
-        // Phase transition: SendInfo → WaitConnect
         if matches!(client.phase, ConnPhase::SendInfo) {
             client.phase = ConnPhase::WaitConnect;
         }
@@ -1303,7 +1281,6 @@ impl Worker {
     }
 
     fn handle_read_raw(&mut self, conn_id: u64) {
-        // Read from socket in a loop until WouldBlock to drain the kernel buffer.
         let mut got_eof = false;
         loop {
             let client = match self.conns.get_mut(&conn_id) {
@@ -1332,21 +1309,18 @@ impl Worker {
         self.process_read_buf(conn_id);
         self.flush_notifications();
 
-        // Remove connection after processing any remaining data in the buffer.
         if got_eof {
             self.remove_conn(conn_id);
         }
     }
 
     fn handle_read_ws(&mut self, conn_id: u64) {
-        // For WsHandshake phase, read directly into read_buf (raw HTTP bytes)
         let is_handshake = matches!(
             self.conns.get(&conn_id).map(|c| &c.phase),
             Some(ConnPhase::WsHandshake)
         );
 
         if is_handshake {
-            // During handshake, read HTTP bytes into read_buf directly
             loop {
                 let client = match self.conns.get_mut(&conn_id) {
                     Some(c) => c,
@@ -1371,7 +1345,6 @@ impl Worker {
             return;
         }
 
-        // Active WS: read into raw_buf, decode frames into read_buf
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
@@ -1382,7 +1355,6 @@ impl Worker {
             } else {
                 return;
             };
-            // Read from socket into raw_buf
             raw_buf.reserve(4096);
             let spare = raw_buf.spare_capacity_mut();
             let n = unsafe {
@@ -1407,7 +1379,6 @@ impl Worker {
             unsafe { raw_buf.set_len(raw_buf.len() + n as usize) };
         }
 
-        // Decode WS frames into read_buf
         let mut close = false;
         let mut decode_err = false;
         if let Some(client) = self.conns.get_mut(&conn_id) {
@@ -1454,7 +1425,6 @@ impl Worker {
     }
 
     fn handle_read_tls(&mut self, conn_id: u64) {
-        // Read encrypted bytes from socket
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
@@ -1489,11 +1459,9 @@ impl Worker {
             unsafe { tls.enc_in.set_len(tls.enc_in.len() + n as usize) };
         }
 
-        // Feed encrypted data to TLS and extract plaintext
         let mut error = false;
         if let Some(client) = self.conns.get_mut(&conn_id) {
             if let Transport::Tls(ref mut tls) = client.transport {
-                // Feed encrypted data to rustls
                 loop {
                     if tls.enc_in.is_empty() {
                         break;
@@ -1512,10 +1480,8 @@ impl Worker {
                 }
 
                 if !error {
-                    // Process TLS state (handshake / app data)
                     match tls.tls_conn.process_new_packets() {
                         Ok(state) => {
-                            // Extract plaintext
                             if state.plaintext_bytes_to_read() > 0 {
                                 let n = state.plaintext_bytes_to_read();
                                 client.read_buf.reserve(n);
@@ -1550,7 +1516,6 @@ impl Worker {
             return;
         }
 
-        // Flush any TLS handshake/alert data
         self.tls_flush_encrypted(conn_id);
 
         if let Some(client) = self.conns.get_mut(&conn_id) {
@@ -1569,7 +1534,6 @@ impl Worker {
         };
 
         if let Transport::Tls(ref mut tls) = client.transport {
-            // Encrypt pending plaintext writes
             if !client.write_buf.is_empty() {
                 if let Err(e) = tls.tls_conn.writer().write_all(&client.write_buf) {
                     warn!(conn_id, error = %e, "TLS write error");
@@ -1577,7 +1541,6 @@ impl Worker {
                 client.write_buf.clear();
             }
 
-            // Extract encrypted TLS records to enc_out
             loop {
                 let mut tmp = [0u8; 8192];
                 match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
@@ -1589,7 +1552,6 @@ impl Worker {
                 }
             }
 
-            // Write enc_out to socket
             while !tls.enc_out.is_empty() {
                 let n = unsafe {
                     libc::write(
@@ -1669,7 +1631,6 @@ impl Worker {
             None => return,
         };
         if handshake_done {
-            // Log client certificate if present (mTLS)
             if let Some(c) = self.conns.get(&conn_id) {
                 if let Transport::Tls(ref tls) = c.transport {
                     if let Some(certs) = tls.tls_conn.peer_certificates() {
@@ -1684,11 +1645,9 @@ impl Worker {
                 }
             }
             let client = self.conns.get_mut(&conn_id).unwrap();
-            // Queue INFO in write_buf (will be encrypted by tls_flush_encrypted)
             client.write_buf.extend_from_slice(&self.info_line);
             client.phase = ConnPhase::SendInfo;
             self.tls_flush_encrypted(conn_id);
-            // Check if all encrypted data was flushed
             let flushed = match self.conns.get(&conn_id) {
                 Some(c) => {
                     if let Transport::Tls(ref tls) = c.transport {
@@ -1718,7 +1677,6 @@ impl Worker {
         match result {
             None => false, // need more data
             Some(Err(_)) => {
-                // Bad upgrade request
                 if let Some(client) = self.conns.get_mut(&conn_id) {
                     client
                         .write_buf
@@ -1731,18 +1689,13 @@ impl Worker {
             Some(Ok((upgrade, consumed))) => {
                 let response = websocket::build_ws_accept_response(&upgrade.key);
                 let client = self.conns.get_mut(&conn_id).unwrap();
-                // Consume HTTP request from read_buf
                 client.read_buf.advance(consumed);
-                // Write raw HTTP 101 response directly to ws_out
-                // (bypassing WS framing since this is the upgrade response)
                 if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
                     ws_out.extend_from_slice(&response);
                 }
-                // Queue INFO in write_buf (will be WS-encoded by try_flush_conn)
                 let info_line = self.info_line.clone();
                 let client = self.conns.get_mut(&conn_id).unwrap();
                 client.write_buf.extend_from_slice(&info_line);
-                // Now transition to SendInfo
                 client.phase = ConnPhase::SendInfo;
                 self.try_flush_conn(conn_id);
                 true // continue loop
@@ -1809,7 +1762,6 @@ impl Worker {
             };
             match route_op {
                 Some(RouteOp::Info(peer_info)) => {
-                    // Process gossip connect_urls from peer's INFO.
                     if !peer_info.connect_urls.is_empty() {
                         crate::connector::mesh::process_gossip_urls(
                             &self.state,
@@ -1821,7 +1773,6 @@ impl Worker {
                 Some(RouteOp::Connect(connect_info)) => {
                     let peer_sid = connect_info.server_id.clone();
 
-                    // Self-connect check.
                     if let Some(ref sid) = peer_sid {
                         if *sid == self.state.info.server_id {
                             debug!(conn_id, "self-connect on inbound route, closing");
@@ -1840,7 +1791,6 @@ impl Worker {
                     }
                     client.write_buf.extend_from_slice(b"PONG\r\n");
 
-                    // Store peer_server_id for cleanup.
                     if let ConnExt::Route {
                         ref mut peer_server_id,
                         ..
@@ -1856,7 +1806,6 @@ impl Worker {
                     // (one-hop enforcement prevents message loops) and avoids
                     // a retry storm when outbound dedup rejects connections.
 
-                    // Register route MsgWriter.
                     let dw = client.direct_writer.clone();
                     self.state
                         .route_writers
@@ -1864,16 +1813,13 @@ impl Worker {
                         .unwrap()
                         .insert(conn_id, dw);
 
-                    // Send existing local subscriptions as RS+ to the new route.
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
-                    // Broadcast updated INFO to all routes (gossip re-broadcast).
                     crate::connector::mesh::broadcast_route_info(&self.state);
 
                     info!(conn_id, "inbound route connected");
                 }
                 Some(RouteOp::Ping) => {
-                    // Peer sent PING during handshake — respond with PONG.
                     if let Some(client) = self.conns.get_mut(&conn_id) {
                         client.write_buf.extend_from_slice(b"PONG\r\n");
                     }
@@ -1912,7 +1858,6 @@ impl Worker {
             };
             match gw_op {
                 Some(nats_proto::GatewayOp::Info(peer_info)) => {
-                    // Process gateway_urls from peer's INFO for gossip.
                     if let Some(ref urls) = peer_info.gateway_urls {
                         if !urls.is_empty() {
                             let tx = self.state.gateway_connect_tx.lock().unwrap();
@@ -1929,7 +1874,6 @@ impl Worker {
                     return true; // continue
                 }
                 Some(nats_proto::GatewayOp::Connect(connect_info)) => {
-                    // Extract gateway name from CONNECT.
                     let peer_gw_name = connect_info.gateway.clone();
 
                     // Peer's CONNECT — go Active, register, exchange subs.
@@ -1942,7 +1886,6 @@ impl Worker {
                     }
                     client.write_buf.extend_from_slice(b"PONG\r\n");
 
-                    // Store peer gateway name for cleanup.
                     if let ConnExt::Gateway {
                         ref mut peer_gateway_name,
                         ..
@@ -1951,7 +1894,6 @@ impl Worker {
                         *peer_gateway_name = peer_gw_name.clone();
                     }
 
-                    // Register gateway MsgWriter.
                     let dw = client.direct_writer.clone();
                     self.state
                         .gateway_writers
@@ -1959,7 +1901,6 @@ impl Worker {
                         .unwrap()
                         .insert(conn_id, dw);
 
-                    // Register in gateway_peers.
                     if let Some(ref name) = peer_gw_name {
                         let mut peers = self.state.gateway_peers.lock().unwrap();
                         peers
@@ -1969,11 +1910,8 @@ impl Worker {
                             .insert(conn_id);
                     }
 
-                    // Send existing local subscriptions as RS+ to the
-                    // new gateway (interest-only mode).
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
-                    // Broadcast updated INFO to all gateways (gossip).
                     crate::connector::gateway::broadcast_gateway_info(&self.state);
 
                     info!(
@@ -1983,7 +1921,6 @@ impl Worker {
                     );
                 }
                 Some(nats_proto::GatewayOp::Ping) => {
-                    // Peer sent PING during handshake — respond with PONG.
                     if let Some(client) = self.conns.get_mut(&conn_id) {
                         client.write_buf.extend_from_slice(b"PONG\r\n");
                     }
@@ -2024,12 +1961,10 @@ impl Worker {
                     // Inbound leaf node — validate leaf auth, send PING, go Active.
                     #[cfg(feature = "hub")]
                     {
-                        // Validate leaf auth before taking mutable borrow on conns.
                         let leaf_perms = self.state.leaf_auth.validate(&connect_info);
                         let leaf_perms = match leaf_perms {
                             Some(p) => p.map(std::sync::Arc::new),
                             None => {
-                                // Auth failed — disconnect.
                                 warn!(conn_id, "leaf authorization violation");
                                 counter!(
                                     "auth_failures_total",
@@ -2057,7 +1992,6 @@ impl Worker {
                         }
                         client.write_buf.extend_from_slice(b"PING\r\n");
 
-                        // Register leaf MsgWriter so interest can be propagated.
                         let dw = client.direct_writer.clone();
                         self.state
                             .leaf_writers
@@ -2065,13 +1999,11 @@ impl Worker {
                             .unwrap()
                             .insert(conn_id, (dw, leaf_perms.clone()));
 
-                        // Send existing subscriptions as LS+ to the new leaf.
                         send_existing_subs(&self.state, &client.direct_writer, &leaf_perms);
 
                         info!(conn_id, "inbound leaf connected");
                     }
                 } else {
-                    // Regular client connection — validate auth.
                     if !self
                         .state
                         .auth
@@ -2112,7 +2044,6 @@ impl Worker {
                 }
             }
             Some(_) => {
-                // Wrong op
                 if let Some(client) = self.conns.get_mut(&conn_id) {
                     client
                         .write_buf
@@ -2126,8 +2057,6 @@ impl Worker {
         }
         true // continue loop
     }
-
-    // --- Active phase dispatch ---
 
     /// Dispatch to the appropriate handler based on connection kind.
     fn dispatch_active(&mut self, conn_id: u64) -> bool {

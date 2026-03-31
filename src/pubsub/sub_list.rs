@@ -401,11 +401,9 @@ impl SubscriptionManager {
     }
 
     pub fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
-        // Try wildcard trie first (O(1) sub_index lookup)
         if let Some(removed) = self.wild.remove(conn_id, sid) {
             return Some(removed);
         }
-        // Search exact map
         for subs in self.exact.values_mut() {
             if let Some(pos) = subs
                 .iter()
@@ -419,10 +417,8 @@ impl SubscriptionManager {
     }
 
     pub fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
-        // Remove from wildcard trie
         let mut removed = self.wild.remove_conn(conn_id);
 
-        // Remove from exact map
         self.exact.retain(|_, subs| {
             let mut i = 0;
             while i < subs.len() {
@@ -440,11 +436,9 @@ impl SubscriptionManager {
 
     pub fn match_subject(&self, subject: &str) -> Vec<&Subscription> {
         let mut result = Vec::new();
-        // O(1) exact lookup
         if let Some(subs) = self.exact.get(subject) {
             result.extend(subs.iter());
         }
-        // O(depth) trie traversal for wildcard matches
         self.wild.for_each_match(subject, |sub| {
             result.push(sub);
         });
@@ -456,7 +450,6 @@ impl SubscriptionManager {
     /// If the sub has already delivered >= max messages, returns `true` but caller
     /// should remove it under a write lock.
     pub fn set_unsub_max(&self, conn_id: u64, sid: u64, max: u64) -> bool {
-        // Check exact subs
         for subs in self.exact.values() {
             for sub in subs {
                 if sub.conn_id == conn_id && sub.sid == sid {
@@ -465,7 +458,6 @@ impl SubscriptionManager {
                 }
             }
         }
-        // Check wildcard subs
         if let Some(sub) = self.wild.find(conn_id, sid) {
             sub.max_msgs.store(max, Ordering::Relaxed);
             return true;
@@ -505,7 +497,6 @@ impl SubscriptionManager {
     ) -> (usize, Vec<(u64, u64)>) {
         let mut count = 0;
         let mut expired: Vec<(u64, u64)> = Vec::new();
-        // Collect queue group subs lazily — only allocate when needed.
         let mut queue_groups: Vec<(&str, Vec<&Subscription>)> = Vec::new();
 
         // Check max_msgs limit, deliver if allowed, track expired.
@@ -531,8 +522,6 @@ impl SubscriptionManager {
             }};
         }
 
-        // Route a single matching sub: deliver non-queue immediately,
-        // collect queue subs by group name.
         macro_rules! route_sub {
             ($sub:expr) => {
                 if let Some(ref q) = $sub.queue {
@@ -550,13 +539,11 @@ impl SubscriptionManager {
             };
         }
 
-        // O(1) exact lookup
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs.iter() {
                 route_sub!(sub);
             }
         }
-        // O(depth) trie traversal for wildcard matches
         self.wild.for_each_match(subject, |sub| {
             route_sub!(sub);
         });
@@ -575,7 +562,6 @@ impl SubscriptionManager {
     }
 
     pub fn has_any_subscriber(&self, subject: &str) -> bool {
-        // O(1) exact lookup
         if let Some(subs) = self.exact.get(subject) {
             if !subs.is_empty() {
                 return true;
@@ -609,7 +595,6 @@ impl SubscriptionManager {
     /// Cheap boolean check — no delivery, no queue routing.
     #[cfg(feature = "gateway")]
     pub fn has_local_interest(&self, subject: &str) -> bool {
-        // Check exact subs
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs {
                 #[cfg(feature = "mesh")]
@@ -964,8 +949,6 @@ mod tests {
 
     // DirectWriter behavioral tests live in direct_writer.rs.
 
-    // --- Queue group tests ---
-
     fn test_queue_sub(conn_id: u64, sid: u64, subject: &str, queue: &str) -> Subscription {
         Subscription::new_dummy(conn_id, sid, subject.to_string(), Some(queue.to_string()))
     }
@@ -1067,8 +1050,6 @@ mod tests {
         assert!(interests.contains(&("bar", Some("q1"))));
         assert!(interests.contains(&("bar", Some("q2"))));
     }
-
-    // --- UNSUB max tests ---
 
     #[test]
     fn test_unsub_max_delivery_limit() {
@@ -1254,8 +1235,6 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(expired.len(), 1);
     }
-
-    // --- SubList wildcard spec tests (via public API) ---
 
     #[test]
     fn test_wildcard_star_matches_one_level() {

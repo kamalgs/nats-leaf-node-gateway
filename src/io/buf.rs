@@ -81,9 +81,7 @@ impl AdaptiveBuf {
     /// Adjusts the target capacity and reallocates if appropriate.
     pub(crate) fn after_read(&mut self, n: usize) {
         if n >= self.target_cap && self.target_cap < self.max_cap {
-            // Buffer was fully utilized — grow
             self.target_cap = (self.target_cap * 2).min(self.max_cap);
-            // Ensure we have enough capacity for the next read
             let additional = self
                 .target_cap
                 .saturating_sub(self.buf.capacity() - self.buf.len());
@@ -92,11 +90,9 @@ impl AdaptiveBuf {
             }
             self.shorts = 0;
         } else if n < self.target_cap / 2 {
-            // Short read
             self.shorts = self.shorts.saturating_add(1);
             if self.shorts > SHORTS_TO_SHRINK && self.target_cap > DEFAULT_MIN_BUF {
                 self.target_cap = (self.target_cap / 2).max(DEFAULT_MIN_BUF);
-                // Only reallocate when buffer is empty (all data consumed)
                 if self.buf.is_empty() {
                     self.buf = BytesMut::with_capacity(self.target_cap);
                 }
@@ -290,7 +286,6 @@ impl ServerConn {
     /// avoiding poll/Notify overhead entirely.
     pub(crate) fn read_next_non_pub(&mut self) -> io::Result<Option<ClientOp>> {
         loop {
-            // Skip all buffered PUBs, return on first non-PUB op
             loop {
                 match nats_proto::try_skip_or_parse_client_op(&mut self.read_buf)? {
                     Some(ClientOp::Pong) => continue, // skipped PUB/HPUB
@@ -299,7 +294,6 @@ impl ServerConn {
                 }
             }
             self.read_buf.try_shrink();
-            // Read more data from socket
             let n = self.read_buf.read_from(&mut self.reader)?;
             if n == 0 {
                 if self.read_buf.is_empty() {
@@ -527,8 +521,6 @@ mod tests {
         assert!(s.contains("\"auth_token\":\"tok\""));
     }
 
-    // --- LeafConn split test ---
-
     #[test]
     #[cfg(feature = "leaf")]
     fn test_leaf_split_produces_independent_halves() {
@@ -550,8 +542,6 @@ mod tests {
         let op = reader.read_leaf_op().unwrap().unwrap();
         assert!(matches!(op, crate::nats_proto::LeafOp::Ping));
     }
-
-    // --- AdaptiveBuf tests ---
 
     #[test]
     fn test_adaptive_buf_grows_on_full_read() {
