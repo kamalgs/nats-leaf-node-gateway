@@ -1,5 +1,7 @@
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
+use rustc_hash::FxHashMap;
 #[cfg(any(
-    feature = "hub",
+    feature = "accounts",
     feature = "mesh",
     feature = "gateway",
     feature = "worker-affinity"
@@ -1133,14 +1135,14 @@ pub(crate) struct ServerState {
     #[cfg(feature = "hub")]
     #[allow(clippy::type_complexity)]
     pub inbound_leaf_writers:
-        std::sync::RwLock<HashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
+        std::sync::RwLock<FxHashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
     /// Inbound leaf node authentication configuration.
     #[cfg(feature = "hub")]
     pub inbound_leaf_auth: LeafAuth,
     /// Registry of MsgWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "mesh")]
-    pub route_writers: std::sync::RwLock<HashMap<u64, MsgWriter>>,
+    pub route_writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
     /// Port for inbound route connections. `None` when cluster mode is not enabled.
     #[cfg(feature = "mesh")]
     pub cluster_port: Option<u16>,
@@ -1159,7 +1161,7 @@ pub(crate) struct ServerState {
     pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
     /// Registry of MsgWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
-    pub gateway_writers: std::sync::RwLock<HashMap<u64, MsgWriter>>,
+    pub gateway_writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
     /// Port for inbound gateway connections.
     #[cfg(feature = "gateway")]
     pub gateway_port: Option<u16>,
@@ -1186,7 +1188,7 @@ pub(crate) struct ServerState {
     /// Keyed by outbound gateway conn_id. Used for optimistic forwarding and
     /// negative interest tracking.
     #[cfg(feature = "gateway")]
-    pub gateway_interest: std::sync::RwLock<HashMap<u64, GatewayInterestState>>,
+    pub gateway_interest: std::sync::RwLock<FxHashMap<u64, GatewayInterestState>>,
     /// Fast flag: true when any outbound gateway is in Optimistic mode.
     /// Prevents the can_skip PUB optimization from discarding messages
     /// that need to be forwarded across optimistic gateways.
@@ -1301,11 +1303,11 @@ impl ServerState {
             #[cfg(feature = "hub")]
             leafnode_port,
             #[cfg(feature = "hub")]
-            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "hub")]
             inbound_leaf_auth,
             #[cfg(feature = "mesh")]
-            route_writers: std::sync::RwLock::new(HashMap::new()),
+            route_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "mesh")]
             cluster_port,
             #[cfg(feature = "mesh")]
@@ -1332,7 +1334,7 @@ impl ServerState {
             #[cfg(feature = "mesh")]
             cluster_seeds,
             #[cfg(feature = "gateway")]
-            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             gateway_port,
             #[cfg(feature = "gateway")]
@@ -1351,7 +1353,7 @@ impl ServerState {
             #[cfg(feature = "gateway")]
             cached_gateway_info: Mutex::new(String::new()),
             #[cfg(feature = "gateway")]
-            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
