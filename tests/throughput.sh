@@ -281,7 +281,7 @@ SUMMARY_GO_CTX=()
 
 # Extract msgs/sec from nats bench output (pub stats line)
 extract_rate() {
-  grep -oP '[\d,]+(?= msgs/sec)' | head -1 | tr -d ','
+  grep -oP '[\d,]+(?= msgs/sec)' | head -1 | tr -d ',' || true
 }
 
 # ──────────────────────────────────────────────────────────────────────
