@@ -1968,7 +1968,7 @@ impl Worker {
 
         let op = {
             let client = self.conns.get_mut(&conn_id).unwrap();
-            match nats_proto::try_parse_client_op(&mut client.read_buf) {
+            match nats_proto::try_parse_client_op_cursor(&mut client.read_buf) {
                 Ok(op) => op,
                 Err(_) => {
                     self.remove_conn(conn_id);
@@ -2132,7 +2132,7 @@ impl Worker {
                 // Check max control line only when incomplete and buffer is large.
                 // In the hot path buf.len() <= max_ctrl so this is a no-op.
                 let exceeded = max_ctrl > 0
-                    && self.conns.get(&conn_id).map_or(false, |c| {
+                    && self.conns.get(&conn_id).is_some_and(|c| {
                         let buf: &[u8] = &c.read_buf;
                         buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
                     });
@@ -2244,9 +2244,9 @@ impl Worker {
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             if can_skip {
-                nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
+                nats_proto::try_skip_or_parse_client_op_cursor(&mut client.read_buf)
             } else {
-                nats_proto::try_parse_client_op(&mut client.read_buf)
+                nats_proto::try_parse_client_op_cursor(&mut client.read_buf)
             }
         };
         match result {
@@ -2255,7 +2255,7 @@ impl Worker {
                 // Check max control line only when incomplete and buffer is large.
                 // In the hot path buf.len() <= max_ctrl so this is a no-op.
                 let exceeded = max_ctrl > 0
-                    && self.conns.get(&conn_id).map_or(false, |c| {
+                    && self.conns.get(&conn_id).is_some_and(|c| {
                         let buf: &[u8] = &c.read_buf;
                         buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
                     });

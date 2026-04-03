@@ -380,13 +380,13 @@ impl WildTrieInner {
 enum WildTrie {
     #[default]
     Empty,
-    Active(WildTrieInner),
+    Active(Box<WildTrieInner>),
 }
 
 impl WildTrie {
     fn insert(&mut self, sub: Subscription) {
         if matches!(self, WildTrie::Empty) {
-            *self = WildTrie::Active(WildTrieInner::default());
+            *self = WildTrie::Active(Box::default());
         }
         if let WildTrie::Active(inner) = self {
             inner.insert(sub);
