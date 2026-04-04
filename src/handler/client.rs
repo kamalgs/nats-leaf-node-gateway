@@ -336,7 +336,12 @@ impl ClientHandler {
                     let has_sub = subs.has_any_subscriber(subject_str);
                     drop(subs);
 
-                    if !has_sub {
+                    #[cfg(feature = "gateway")]
+                    let has_gw = wctx.state.has_gateway_interest.load(Ordering::Relaxed);
+                    #[cfg(not(feature = "gateway"))]
+                    let has_gw = false;
+
+                    if !has_sub && !has_gw {
                         let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
                         let no_resp_msg =
