@@ -1444,6 +1444,8 @@ impl Server {
             auth_required: config.client_auth.is_required(),
             tls_required: tls_config.is_some(),
             nonce,
+            #[cfg(feature = "mesh")]
+            open_wire: Some(1),
             ..Default::default()
         };
 

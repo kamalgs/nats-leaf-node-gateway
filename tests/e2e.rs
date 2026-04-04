@@ -13,6 +13,12 @@ use futures_util::StreamExt;
 #[cfg(feature = "gateway")]
 use open_wire::GatewayRemote;
 use open_wire::{Server, ServerConfig};
+#[cfg(feature = "hub")]
+use open_wire::InboundLeafConfig;
+#[cfg(feature = "leaf")]
+use open_wire::HubConfig;
+#[cfg(feature = "mesh")]
+use open_wire::ClusterConfig;
 use tokio::time::timeout;
 
 /// Drain a subscriber, counting messages until a timeout gap with no messages.
@@ -104,8 +110,8 @@ fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
     let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port,
-        hub_url,
         server_name: format!("test-leaf-{}", port),
+        hub: HubConfig { url: hub_url, ..Default::default() },
         ..Default::default()
     };
     let server = Server::new(config);
@@ -526,7 +532,7 @@ fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: format!("test-hub-{}", client_port),
-        leafnode_port: Some(leafnode_port),
+        leafnodes: InboundLeafConfig { port: Some(leafnode_port), ..Default::default() },
         ..Default::default()
     };
     let server = Server::new(config);
@@ -885,9 +891,11 @@ fn spawn_cluster_node(
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: name.to_string(),
-        cluster_port: Some(cluster_port),
-        cluster_seeds: seeds,
-        cluster_name: Some("test-cluster".to_string()),
+        cluster: ClusterConfig {
+            port: Some(cluster_port),
+            seeds,
+            name: Some("test-cluster".to_string()),
+        },
         ..Default::default()
     };
     let server = Server::new(config);

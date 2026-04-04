@@ -12,6 +12,8 @@ use bytes::BytesMut;
 
 use crate::nats_proto::MsgBuilder;
 use crate::types::HeaderMap;
+#[cfg(feature = "mesh")]
+use crate::protocol::bin_proto;
 
 /// Create a Linux eventfd for notification.
 pub(crate) fn create_eventfd() -> OwnedFd {
@@ -40,6 +42,9 @@ pub(crate) struct MsgWriter {
     has_pending: Arc<AtomicBool>,
     /// Pre-built MsgBuilder for formatting — kept per-writer to avoid allocation.
     msg_builder: Arc<Mutex<MsgBuilder>>,
+    /// When true, encode outgoing route frames as binary (open-wire binary protocol).
+    #[cfg(feature = "mesh")]
+    binary: bool,
 }
 
 impl MsgWriter {
@@ -54,6 +59,8 @@ impl MsgWriter {
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+            #[cfg(feature = "mesh")]
+            binary: false,
         }
     }
 
@@ -67,6 +74,48 @@ impl MsgWriter {
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+            #[cfg(feature = "mesh")]
+            binary: false,
+        }
+    }
+
+    /// Create a standalone binary-mode MsgWriter (for binary outbound route connections).
+    #[cfg(feature = "mesh")]
+    pub(crate) fn new_binary_dummy() -> Self {
+        let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let event_fd = Arc::new(create_eventfd());
+        Self {
+            buf,
+            has_pending,
+            event_fd,
+            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+            binary: true,
+        }
+    }
+
+    /// Returns true if this writer encodes frames in binary (open-wire) format.
+    #[cfg(feature = "mesh")]
+    pub(crate) fn is_binary(&self) -> bool {
+        self.binary
+    }
+
+    /// Create a binary-mode MsgWriter sharing the given buffer and notification Arcs.
+    ///
+    /// Used to upgrade an inbound route connection's writer to binary mode while
+    /// keeping `flush_pending` in the worker pointing at the same shared data.
+    #[cfg(feature = "mesh")]
+    pub(crate) fn new_binary_shared(
+        buf: Arc<Mutex<BytesMut>>,
+        has_pending: Arc<AtomicBool>,
+        event_fd: Arc<OwnedFd>,
+    ) -> Self {
+        Self {
+            buf,
+            has_pending,
+            event_fd,
+            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+            binary: true,
         }
     }
 
@@ -114,6 +163,20 @@ impl MsgWriter {
         payload: &[u8],
         #[cfg(feature = "accounts")] account: &[u8],
     ) {
+        #[cfg(feature = "mesh")]
+        if self.binary {
+            let reply_slice = reply.unwrap_or(b"");
+            let mut buf = self.buf.lock().unwrap();
+            if let Some(hdrs) = headers {
+                let hdr_bytes = hdrs.to_bytes();
+                bin_proto::write_hmsg(subject, reply_slice, &hdr_bytes, payload, &mut buf);
+            } else {
+                bin_proto::write_msg(subject, reply_slice, payload, &mut buf);
+            }
+            drop(buf);
+            self.has_pending.store(true, Ordering::Release);
+            return;
+        }
         let mut builder = self.msg_builder.lock().unwrap();
         let data = builder.build_rmsg(
             subject,
@@ -123,6 +186,89 @@ impl MsgWriter {
             #[cfg(feature = "accounts")]
             account,
         );
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
+    /// Write a route sub (RS+ or binary Sub) to the shared buffer.
+    ///
+    /// Uses binary framing when this writer is in binary mode, text RS+ otherwise.
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
+    pub(crate) fn write_route_sub(
+        &self,
+        subject: &[u8],
+        queue: Option<&[u8]>,
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) {
+        #[cfg(feature = "mesh")]
+        if self.binary {
+            #[cfg(not(feature = "accounts"))]
+            let account: &[u8] = b"$G";
+            let queue_slice = queue.unwrap_or(b"");
+            let mut buf = self.buf.lock().unwrap();
+            bin_proto::write_sub(subject, queue_slice, account, &mut buf);
+            drop(buf);
+            self.has_pending.store(true, Ordering::Release);
+            return;
+        }
+        let mut builder = self.msg_builder.lock().unwrap();
+        let data = if let Some(q) = queue {
+            builder.build_route_sub_queue(
+                subject,
+                q,
+                #[cfg(feature = "accounts")]
+                account,
+            )
+        } else {
+            builder.build_route_sub(
+                subject,
+                #[cfg(feature = "accounts")]
+                account,
+            )
+        };
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
+    /// Write a route unsub (RS- or binary Unsub) to the shared buffer.
+    ///
+    /// Uses binary framing when this writer is in binary mode, text RS- otherwise.
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
+    pub(crate) fn write_route_unsub(
+        &self,
+        subject: &[u8],
+        queue: Option<&[u8]>,
+        #[cfg(feature = "accounts")] account: &[u8],
+    ) {
+        #[cfg(feature = "mesh")]
+        if self.binary {
+            #[cfg(not(feature = "accounts"))]
+            let account: &[u8] = b"$G";
+            let mut buf = self.buf.lock().unwrap();
+            bin_proto::write_unsub(subject, account, &mut buf);
+            drop(buf);
+            self.has_pending.store(true, Ordering::Release);
+            return;
+        }
+        let mut builder = self.msg_builder.lock().unwrap();
+        let data = if let Some(q) = queue {
+            builder.build_route_unsub_queue(
+                subject,
+                q,
+                #[cfg(feature = "accounts")]
+                account,
+            )
+        } else {
+            builder.build_route_unsub(
+                subject,
+                #[cfg(feature = "accounts")]
+                account,
+            )
+        };
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
         drop(buf);
@@ -377,5 +523,150 @@ mod tests {
         assert_eq!(&data[..], b"MSG test 1 4\r\ndata\r\n");
         // has_pending is still true — the worker is responsible for clearing it
         assert!(writer.has_pending.load(Ordering::Acquire));
+    }
+}
+
+/// Tests for binary-mode MsgWriter (open-wire inter-node framing).
+#[cfg(all(test, feature = "mesh"))]
+mod binary_tests {
+    use super::*;
+    use crate::protocol::bin_proto::{self, BinOp};
+
+    /// Drain the writer buffer and decode exactly one binary frame.
+    fn drain_one(w: &MsgWriter) -> bin_proto::BinFrame {
+        let mut data = w.drain().expect("writer buffer was empty");
+        bin_proto::try_decode(&mut data).expect("failed to decode binary frame")
+    }
+
+    #[test]
+    fn write_rmsg_encodes_msg_frame() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_rmsg(b"foo.bar", None, None, b"hello");
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Msg);
+        assert_eq!(&frame.subject[..], b"foo.bar");
+        assert!(frame.reply.is_empty());
+        assert_eq!(&frame.payload[..], b"hello");
+    }
+
+    #[test]
+    fn write_rmsg_encodes_reply() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_rmsg(b"foo", Some(b"_INBOX.123"), None, b"");
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Msg);
+        assert_eq!(&frame.reply[..], b"_INBOX.123");
+    }
+
+    #[test]
+    fn write_rmsg_encodes_hmsg_with_headers() {
+        let w = MsgWriter::new_binary_dummy();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("X-Test", "v".to_string());
+        w.write_rmsg(b"sub", None, Some(&hdrs), b"body");
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::HMsg);
+        assert_eq!(&frame.subject[..], b"sub");
+        // payload layout: [4B hdr_len LE][hdr_bytes][body]
+        assert!(frame.payload.len() >= 4);
+        let hdr_len =
+            u32::from_le_bytes([frame.payload[0], frame.payload[1], frame.payload[2], frame.payload[3]])
+                as usize;
+        assert!(hdr_len > 0, "header length must be non-zero");
+        assert!(frame.payload.len() >= 4 + hdr_len, "payload too short for claimed header length");
+        assert_eq!(&frame.payload[4 + hdr_len..], b"body");
+    }
+
+    #[test]
+    fn write_rmsg_empty_payload() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_rmsg(b"a.b.c", None, None, b"");
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Msg);
+        assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn write_route_sub_binary_no_queue() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_route_sub(b"foo.>", None);
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Sub);
+        assert_eq!(&frame.subject[..], b"foo.>");
+        assert!(frame.reply.is_empty(), "no queue → reply field empty");
+        assert_eq!(&frame.payload[..], b"$G", "account defaults to $G");
+    }
+
+    #[test]
+    fn write_route_sub_binary_with_queue() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_route_sub(b"events.>", Some(b"workers"));
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Sub);
+        assert_eq!(&frame.subject[..], b"events.>");
+        assert_eq!(&frame.reply[..], b"workers", "queue group in reply field");
+    }
+
+    #[test]
+    fn write_route_unsub_binary() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_route_unsub(b"foo.>", None);
+        let frame = drain_one(&w);
+        assert_eq!(frame.op, BinOp::Unsub);
+        assert_eq!(&frame.subject[..], b"foo.>");
+        assert!(frame.reply.is_empty());
+        assert_eq!(&frame.payload[..], b"$G");
+    }
+
+    #[test]
+    fn text_mode_write_route_sub_produces_text_not_binary() {
+        let w = MsgWriter::new_dummy(); // text mode
+        w.write_route_sub(b"foo", None);
+        let data = w.drain().expect("text writer should have data");
+        // Text RS+ must begin with "RS+"
+        assert!(data.starts_with(b"RS+"), "text mode must produce RS+ line, got: {:?}", &data[..]);
+        // Text output should NOT be parseable as a binary frame with valid op
+        let mut clone = data.clone();
+        let frame = bin_proto::try_decode(&mut clone);
+        if let Some(f) = frame {
+            // If it accidentally decodes, the op byte ('R' = 0x52) is not a valid BinOp
+            assert_ne!(f.op, BinOp::Sub, "text RS+ must not decode as binary Sub");
+        }
+    }
+
+    #[test]
+    fn multiple_frames_in_sequence() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_route_sub(b"a", None);
+        w.write_route_sub(b"b", Some(b"q"));
+        w.write_rmsg(b"c", None, None, b"data");
+        let mut data = w.drain().unwrap();
+        let f1 = bin_proto::try_decode(&mut data).unwrap();
+        let f2 = bin_proto::try_decode(&mut data).unwrap();
+        let f3 = bin_proto::try_decode(&mut data).unwrap();
+        assert!(bin_proto::try_decode(&mut data).is_none(), "should be no more frames");
+        assert_eq!(f1.op, BinOp::Sub);
+        assert_eq!(&f1.subject[..], b"a");
+        assert_eq!(f2.op, BinOp::Sub);
+        assert_eq!(&f2.reply[..], b"q");
+        assert_eq!(f3.op, BinOp::Msg);
+        assert_eq!(&f3.subject[..], b"c");
+    }
+
+    #[test]
+    fn binary_frame_size_is_compact() {
+        let w = MsgWriter::new_binary_dummy();
+        w.write_rmsg(b"x", None, None, b"y");
+        let data = w.drain().unwrap();
+        // 9-byte header + 1 subject + 0 reply + 1 payload = 11 bytes
+        assert_eq!(data.len(), 11, "compact frame: header(9) + subj(1) + repl(0) + pay(1)");
+    }
+
+    #[test]
+    fn has_pending_set_after_binary_write() {
+        let w = MsgWriter::new_binary_dummy();
+        assert!(!w.has_pending.load(std::sync::atomic::Ordering::Acquire));
+        w.write_rmsg(b"t", None, None, b"");
+        assert!(w.has_pending.load(std::sync::atomic::Ordering::Acquire));
     }
 }

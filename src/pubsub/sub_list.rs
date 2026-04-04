@@ -560,9 +560,14 @@ impl SubscriptionManager {
     ///
     /// Queue group semantics: non-queue subs receive every message,
     /// while each queue group delivers to exactly one member (round-robin).
+    ///
+    /// `pre_filter`: called before a subscription is considered for delivery or
+    /// added to a queue group. Returning `false` excludes it entirely — including
+    /// from the queue-group round-robin pool, so it never "steals" a slot.
     pub fn for_each_match(
         &self,
         subject: &str,
+        pre_filter: impl Fn(&Subscription) -> bool,
         mut f: impl FnMut(&Subscription),
     ) -> (usize, Vec<(u64, u64)>) {
         let mut count = 0;
@@ -594,7 +599,9 @@ impl SubscriptionManager {
 
         macro_rules! route_sub {
             ($sub:expr) => {
-                if let Some(ref q) = $sub.queue {
+                if !pre_filter($sub) {
+                    // excluded — do not add to queue group or deliver
+                } else if let Some(ref q) = $sub.queue {
                     if let Some(group) = queue_groups
                         .iter_mut()
                         .find(|(name, _)| *name == q.as_str())
@@ -1031,7 +1038,7 @@ mod tests {
         sl.insert(test_queue_sub(3, 1, "foo", "q1"));
 
         let mut delivered = Vec::new();
-        let (count, _expired) = sl.for_each_match("foo", |sub| {
+        let (count, _expired) = sl.for_each_match("foo", |_| true, |sub| {
             delivered.push(sub.conn_id);
         });
         assert_eq!(count, 1);
@@ -1046,7 +1053,7 @@ mod tests {
 
         let mut counts = [0u32; 3]; // conn_id 1 and 2
         for _ in 0..100 {
-            let _ = sl.for_each_match("foo", |sub| {
+            let _ = sl.for_each_match("foo", |_| true, |sub| {
                 counts[sub.conn_id as usize] += 1;
             });
         }
@@ -1066,7 +1073,7 @@ mod tests {
         sl.insert(test_sub(3, 1, "foo"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo", |sub| {
+        let (count, _) = sl.for_each_match("foo", |_| true, |sub| {
             delivered.push(sub.conn_id);
         });
         // Non-queue sub always delivered + 1 from queue group
@@ -1083,7 +1090,7 @@ mod tests {
         sl.insert(test_queue_sub(4, 1, "foo", "q2"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo", |sub| {
+        let (count, _) = sl.for_each_match("foo", |_| true, |sub| {
             delivered.push(sub.conn_id);
         });
         // 1 from q1 + 1 from q2
@@ -1098,7 +1105,7 @@ mod tests {
         sl.insert(test_queue_sub(2, 1, "foo.*", "q1"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo.bar", |sub| {
+        let (count, _) = sl.for_each_match("foo.bar", |_| true, |sub| {
             delivered.push(sub.conn_id);
         });
         assert_eq!(count, 1);
@@ -1129,12 +1136,12 @@ mod tests {
 
         // Deliver 3 messages — all should succeed
         for _ in 0..3 {
-            let (count, _) = sl.for_each_match("foo", |_sub| {});
+            let (count, _) = sl.for_each_match("foo", |_| true, |_sub| {});
             assert_eq!(count, 1);
         }
 
         // 4th message should be skipped and sub expired
-        let (count, expired) = sl.for_each_match("foo", |_sub| {});
+        let (count, expired) = sl.for_each_match("foo", |_| true, |_sub| {});
         assert_eq!(count, 0);
         assert!(expired.is_empty()); // already expired on 3rd delivery
     }
@@ -1145,13 +1152,13 @@ mod tests {
         sl.insert(test_sub(1, 1, "foo"));
         sl.set_unsub_max(1, 1, 1);
 
-        let (count, expired) = sl.for_each_match("foo", |_sub| {});
+        let (count, expired) = sl.for_each_match("foo", |_| true, |_sub| {});
         assert_eq!(count, 1);
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], (1, 1));
 
         // Next delivery should skip
-        let (count, _) = sl.for_each_match("foo", |_sub| {});
+        let (count, _) = sl.for_each_match("foo", |_| true, |_sub| {});
         assert_eq!(count, 0);
     }
 
@@ -1165,7 +1172,7 @@ mod tests {
         // Deliver enough messages that conn_id=1 gets 2
         let mut conn1_count = 0u32;
         for _ in 0..100 {
-            let (_, expired) = sl.for_each_match("foo", |sub| {
+            let (_, expired) = sl.for_each_match("foo", |_| true, |sub| {
                 if sub.conn_id == 1 {
                     conn1_count += 1;
                 }
@@ -1187,7 +1194,7 @@ mod tests {
         // Set max=3, then deliver 3 messages to reach the limit
         sl.set_unsub_max(1, 1, 3);
         for _ in 0..3 {
-            let _ = sl.for_each_match("foo", |_sub| {});
+            let _ = sl.for_each_match("foo", |_| true, |_sub| {});
         }
 
         // Should now be expired
@@ -1299,9 +1306,9 @@ mod tests {
         sl.insert(test_sub(1, 1, "foo.*"));
         assert!(sl.set_unsub_max(1, 1, 2));
 
-        let (count, _) = sl.for_each_match("foo.bar", |_sub| {});
+        let (count, _) = sl.for_each_match("foo.bar", |_| true, |_sub| {});
         assert_eq!(count, 1);
-        let (count, expired) = sl.for_each_match("foo.baz", |_sub| {});
+        let (count, expired) = sl.for_each_match("foo.baz", |_| true, |_sub| {});
         assert_eq!(count, 1);
         assert_eq!(expired.len(), 1);
     }

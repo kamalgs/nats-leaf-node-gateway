@@ -717,6 +717,7 @@ impl Worker {
                 route_sid_counter: 0,
                 route_sids: HashMap::new(),
                 peer_server_id: None,
+                binary: false,
             },
         );
     }
@@ -1811,6 +1812,9 @@ impl Worker {
                         }
                     }
 
+                    let use_binary = connect_info.open_wire == Some(1)
+                        && self.state.info.open_wire == Some(1);
+
                     // Peer's CONNECT — go Active, register, exchange subs.
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     client.phase = ConnPhase::Active;
@@ -1819,14 +1823,32 @@ impl Worker {
                     {
                         client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                     }
+                    // Always respond with text PONG — the handshake stays in text.
+                    // Binary framing only activates for Active-phase data frames.
                     client.write_buf.extend_from_slice(b"PONG\r\n");
+                    // Ensure flush_pending sends PONG even when there are no existing
+                    // subs to sync (send_existing_route_subs wouldn't set has_pending).
+                    client.has_pending.store(true, Ordering::Release);
 
                     if let ConnExt::Route {
                         ref mut peer_server_id,
+                        ref mut binary,
                         ..
                     } = client.ext
                     {
                         *peer_server_id = peer_sid.clone();
+                        *binary = use_binary;
+                    }
+
+                    // If binary mode, replace the direct_writer with a binary-mode writer
+                    // sharing the same direct_buf/has_pending Arcs so flush_pending works.
+                    if use_binary {
+                        let binary_dw = crate::sub_list::MsgWriter::new_binary_shared(
+                            Arc::clone(&client.direct_buf),
+                            Arc::clone(&client.has_pending),
+                            Arc::clone(&self.event_fd),
+                        );
+                        client.direct_writer = binary_dw;
                     }
 
                     // Note: we intentionally do NOT register inbound peers
@@ -1847,7 +1869,7 @@ impl Worker {
 
                     crate::connector::mesh::broadcast_route_info(&self.state);
 
-                    info!(conn_id, "inbound route connected");
+                    info!(conn_id, use_binary, "inbound route connected");
                 }
                 Some(RouteOp::Ping) => {
                     if let Some(client) = self.conns.get_mut(&conn_id) {
@@ -2097,7 +2119,18 @@ impl Worker {
             #[cfg(feature = "hub")]
             ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
             #[cfg(feature = "mesh")]
-            ConnKind::Route => self.process_active::<RouteHandler>(conn_id),
+            ConnKind::Route => {
+                let is_binary = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| matches!(&c.ext, ConnExt::Route { binary: true, .. }))
+                    .unwrap_or(false);
+                if is_binary {
+                    self.process_active_route_binary(conn_id)
+                } else {
+                    self.process_active::<RouteHandler>(conn_id)
+                }
+            }
             #[cfg(feature = "gateway")]
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
             ConnKind::Client => self.process_active_client(conn_id, can_skip),
@@ -2288,6 +2321,123 @@ impl Worker {
     fn handle_write(&mut self, conn_id: u64) {
         self.try_flush_conn(conn_id);
     }
+
+    /// Parse and dispatch a single binary frame from an inbound binary-mode route connection.
+    ///
+    /// Maps `BinOp::Ping/Pong` in-place, converts `Msg/HMsg/Sub/Unsub` to `RouteOp`
+    /// and delegates to `RouteHandler` via `dispatch_and_apply`.
+    #[cfg(feature = "mesh")]
+    fn process_active_route_binary(&mut self, conn_id: u64) -> bool {
+        use crate::protocol::bin_proto::{self, BinOp};
+
+        // The outbound side sends INFO+CONNECT+PING as text in one batch.
+        // After we transition to binary Active, the text PING\r\n may still
+        // be sitting at the front of the read buffer. Consume it silently —
+        // we already sent PONG when processing CONNECT, so a second PONG
+        // would arrive as invalid bytes in the peer's binary parser.
+        {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            let buf = client.read_buf.bytes_mut();
+            if buf.starts_with(b"PING\r\n") {
+                buf.advance(6);
+                return true;
+            }
+        }
+
+        let frame = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            bin_proto::try_decode(client.read_buf.bytes_mut())
+        };
+        let frame = match frame {
+            Some(f) => f,
+            None => return false,
+        };
+
+        match frame.op {
+            BinOp::Ping => {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                bin_proto::write_pong(&mut client.write_buf);
+                return true;
+            }
+            BinOp::Pong => return true,
+            _ => {}
+        }
+
+        let route_op = bin_frame_to_route_op(frame);
+        match route_op {
+            Some(op) => self.dispatch_and_apply::<RouteHandler>(conn_id, op),
+            None => true,
+        }
+    }
+}
+
+/// Convert a decoded `BinFrame` to a `RouteOp` for dispatch via `RouteHandler`.
+///
+/// `Ping` and `Pong` are handled in-place by `process_active_route_binary` and
+/// must not be passed to this function.
+#[cfg(feature = "mesh")]
+fn bin_frame_to_route_op(frame: crate::protocol::bin_proto::BinFrame) -> Option<RouteOp> {
+    use crate::protocol::bin_proto::BinOp;
+    match frame.op {
+        BinOp::Msg => Some(RouteOp::RouteMsg {
+            #[cfg(feature = "accounts")]
+            account: bytes::Bytes::from_static(b"$G"),
+            subject: frame.subject,
+            reply: if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply)
+            },
+            headers: None,
+            payload: frame.payload,
+        }),
+        BinOp::HMsg => {
+            // Payload layout: [4B hdr_len LE][hdr_bytes][body]
+            if frame.payload.len() < 4 {
+                return None;
+            }
+            let hdr_len = u32::from_le_bytes([
+                frame.payload[0],
+                frame.payload[1],
+                frame.payload[2],
+                frame.payload[3],
+            ]) as usize;
+            if frame.payload.len() < 4 + hdr_len {
+                return None;
+            }
+            let hdr_bytes = &frame.payload[4..4 + hdr_len];
+            let headers = crate::nats_proto::parse_headers(hdr_bytes).ok()?;
+            let payload = frame.payload.slice(4 + hdr_len..);
+            Some(RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account: bytes::Bytes::from_static(b"$G"),
+                subject: frame.subject,
+                reply: if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(frame.reply)
+                },
+                headers: Some(headers),
+                payload,
+            })
+        }
+        BinOp::Sub => Some(RouteOp::RouteSub {
+            #[cfg(feature = "accounts")]
+            account: frame.payload,
+            subject: frame.subject,
+            queue: if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply)
+            },
+        }),
+        BinOp::Unsub => Some(RouteOp::RouteUnsub {
+            #[cfg(feature = "accounts")]
+            account: frame.payload,
+            subject: frame.subject,
+        }),
+        BinOp::Ping | BinOp::Pong => None, // handled in-place
+    }
 }
 
 /// Modify epoll registration for a client socket.
@@ -2346,4 +2496,136 @@ fn cleanup_conn(id: u64, state: &ServerState) {
     let _ = &removed;
 
     info!(id, "client cleaned up");
+}
+
+/// Tests for `bin_frame_to_route_op`: binary frame → RouteOp conversion.
+#[cfg(all(test, feature = "mesh"))]
+mod bin_frame_tests {
+    use super::*;
+    use crate::protocol::bin_proto::{self, BinOp};
+    use bytes::{Bytes, BytesMut};
+
+    /// Encode a frame with the given fields and decode it back.
+    fn frame(op: BinOp, subject: &[u8], reply: &[u8], payload: &[u8]) -> bin_proto::BinFrame {
+        let mut buf = BytesMut::new();
+        match op {
+            BinOp::Msg => bin_proto::write_msg(subject, reply, payload, &mut buf),
+            BinOp::Sub => bin_proto::write_sub(subject, reply, payload, &mut buf),
+            BinOp::Unsub => bin_proto::write_unsub(subject, payload, &mut buf),
+            BinOp::Ping => bin_proto::write_ping(&mut buf),
+            BinOp::Pong => bin_proto::write_pong(&mut buf),
+            BinOp::HMsg => panic!("use write_hmsg directly"),
+        }
+        bin_proto::try_decode(&mut buf).expect("decode failed")
+    }
+
+    #[test]
+    fn msg_no_reply() {
+        match bin_frame_to_route_op(frame(BinOp::Msg, b"foo.bar", b"", b"hello")).unwrap() {
+            RouteOp::RouteMsg { subject, reply, payload, headers, .. } => {
+                assert_eq!(&subject[..], b"foo.bar");
+                assert!(reply.is_none());
+                assert_eq!(&payload[..], b"hello");
+                assert!(headers.is_none());
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn msg_with_reply() {
+        match bin_frame_to_route_op(frame(BinOp::Msg, b"foo", b"_INBOX.1", b"")).unwrap() {
+            RouteOp::RouteMsg { reply, .. } => {
+                assert_eq!(reply.unwrap().as_ref(), b"_INBOX.1");
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmsg_round_trip() {
+        let hdr = b"NATS/1.0\r\nX-Src: node-a\r\n\r\n";
+        let body = b"payload";
+        let mut buf = BytesMut::new();
+        bin_proto::write_hmsg(b"events.v1", b"", hdr, body, &mut buf);
+        let f = bin_proto::try_decode(&mut buf).unwrap();
+        match bin_frame_to_route_op(f).unwrap() {
+            RouteOp::RouteMsg { subject, reply, headers, payload, .. } => {
+                assert_eq!(&subject[..], b"events.v1");
+                assert!(reply.is_none());
+                assert!(headers.is_some(), "headers must be parsed");
+                assert_eq!(&payload[..], body);
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmsg_payload_too_short_returns_none() {
+        // Craft an HMsg where the embedded hdr_len field claims more bytes than exist.
+        let f = bin_proto::BinFrame {
+            op: BinOp::HMsg,
+            subject: Bytes::from_static(b"sub"),
+            reply: Bytes::new(),
+            // [4B hdr_len=50][only 3 bytes] — truncated header
+            payload: Bytes::from_static(b"\x32\x00\x00\x00abc"),
+        };
+        assert!(
+            bin_frame_to_route_op(f).is_none(),
+            "truncated HMsg payload must return None"
+        );
+    }
+
+    #[test]
+    fn hmsg_payload_empty_returns_none() {
+        let f = bin_proto::BinFrame {
+            op: BinOp::HMsg,
+            subject: Bytes::from_static(b"sub"),
+            reply: Bytes::new(),
+            payload: Bytes::new(), // no hdr_len bytes at all
+        };
+        assert!(bin_frame_to_route_op(f).is_none());
+    }
+
+    #[test]
+    fn sub_no_queue() {
+        match bin_frame_to_route_op(frame(BinOp::Sub, b"foo.>", b"", b"$G")).unwrap() {
+            RouteOp::RouteSub { subject, queue, .. } => {
+                assert_eq!(&subject[..], b"foo.>");
+                assert!(queue.is_none());
+            }
+            other => panic!("expected RouteSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_with_queue() {
+        match bin_frame_to_route_op(frame(BinOp::Sub, b"events.>", b"workers", b"$G")).unwrap() {
+            RouteOp::RouteSub { subject, queue, .. } => {
+                assert_eq!(&subject[..], b"events.>");
+                assert_eq!(queue.unwrap().as_ref(), b"workers");
+            }
+            other => panic!("expected RouteSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsub() {
+        match bin_frame_to_route_op(frame(BinOp::Unsub, b"foo.>", b"", b"$G")).unwrap() {
+            RouteOp::RouteUnsub { subject, .. } => {
+                assert_eq!(&subject[..], b"foo.>");
+            }
+            other => panic!("expected RouteUnsub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_returns_none() {
+        assert!(bin_frame_to_route_op(frame(BinOp::Ping, b"", b"", b"")).is_none());
+    }
+
+    #[test]
+    fn pong_returns_none() {
+        assert!(bin_frame_to_route_op(frame(BinOp::Pong, b"", b"", b"")).is_none());
+    }
 }

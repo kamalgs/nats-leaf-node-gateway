@@ -109,6 +109,17 @@ impl AdaptiveBuf {
         self.buf
     }
 
+    /// Return a mutable reference to the inner `BytesMut`, resetting the newline cursor.
+    ///
+    /// Use only for binary protocol parsing which bypasses the newline-cursor state.
+    /// Calling this resets `next_nl` and `scan_start` so that subsequent text-protocol
+    /// parse calls rescan from the beginning.
+    pub(crate) fn bytes_mut(&mut self) -> &mut BytesMut {
+        self.next_nl = None;
+        self.scan_start = 0;
+        &mut self.buf
+    }
+
     /// Find the next `\n` in the buffer, scanning only bytes that have not
     /// been examined since the last successful consume.
     ///

@@ -80,6 +80,8 @@ pub(crate) enum ConnExt {
         route_sids: HashMap<(Bytes, Option<Bytes>), u64>,
         /// Peer's server_id, stored for cleanup deregistration from RoutePeerRegistry.
         peer_server_id: Option<String>,
+        /// Whether this connection uses binary framing (open-wire binary protocol).
+        binary: bool,
     },
     /// Inbound gateway connection (uses RMSG for delivery, RS+/RS- for interest).
     #[cfg(feature = "gateway")]

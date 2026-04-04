@@ -259,20 +259,26 @@ where
     F: FnMut(&crate::sub_list::Subscription),
 {
     let mut delivered: usize = 0;
-    let (_match_count, expired) = subs.for_each_match(msg.subject_str, |sub| {
-        if scope.skip_echo && sub.conn_id == skip_conn_id {
-            return;
-        }
-        // One-hop rule: messages from routes are never re-forwarded to other routes.
-        #[cfg(feature = "mesh")]
-        if scope.skip_routes && sub.is_route {
-            return;
-        }
-        // One-hop rule: messages from gateways are never re-forwarded to other gateways.
-        #[cfg(feature = "gateway")]
-        if scope.skip_gateways && sub.is_gateway {
-            return;
-        }
+    let (_match_count, expired) = subs.for_each_match(
+        msg.subject_str,
+        |sub| {
+            // Pre-filter: exclude subs that must not participate in queue-group
+            // round-robin — if they are picked as the sole group member and then
+            // filtered post-selection, the message would be silently dropped.
+            if scope.skip_echo && sub.conn_id == skip_conn_id {
+                return false;
+            }
+            #[cfg(feature = "mesh")]
+            if scope.skip_routes && sub.is_route {
+                return false;
+            }
+            #[cfg(feature = "gateway")]
+            if scope.skip_gateways && sub.is_gateway {
+                return false;
+            }
+            true
+        },
+        |sub| {
         #[cfg(feature = "gateway")]
         if sub.is_gateway {
             let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
@@ -653,7 +659,7 @@ pub(crate) fn deliver_cross_account(
         );
 
         let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
-        let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
+        let (_count, expired) = subs.for_each_match(&dst_subject_str, |_| true, |sub| {
             let did_deliver = deliver_to_sub_inner(sub, &dst_msg, dst_acct_name);
             if !did_deliver {
                 return;
@@ -717,7 +723,7 @@ pub(crate) fn deliver_cross_account_upstream(
         );
 
         let subs = state.get_subs(route.dst_account_id).read().unwrap();
-        let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
+        let (_count, expired) = subs.for_each_match(&dst_subject_str, |_| true, |sub| {
             if !deliver_to_sub_inner(sub, &dst_msg, dst_acct_name) {
                 return;
             }
