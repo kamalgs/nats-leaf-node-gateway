@@ -93,6 +93,9 @@ pub(crate) enum ConnExt {
         /// Remote cluster's gateway name.
         peer_gateway_name: Option<String>,
     },
+    /// Binary-protocol client: uses the binary wire format for pub/sub/deliver.
+    #[cfg(feature = "binary-client")]
+    BinaryClient,
 }
 
 /// Lightweight tag for dispatch — always compiled, no cfg gates on the enum itself.
@@ -108,6 +111,9 @@ pub(crate) enum ConnKind {
     /// Inbound gateway connection.
     #[cfg(feature = "gateway")]
     Gateway,
+    /// Binary-protocol client connection (`binary-client` feature).
+    #[cfg(feature = "binary-client")]
+    BinaryClient,
 }
 
 impl ConnExt {
@@ -121,6 +127,8 @@ impl ConnExt {
             Self::Route { .. } => ConnKind::Route,
             #[cfg(feature = "gateway")]
             Self::Gateway { .. } => ConnKind::Gateway,
+            #[cfg(feature = "binary-client")]
+            Self::BinaryClient => ConnKind::BinaryClient,
         }
     }
 
@@ -173,6 +181,8 @@ impl ConnExt {
             Self::Route { .. } => "route",
             #[cfg(feature = "gateway")]
             Self::Gateway { .. } => "gateway",
+            #[cfg(feature = "binary-client")]
+            Self::BinaryClient => "binary",
         }
     }
 }

@@ -1373,7 +1373,7 @@ impl MsgBuilder {
     }
 
     /// Build `RMSG $G subject [reply] [hdr_len] total_len\r\npayload\r\n`.
-    #[cfg(any(feature = "mesh", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway", feature = "binary-client"))]
     pub fn build_rmsg(
         &mut self,
         subject: &[u8],

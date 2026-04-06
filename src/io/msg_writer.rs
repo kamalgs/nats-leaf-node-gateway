@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use bytes::{Bytes, BytesMut};
 
 use crate::nats_proto::MsgBuilder;
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 use crate::protocol::bin_proto;
 use crate::types::HeaderMap;
 
 // ── Segment buffer types for zero-copy binary route delivery ──────────────────
 
 /// A single binary message frame using zero-copy subject and payload refs.
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 pub(crate) struct BinMsgFrame {
     /// 9-byte framing header (op + subj_len + repl_len + pay_len).
     pub header: [u8; 9],
@@ -29,7 +29,7 @@ pub(crate) struct BinMsgFrame {
 }
 
 /// A segment in the binary direct buffer.
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 pub(crate) enum BinSeg {
     /// Control frame (sub/unsub, ping/pong): small bytes copied inline.
     Inline(Bytes),
@@ -38,14 +38,14 @@ pub(crate) enum BinSeg {
 }
 
 /// Segment accumulator for binary route connections (zero-copy).
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 pub(crate) struct BinSegBuf {
     pub segs: Vec<BinSeg>,
     /// Running total of logical bytes (for slow-consumer detection).
     pub total_len: usize,
 }
 
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 impl BinSegBuf {
     pub fn new() -> Self {
         BinSegBuf {
@@ -103,7 +103,7 @@ pub(crate) enum DirectBuf {
     /// For client / leaf / gateway connections — bytes are copied.
     Text(BytesMut),
     /// For binary route connections — segment list, zero-copy.
-    #[cfg(feature = "mesh")]
+    #[cfg(any(feature = "mesh", feature = "binary-client"))]
     Binary(BinSegBuf),
 }
 
@@ -111,7 +111,7 @@ impl DirectBuf {
     pub fn is_empty(&self) -> bool {
         match self {
             DirectBuf::Text(b) => b.is_empty(),
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             DirectBuf::Binary(s) => s.is_empty(),
         }
     }
@@ -119,7 +119,7 @@ impl DirectBuf {
     pub fn len(&self) -> usize {
         match self {
             DirectBuf::Text(b) => b.len(),
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             DirectBuf::Binary(s) => s.total_len,
         }
     }
@@ -153,7 +153,7 @@ pub(crate) struct MsgWriter {
     /// Pre-built MsgBuilder for formatting — kept per-writer to avoid allocation.
     msg_builder: Arc<Mutex<MsgBuilder>>,
     /// When true, encode outgoing route frames as binary (open-wire binary protocol).
-    #[cfg(feature = "mesh")]
+    #[cfg(any(feature = "mesh", feature = "binary-client"))]
     binary: bool,
 }
 
@@ -169,7 +169,7 @@ impl MsgWriter {
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             binary: false,
         }
     }
@@ -184,13 +184,13 @@ impl MsgWriter {
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             binary: false,
         }
     }
 
     /// Create a standalone binary-mode MsgWriter (for binary outbound route connections).
-    #[cfg(feature = "mesh")]
+    #[cfg(any(feature = "mesh", feature = "binary-client"))]
     pub(crate) fn new_binary_dummy() -> Self {
         let buf = Arc::new(Mutex::new(DirectBuf::Binary(BinSegBuf::new())));
         let has_pending = Arc::new(AtomicBool::new(false));
@@ -205,7 +205,7 @@ impl MsgWriter {
     }
 
     /// Returns true if this writer encodes frames in binary (open-wire) format.
-    #[cfg(feature = "mesh")]
+    #[cfg(any(feature = "mesh", feature = "binary-client"))]
     pub(crate) fn is_binary(&self) -> bool {
         self.binary
     }
@@ -214,7 +214,7 @@ impl MsgWriter {
     ///
     /// Used to upgrade an inbound route connection's writer to binary mode while
     /// keeping `flush_pending` in the worker pointing at the same shared data.
-    #[cfg(feature = "mesh")]
+    #[cfg(any(feature = "mesh", feature = "binary-client"))]
     pub(crate) fn new_binary_shared(
         buf: Arc<Mutex<DirectBuf>>,
         has_pending: Arc<AtomicBool>,
@@ -229,6 +229,31 @@ impl MsgWriter {
         }
     }
 
+    /// Proportional backpressure: if this connection's direct buffer is above the
+    /// soft HWM (32 MB, half the default max_pending), sleep briefly on the *caller's*
+    /// thread before writing.  This works across worker boundaries — the sleep happens
+    /// in whatever worker is processing the publisher, letting the draining worker
+    /// catch up without any shared mutable state.
+    ///
+    /// The check acquires and immediately releases the buf lock so the draining
+    /// worker can drain freely during the sleep.
+    #[inline]
+    fn backpressure_check(&self) {
+        const HWM: usize = 32 * 1024 * 1024; // 32 MB soft limit
+        const MAX: usize = 64 * 1024 * 1024; // 64 MB hard limit (matches max_pending)
+        let len = self.buf.lock().unwrap().len();
+        if len > HWM {
+            // Linear: 1 µs at HWM, 500 µs at max_pending.
+            // Intentionally small — the sleep is on the caller's worker thread,
+            // and sleeping too long stalls the entire worker event loop.
+            // Primary backpressure is TCP flow control via EPOLLIN suppression
+            // in flush_pending; this provides a secondary soft brake.
+            let congestion = ((len - HWM) as f64 / (MAX - HWM) as f64).min(1.0);
+            let sleep_us = 1 + (congestion * 500.0) as u64;
+            std::thread::sleep(std::time::Duration::from_micros(sleep_us));
+        }
+    }
+
     /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
     pub(crate) fn write_msg(
         &self,
@@ -238,6 +263,7 @@ impl MsgWriter {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) {
+        self.backpressure_check();
         let mut builder = self.msg_builder.lock().unwrap();
         let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
         let mut buf = self.buf.lock().unwrap();
@@ -257,6 +283,7 @@ impl MsgWriter {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) {
+        self.backpressure_check();
         let mut builder = self.msg_builder.lock().unwrap();
         let data = builder.build_lmsg(subject, reply, headers, payload);
         let mut buf = self.buf.lock().unwrap();
@@ -272,7 +299,7 @@ impl MsgWriter {
     /// In binary mode, `subject` and `payload` are stored as zero-copy `Bytes`
     /// segment refs (O(1) clone) rather than being copied, eliminating two memcpy
     /// calls per routed message. Headers are rare and still serialised inline.
-    #[cfg(any(feature = "mesh", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway", feature = "binary-client"))]
     pub(crate) fn write_rmsg(
         &self,
         subject: &Bytes,
@@ -281,7 +308,8 @@ impl MsgWriter {
         payload: &Bytes,
         #[cfg(feature = "accounts")] account: &[u8],
     ) {
-        #[cfg(feature = "mesh")]
+        self.backpressure_check();
+        #[cfg(any(feature = "mesh", feature = "binary-client"))]
         if self.binary {
             let reply_slice = reply.unwrap_or(b"");
             let mut buf = self.buf.lock().unwrap();
@@ -342,7 +370,7 @@ impl MsgWriter {
         queue: Option<&[u8]>,
         #[cfg(feature = "accounts")] account: &[u8],
     ) {
-        #[cfg(feature = "mesh")]
+        #[cfg(any(feature = "mesh", feature = "binary-client"))]
         if self.binary {
             #[cfg(not(feature = "accounts"))]
             let account: &[u8] = b"$G";
@@ -390,7 +418,7 @@ impl MsgWriter {
         queue: Option<&[u8]>,
         #[cfg(feature = "accounts")] account: &[u8],
     ) {
-        #[cfg(feature = "mesh")]
+        #[cfg(any(feature = "mesh", feature = "binary-client"))]
         if self.binary {
             #[cfg(not(feature = "accounts"))]
             let account: &[u8] = b"$G";
@@ -464,7 +492,7 @@ impl MsgWriter {
         }
         match &mut *buf {
             DirectBuf::Text(b) => Some(b.split()),
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             DirectBuf::Binary(seg_buf) => {
                 let mut out = BytesMut::with_capacity(seg_buf.total_len);
                 seg_buf.materialize_into(&mut out);

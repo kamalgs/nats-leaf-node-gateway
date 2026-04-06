@@ -244,6 +244,20 @@ pub(crate) fn deliver_to_sub_inner(
         );
         return true;
     }
+    // Binary-protocol client subscriptions: deliver via binary Msg frame.
+    #[cfg(feature = "binary-client")]
+    if sub.is_binary_client {
+        sub.writer.write_rmsg(
+            &msg.subject,
+            msg.reply.as_deref(),
+            msg.headers,
+            &msg.payload,
+            #[cfg(feature = "accounts")]
+            account_name,
+        );
+        return true;
+    }
+
     sub.writer.write_msg(
         &msg.subject,
         &sub.sid_bytes,
@@ -882,6 +896,8 @@ mod tests {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
             #[cfg(feature = "hub")]

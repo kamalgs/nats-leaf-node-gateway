@@ -168,6 +168,9 @@ pub struct ServerConfig {
     /// Account configurations for multi-tenant isolation.
     #[cfg(feature = "accounts")]
     pub accounts: Vec<AccountConfig>,
+    /// Port for binary-protocol client connections (`binary-client` feature).
+    #[cfg(feature = "binary-client")]
+    pub binary_port: Option<u16>,
 }
 
 impl Default for ServerConfig {
@@ -205,6 +208,8 @@ impl Default for ServerConfig {
             gateway: GatewayConfig::default(),
             #[cfg(feature = "accounts")]
             accounts: Vec::new(),
+            #[cfg(feature = "binary-client")]
+            binary_port: None,
         }
     }
 }
@@ -1315,12 +1320,13 @@ impl ServerState {
             #[cfg(feature = "mesh")]
             route_peers: {
                 let mut known_urls = HashSet::new();
-                // Add own cluster endpoint (use configured host or 127.0.0.1;
-                // never 0.0.0.0 which isn't a routable address for peers).
+                // Seed with own cluster endpoint so peers learn our address via
+                // INFO `connect_urls` gossip (enabling discovery of transitive peers).
+                // Use configured host or 127.0.0.1; never 0.0.0.0 which isn't routable.
                 if let Some(cp) = cluster_port {
                     known_urls.insert(format!("{}:{cp}", cluster_self_host));
                 }
-                // Add all configured seeds
+                // Add configured seeds so they are advertised in our INFO immediately.
                 for seed in &cluster_seeds {
                     known_urls.insert(crate::connector::mesh::normalize_route_url(seed));
                 }
@@ -1671,6 +1677,23 @@ impl Server {
         workers[idx].send_gateway_conn(cid, tcp_stream, addr);
     }
 
+    #[cfg(feature = "binary-client")]
+    fn accept_binary_tcp(
+        &self,
+        tcp_stream: TcpStream,
+        addr: std::net::SocketAddr,
+        workers: &[WorkerHandle],
+        next_worker: &mut usize,
+    ) {
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        let cid = self.state.next_client_id();
+        let idx = *next_worker % workers.len();
+        *next_worker = idx + 1;
+        workers[idx].send_binary_conn(cid, tcp_stream, addr);
+    }
+
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1975,6 +1998,19 @@ impl Server {
             None
         };
 
+        #[cfg(feature = "binary-client")]
+        let binary_listener = if let Some(bin_port) = self.config.binary_port {
+            let bin_addr = format!("{}:{}", self.config.host, bin_port);
+            let bl = TcpListener::bind(&bin_addr)?;
+            bl.set_nonblocking(true)?;
+            info!(addr = %bin_addr, "listening (binary client)");
+            Some(bl)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "binary-client"))]
+        let binary_listener: Option<TcpListener> = None;
+
         let mut pfds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -2007,6 +2043,14 @@ impl Server {
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: binary_listener
+                    .as_ref()
+                    .map(|l| l.as_raw_fd())
+                    .unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
 
         loop {
@@ -2029,7 +2073,8 @@ impl Server {
             pfds[2].revents = 0;
             pfds[3].revents = 0;
             pfds[4].revents = 0;
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, 1000) };
+            pfds[5].revents = 0;
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 6, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -2076,6 +2121,15 @@ impl Server {
                 if let Some(ref gl) = gateway_listener {
                     while let Ok((stream, addr)) = gl.accept() {
                         self.accept_gateway_tcp(stream, addr, &workers, &mut next_worker);
+                    }
+                }
+            }
+
+            #[cfg(feature = "binary-client")]
+            if ret > 0 && pfds[5].revents & libc::POLLIN != 0 {
+                if let Some(ref bl) = binary_listener {
+                    while let Ok((stream, addr)) = bl.accept() {
+                        self.accept_binary_tcp(stream, addr, &workers, &mut next_worker);
                     }
                 }
             }

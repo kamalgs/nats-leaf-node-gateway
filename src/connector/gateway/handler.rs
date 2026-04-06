@@ -133,6 +133,8 @@ impl GatewayHandler {
             #[cfg(feature = "mesh")]
             is_route: false,
             is_gateway: true,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
             #[cfg(feature = "hub")]

@@ -583,6 +583,8 @@ fn handle_route_op(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]
@@ -714,6 +716,8 @@ fn handle_bin_frame(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]

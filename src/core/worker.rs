@@ -42,7 +42,7 @@ use crate::handler::{
 };
 use crate::nats_proto;
 use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 use crate::sub_list::{BinSeg, BinSegBuf};
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
@@ -77,6 +77,13 @@ pub(crate) enum WorkerCmd {
     /// Accept an inbound gateway connection (gateway mode).
     #[cfg(feature = "gateway")]
     NewGatewayConn {
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+    },
+    /// Accept an inbound binary-protocol client connection.
+    #[cfg(feature = "binary-client")]
+    NewBinaryConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
@@ -125,6 +132,13 @@ impl WorkerHandle {
     #[cfg(feature = "gateway")]
     pub fn send_gateway_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewGatewayConn { id, stream, addr });
+        self.wake();
+    }
+
+    /// Send a new binary-protocol client connection to this worker and wake it.
+    #[cfg(feature = "binary-client")]
+    pub fn send_binary_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let _ = self.tx.send(WorkerCmd::NewBinaryConn { id, stream, addr });
         self.wake();
     }
 
@@ -206,6 +220,10 @@ pub(crate) struct Worker {
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
     worker_index: usize,
+    /// True when any connection's pending write buffer exceeds the soft high-water mark.
+    /// While set, EPOLLIN reads are skipped so the OS TCP receive buffer fills up and
+    /// kernel flow control naturally slows the publisher.
+    backpressure_active: bool,
 }
 
 // --- Connection state machine ---
@@ -373,6 +391,7 @@ impl Worker {
                     msgs_delivered_bytes: 0,
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
+                    backpressure_active: false,
                 };
                 worker.run();
             })
@@ -442,7 +461,10 @@ impl Worker {
                         self.remove_conn(conn_id);
                         continue;
                     }
-                    if ev.events & libc::EPOLLIN as u32 != 0 {
+                    // Skip reads when write buffers are congested: this lets the OS
+                    // TCP receive buffer fill up, triggering kernel flow control that
+                    // slows the publisher without any application-level disconnect.
+                    if ev.events & libc::EPOLLIN as u32 != 0 && !self.backpressure_active {
                         self.handle_read(conn_id);
                     }
                     if ev.events & libc::EPOLLOUT as u32 != 0 {
@@ -454,7 +476,16 @@ impl Worker {
             // Flush any pending MsgWriter data after processing all events.
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
+            // Also updates backpressure_active based on current write buffer levels.
             self.flush_pending();
+
+            // When backpressure is active, pause briefly so the OS can drain queued
+            // TCP data to route/subscriber sockets before we accept more from clients.
+            // Without this sleep the event loop spins on level-triggered EPOLLIN events
+            // for connections we are deliberately not reading from.
+            if self.backpressure_active {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
 
             self.flush_metrics();
 
@@ -505,6 +536,10 @@ impl Worker {
                 #[cfg(feature = "gateway")]
                 WorkerCmd::NewGatewayConn { id, stream, addr } => {
                     self.add_gateway_conn(id, stream, addr);
+                }
+                #[cfg(feature = "binary-client")]
+                WorkerCmd::NewBinaryConn { id, stream, addr } => {
+                    self.add_binary_conn(id, stream, addr);
                 }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
@@ -741,6 +776,68 @@ impl Worker {
         );
     }
 
+    /// Create a binary-protocol client connection — no handshake, active immediately.
+    #[cfg(feature = "binary-client")]
+    fn add_binary_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(true).ok();
+        stream.set_nodelay(true).ok();
+        let fd = stream.as_raw_fd();
+
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: id,
+        };
+        let ret = unsafe {
+            libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev)
+        };
+        if ret != 0 {
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for binary client");
+            return;
+        }
+
+        // Binary clients share the same zero-copy segment buffer path as route connections.
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Binary(BinSegBuf::new())));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let direct_writer = MsgWriter::new_binary_shared(
+            Arc::clone(&direct_buf),
+            Arc::clone(&has_pending),
+            Arc::clone(&self.event_fd),
+        );
+
+        let client = ClientState {
+            fd,
+            _stream: stream,
+            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
+            write_buf: BytesMut::new(),
+            direct_writer,
+            direct_buf,
+            has_pending,
+            phase: ConnPhase::Active,
+            transport: Transport::Raw,
+            ext: ConnExt::BinaryClient,
+            #[cfg(feature = "leaf")]
+            upstream_txs: Vec::new(),
+            epoll_has_out: false,
+            echo: false,
+            no_responders: false,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        counter!("binary_connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+        debug!(id, addr = %addr, "accepted binary client connection");
+    }
+
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
             unsafe {
@@ -805,6 +902,9 @@ impl Worker {
     fn flush_pending(&mut self) {
         let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
+        // Tracks the highest congestion level seen this pass (0.0 = at HWM, 1.0 = at max_pending).
+        // Used to apply graduated backpressure after the scan loop.
+        let mut max_congestion: f64 = 0.0;
 
         for (conn_id, client) in &mut self.conns {
             if !client.has_pending.load(Ordering::Acquire) {
@@ -818,7 +918,7 @@ impl Worker {
             enum DrainResult {
                 Empty,
                 FlatBytes(BytesMut),
-                #[cfg(feature = "mesh")]
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
                 Segs {
                     segs: Vec<BinSeg>,
                     total_len: usize,
@@ -831,7 +931,7 @@ impl Worker {
                 } else if matches!(client.transport, Transport::Raw) {
                     match &mut *dbuf {
                         DirectBuf::Text(b) => DrainResult::FlatBytes(b.split()),
-                        #[cfg(feature = "mesh")]
+                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
                         DirectBuf::Binary(seg_buf) => {
                             let total_len = seg_buf.total_len;
                             DrainResult::Segs {
@@ -847,7 +947,7 @@ impl Worker {
                             client.write_buf.extend_from_slice(b);
                             b.clear();
                         }
-                        #[cfg(feature = "mesh")]
+                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
                         DirectBuf::Binary(seg_buf) => {
                             seg_buf.materialize_into(&mut client.write_buf);
                         }
@@ -857,9 +957,9 @@ impl Worker {
             };
             // Materialise DrainResult: text path uses direct_data; binary uses segs_drain.
             let direct_data: BytesMut;
-            #[cfg(feature = "mesh")]
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
             let segs_drain: Option<(Vec<BinSeg>, usize)>;
-            #[cfg(not(feature = "mesh"))]
+            #[cfg(not(any(feature = "mesh", feature = "binary-client")))]
             let segs_drain: Option<(Vec<()>, usize)>;
             match drained {
                 DrainResult::Empty => {
@@ -870,15 +970,19 @@ impl Worker {
                     direct_data = b;
                     segs_drain = None;
                 }
-                #[cfg(feature = "mesh")]
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
                 DrainResult::Segs { segs, total_len } => {
                     direct_data = BytesMut::new();
                     segs_drain = Some((segs, total_len));
                 }
             }
 
-            // Slow consumer detection: if pending data exceeds max_pending,
-            // disconnect the client to protect server memory.
+            // Slow consumer detection and graduated backpressure.
+            //
+            // Hard limit (max_pending): disconnect the connection to protect server memory.
+            // Soft limit (max_pending / 2): start applying a proportional sleep after the
+            // scan loop so the worker stops reading client data, letting kernel TCP flow
+            // control propagate backpressure to the publisher naturally.
             let max_pending = self.state.buf_config.max_pending;
             if max_pending > 0 {
                 let extra = if let Some((_, tl)) = &segs_drain {
@@ -894,6 +998,7 @@ impl Worker {
                 if pending > max_pending {
                     warn!(
                         conn_id = *conn_id,
+                        conn_type = client.ext.kind(),
                         pending_bytes = pending,
                         max = max_pending,
                         "slow consumer, disconnecting"
@@ -906,6 +1011,15 @@ impl Worker {
                         .fetch_add(1, Ordering::Relaxed);
                     to_remove.push(*conn_id);
                     continue;
+                }
+                // Soft high-water mark at 50% of max_pending.
+                let hwm = max_pending / 2;
+                if pending > hwm {
+                    // congestion in [0, 1): 0 = just crossed HWM, 1 = at max_pending.
+                    let congestion = (pending - hwm) as f64 / (max_pending - hwm) as f64;
+                    if congestion > max_congestion {
+                        max_congestion = congestion;
+                    }
                 }
             }
 
@@ -946,7 +1060,7 @@ impl Worker {
             let mut error = false;
             if is_raw {
                 // ── Binary segment path (zero-copy scatter-gather) ──────────
-                #[cfg(feature = "mesh")]
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
                 if let Some((segs, _total_len)) = segs_drain {
                     // Build iovec array: write_buf (if any) + per-segment iovecs.
                     // Each Msg segment contributes up to 4 iovecs; Inline contributes 1.
@@ -1203,6 +1317,12 @@ impl Worker {
             }
         }
 
+        // Update the backpressure flag: suppress EPOLLIN reads on the next event loop
+        // iteration while any connection's write buffer is above the soft HWM.
+        // The event loop adds a 1ms sleep when this is set to avoid spinning and to
+        // give route TCP connections time to drain.
+        self.backpressure_active = max_congestion > 0.0;
+
         for conn_id in to_remove {
             self.remove_conn(conn_id);
         }
@@ -1369,7 +1489,7 @@ impl Worker {
                                 client.write_buf.extend_from_slice(b);
                                 b.clear();
                             }
-                            #[cfg(feature = "mesh")]
+                            #[cfg(any(feature = "mesh", feature = "binary-client"))]
                             DirectBuf::Binary(seg_buf) => {
                                 seg_buf.materialize_into(&mut client.write_buf);
                             }
@@ -2005,6 +2125,30 @@ impl Worker {
                             self.remove_conn(conn_id);
                             return false;
                         }
+                        // Dedup: if an outbound (or earlier inbound) route to this peer
+                        // is already active, drop this connection.  Whichever direction
+                        // arrives first wins; the other is silently closed.  This prevents
+                        // bidirectional seed configs from creating two route connections
+                        // per pair, which would double-deliver every routed message.
+                        let is_duplicate = {
+                            let mut peers = self.state.route_peers.lock().unwrap();
+                            if peers.connected.contains_key(sid.as_str()) {
+                                true
+                            } else {
+                                // Register so subsequent connections from this peer are dropped.
+                                peers.connected.insert(sid.clone(), "inbound".to_string());
+                                false
+                            }
+                        };
+                        if is_duplicate {
+                            debug!(
+                                conn_id,
+                                peer_id = %sid,
+                                "duplicate inbound route, dropping"
+                            );
+                            self.remove_conn(conn_id);
+                            return false;
+                        }
                     }
 
                     let use_binary =
@@ -2049,13 +2193,6 @@ impl Worker {
                         );
                         client.direct_writer = binary_dw;
                     }
-
-                    // Note: we intentionally do NOT register inbound peers
-                    // in route_peers.connected here. The outbound side handles
-                    // its own registration in connect_route(). Having both an
-                    // inbound and outbound route to the same peer is harmless
-                    // (one-hop enforcement prevents message loops) and avoids
-                    // a retry storm when outbound dedup rejects connections.
 
                     let dw = client.direct_writer.clone();
                     self.state
@@ -2332,6 +2469,8 @@ impl Worker {
             }
             #[cfg(feature = "gateway")]
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
+            #[cfg(feature = "binary-client")]
+            ConnKind::BinaryClient => self.process_active_binary_client(conn_id),
             ConnKind::Client => self.process_active_client(conn_id, can_skip),
         }
     }
@@ -2567,6 +2706,167 @@ impl Worker {
             Some(op) => self.dispatch_and_apply::<RouteHandler>(conn_id, op),
             None => true,
         }
+    }
+
+    /// Parse and dispatch frames from a binary-protocol client connection.
+    ///
+    /// - `Msg`: publish to local subscribers (and propagate via routes/gateways/leaf).
+    /// - `Sub`: register a subscription; subject=pattern, reply=queue, payload=SID (u32 LE).
+    /// - `Unsub`: remove a subscription; subject=SID (u32 LE).
+    /// - `Ping`/`Pong`: keepalive.
+    #[cfg(feature = "binary-client")]
+    fn process_active_binary_client(&mut self, conn_id: u64) -> bool {
+        use crate::handler::propagation::propagate_all_interest;
+        use crate::handler::{DeliveryScope, Msg};
+        use crate::nats_proto::sid_to_bytes;
+        use crate::protocol::bin_proto::{self, BinOp};
+        use crate::sub_list::Subscription;
+
+        let frame = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            bin_proto::try_decode(client.read_buf.bytes_mut())
+        };
+        let frame = match frame {
+            Some(f) => f,
+            None => return false,
+        };
+
+        match frame.op {
+            BinOp::Ping => {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                bin_proto::write_pong(&mut client.write_buf);
+                return true;
+            }
+            BinOp::Pong => return true,
+            BinOp::Msg | BinOp::HMsg => {
+                let reply = if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(frame.reply)
+                };
+                let msg = Msg::new(frame.subject, reply, None, frame.payload);
+                let (_, expired) = {
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let conn_ctx = client.conn_ctx(conn_id);
+                    let mut wctx = MessageDeliveryHub {
+                        state: &self.state,
+                        event_fd: self.event_fd.as_raw_fd(),
+                        pending_notify: &mut self.pending_notify,
+                        pending_notify_count: &mut self.pending_notify_count,
+                        msgs_received: &mut self.msgs_received,
+                        msgs_received_bytes: &mut self.msgs_received_bytes,
+                        msgs_delivered: &mut self.msgs_delivered,
+                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                        worker_label: &self.worker_label,
+                        #[cfg(feature = "worker-affinity")]
+                        worker_index: self.worker_index,
+                    };
+                    *wctx.msgs_received += 1;
+                    *wctx.msgs_received_bytes += msg.payload.len() as u64;
+                    wctx.publish(
+                        &msg,
+                        conn_ctx.conn_id,
+                        &DeliveryScope::local(false),
+                        #[cfg(feature = "accounts")]
+                        conn_ctx.account_id,
+                    )
+                };
+                self.apply_result(conn_id, crate::handler::HandleResult::Ok, expired);
+            }
+            BinOp::Sub => {
+                // subject=pattern, reply=queue, payload=SID as u32 LE (4 bytes)
+                let sid = if frame.payload.len() >= 4 {
+                    u32::from_le_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]) as u64
+                } else {
+                    return true; // malformed, ignore
+                };
+                let subject_str = unsafe { std::str::from_utf8_unchecked(&frame.subject) };
+                let queue_str = if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(unsafe { std::str::from_utf8_unchecked(&frame.reply) }.to_string())
+                };
+
+                let writer = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.direct_writer.clone())
+                    .unwrap();
+                let sub = Subscription {
+                    conn_id,
+                    sid,
+                    sid_bytes: sid_to_bytes(sid),
+                    subject: subject_str.to_string(),
+                    queue: queue_str,
+                    writer,
+                    max_msgs: std::sync::atomic::AtomicU64::new(0),
+                    delivered: std::sync::atomic::AtomicU64::new(0),
+                    is_leaf: false,
+                    #[cfg(feature = "mesh")]
+                    is_route: false,
+                    #[cfg(feature = "gateway")]
+                    is_gateway: false,
+                    #[cfg(feature = "binary-client")]
+                    is_binary_client: true,
+                    #[cfg(feature = "accounts")]
+                    account_id: 0,
+                    #[cfg(feature = "hub")]
+                    leaf_perms: None,
+                };
+                {
+                    let mut subs = self.state.get_subs(
+                        #[cfg(feature = "accounts")]
+                        0,
+                    ).write().unwrap();
+                    subs.insert(sub);
+                    self.state.has_subs.store(true, Ordering::Relaxed);
+                }
+                if let Some(c) = self.conns.get_mut(&conn_id) {
+                    c.sub_count += 1;
+                }
+                propagate_all_interest(
+                    &self.state,
+                    frame.subject.as_ref(),
+                    if frame.reply.is_empty() { None } else { Some(frame.reply.as_ref()) },
+                    true,
+                    #[cfg(feature = "accounts")]
+                    b"$G",
+                );
+            }
+            BinOp::Unsub => {
+                // subject=SID as u32 LE (4 bytes)
+                let sid = if frame.subject.len() >= 4 {
+                    u32::from_le_bytes([
+                        frame.subject[0],
+                        frame.subject[1],
+                        frame.subject[2],
+                        frame.subject[3],
+                    ]) as u64
+                } else {
+                    return true;
+                };
+                let removed = {
+                    let mut subs = self.state.get_subs(
+                        #[cfg(feature = "accounts")]
+                        0,
+                    ).write().unwrap();
+                    let r = subs.remove(conn_id, sid);
+                    self.state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+                    r
+                };
+                if removed.is_some() {
+                    if let Some(c) = self.conns.get_mut(&conn_id) {
+                        c.sub_count = c.sub_count.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        true
     }
 }
 

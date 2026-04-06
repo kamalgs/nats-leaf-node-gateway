@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use bytes::Bytes;
 
 pub(crate) use crate::msg_writer::{create_eventfd, DirectBuf, MsgWriter};
-#[cfg(feature = "mesh")]
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
 pub(crate) use crate::msg_writer::{BinSeg, BinSegBuf};
 
 /// Backward-compatible alias for `MsgWriter`.
@@ -36,6 +36,9 @@ pub struct Subscription {
     /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
     #[cfg(feature = "gateway")]
     pub is_gateway: bool,
+    /// True for binary-protocol client subscriptions (deliver via binary RMSG).
+    #[cfg(feature = "binary-client")]
+    pub is_binary_client: bool,
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     pub account_id: crate::core::server::AccountId,
@@ -61,6 +64,8 @@ impl Clone for Subscription {
             is_route: self.is_route,
             #[cfg(feature = "gateway")]
             is_gateway: self.is_gateway,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: self.is_binary_client,
             #[cfg(feature = "accounts")]
             account_id: self.account_id,
             #[cfg(feature = "hub")]
@@ -88,6 +93,8 @@ impl Subscription {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
             #[cfg(feature = "hub")]

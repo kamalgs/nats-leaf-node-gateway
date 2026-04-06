@@ -164,6 +164,8 @@ impl RouteHandler {
             is_route: true,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id,
             #[cfg(feature = "hub")]
