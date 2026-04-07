@@ -150,11 +150,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
                 .as_bytes();
             let subs = account_sub.read().unwrap();
             for (subject, queue) in subs.local_interests() {
-                writer.write_route_sub(
-                    subject.as_bytes(),
-                    queue.map(|q| q.as_bytes()),
-                    acct,
-                );
+                writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()), acct);
             }
         }
     }
@@ -162,10 +158,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
     {
         let subs = state.subs.read().unwrap();
         for (subject, queue) in subs.local_interests() {
-            writer.write_route_sub(
-                subject.as_bytes(),
-                queue.map(|q| q.as_bytes()),
-            );
+            writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()));
         }
     }
     writer.notify();

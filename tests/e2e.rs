@@ -97,7 +97,10 @@ impl NatsServer {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to start nats-server at {}: {}", bin, e));
 
-        let server = NatsServer { child, port: client_port };
+        let server = NatsServer {
+            child,
+            port: client_port,
+        };
         server.wait_ready();
         server
     }

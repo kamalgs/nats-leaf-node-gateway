@@ -386,10 +386,11 @@ fn connect_route(
     // RMSG/RS+ data to the TCP socket.
     let writer_dw = direct_writer.clone();
     let writer_shutdown = Arc::clone(shutdown);
+    let max_pending_route = state.buf_config.max_pending_route;
     let writer_handle = std::thread::Builder::new()
         .name(format!("route-writer-{}", conn_id))
         .spawn(move || {
-            run_route_writer(tcp_writer, writer_dw, writer_shutdown);
+            run_route_writer(tcp_writer, writer_dw, writer_shutdown, max_pending_route);
         })
         .expect("failed to spawn route writer");
 
@@ -443,7 +444,22 @@ fn connect_route(
 }
 
 /// Writer thread: waits on MsgWriter's eventfd and flushes buffered data to TCP.
-fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
+///
+/// Sets the route's congestion level after each drain cycle so publishers on
+/// other workers can reduce their read budget (non-blocking backpressure).
+/// A 2-second write deadline matches Go nats-server's default; on timeout
+/// the congestion level is set to maximum but the route is not disconnected
+/// immediately — only when the buffer exceeds `max_pending_route`.
+fn run_route_writer(
+    tcp: TcpStream,
+    dw: MsgWriter,
+    shutdown: Arc<AtomicBool>,
+    max_pending_route: usize,
+) {
+    // 2-second write deadline, matching Go nats-server.
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
+
     let efd = dw.event_raw_fd();
     let mut pfds = [libc::pollfd {
         fd: efd,
@@ -458,6 +474,7 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();
             }
+            dw.set_congestion(0);
             return;
         }
 
@@ -481,14 +498,45 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
 
         if let Some(data) = dw.drain() {
             if let Err(e) = tcp_out.write_all(&data) {
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                    // Write deadline expired — signal heavy congestion but keep trying.
+                    dw.set_congestion(2);
+                    warn!("route writer stalled (write deadline exceeded)");
+                    continue;
+                }
                 debug!(error = %e, "route writer TCP error");
                 return;
             }
             if let Err(e) = tcp_out.flush() {
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                    dw.set_congestion(2);
+                    warn!("route writer flush stalled (write deadline exceeded)");
+                    continue;
+                }
                 debug!(error = %e, "route writer flush error");
                 return;
             }
         }
+
+        // Update congestion level based on remaining buffer after flush.
+        let buf_len = dw.buf_len();
+        if buf_len > max_pending_route {
+            warn!(
+                pending_bytes = buf_len,
+                max = max_pending_route,
+                "route writer slow consumer, disconnecting"
+            );
+            return;
+        }
+        let ratio = buf_len as f64 / max_pending_route as f64;
+        let level = if ratio < 0.25 {
+            0
+        } else if ratio < 0.75 {
+            1
+        } else {
+            2
+        };
+        dw.set_congestion(level);
     }
 }
 
@@ -583,8 +631,8 @@ fn handle_route_op(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
-            #[cfg(feature = "binary-client")]
-            is_binary_client: false,
+                #[cfg(feature = "binary-client")]
+                is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]
@@ -716,8 +764,8 @@ fn handle_bin_frame(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
-            #[cfg(feature = "binary-client")]
-            is_binary_client: false,
+                #[cfg(feature = "binary-client")]
+                is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]

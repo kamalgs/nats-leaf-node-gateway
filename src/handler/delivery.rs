@@ -40,6 +40,10 @@ pub(crate) struct MessageDeliveryHub<'a> {
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
     pub worker_index: usize,
+    /// Set to true when a delivery hits a congested route MsgWriter.
+    /// The worker reads this after processing a client's PUBs to reduce
+    /// that client's read budget (non-blocking TCP flow control).
+    pub route_congested: bool,
 }
 
 impl MessageDeliveryHub<'_> {
@@ -392,6 +396,11 @@ pub(crate) fn deliver_to_subs(
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
+            // Signal route congestion so the worker can reduce this client's read budget.
+            #[cfg(feature = "mesh")]
+            if sub.is_route && sub.writer.congestion() >= 1 {
+                wctx.route_congested = true;
+            }
         },
     );
     drop(subs);
@@ -1333,6 +1342,7 @@ mod tests {
             worker_label: "test",
             #[cfg(feature = "worker-affinity")]
             worker_index: 0,
+            route_congested: false,
         };
 
         let msg = Msg::new(

@@ -1459,6 +1459,7 @@ impl Server {
             max_read_buf: config.max_read_buf_capacity,
             write_buf: config.write_buf_capacity,
             max_pending: config.limits.max_pending,
+            ..Default::default()
         };
 
         let auth = config.client_auth.clone();

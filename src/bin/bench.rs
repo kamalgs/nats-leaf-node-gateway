@@ -103,10 +103,16 @@ impl FrameReader {
                 self.buf.resize(self.buf.len() * 2, 0);
             }
             match self.stream.read(&mut self.buf[self.filled..]) {
-                Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    ))
+                }
                 Ok(n) => self.filled += n,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                       || e.kind() == io::ErrorKind::TimedOut =>
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
                 {
                     return Err(e);
                 }
@@ -121,8 +127,10 @@ impl FrameReader {
     fn next_frame_size(&mut self) -> io::Result<Option<(u8, usize)>> {
         self.fill_to(HEADER_LEN)?;
         let op = self.buf[self.pos];
-        let subj_len = u16::from_le_bytes([self.buf[self.pos + 1], self.buf[self.pos + 2]]) as usize;
-        let repl_len = u16::from_le_bytes([self.buf[self.pos + 3], self.buf[self.pos + 4]]) as usize;
+        let subj_len =
+            u16::from_le_bytes([self.buf[self.pos + 1], self.buf[self.pos + 2]]) as usize;
+        let repl_len =
+            u16::from_le_bytes([self.buf[self.pos + 3], self.buf[self.pos + 4]]) as usize;
         let pay_len = u32::from_le_bytes([
             self.buf[self.pos + 5],
             self.buf[self.pos + 6],
@@ -159,7 +167,8 @@ fn run_publisher(
     let subj = subject.as_bytes();
     // Pre-build a batch of frames to amortize syscall overhead.
     const BATCH: usize = 64;
-    let mut batch_buf: Vec<u8> = Vec::with_capacity((HEADER_LEN + subj.len() + payload_size) * BATCH);
+    let mut batch_buf: Vec<u8> =
+        Vec::with_capacity((HEADER_LEN + subj.len() + payload_size) * BATCH);
 
     let mut local_msgs = 0u64;
     let mut local_bytes = 0u64;
@@ -176,7 +185,7 @@ fn run_publisher(
         local_bytes += batch_buf.len() as u64;
 
         // Periodically flush counters to shared atomics.
-        if local_msgs % (BATCH as u64 * 16) == 0 {
+        if local_msgs.is_multiple_of(BATCH as u64 * 16) {
             msgs_sent.fetch_add(local_msgs, Ordering::Relaxed);
             bytes_sent.fetch_add(local_bytes, Ordering::Relaxed);
             local_msgs = 0;
@@ -206,7 +215,9 @@ fn run_subscriber(
     stream.set_nodelay(true).ok();
     // Short read timeout so the receive loop can wake up and check the stop flag
     // after the publisher finishes, rather than blocking on the next frame forever.
-    stream.set_read_timeout(Some(Duration::from_millis(100))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok();
 
     // Send Sub frame: subject=pattern, reply=queue(empty), payload=SID u32 LE.
     let mut out = Vec::new();
@@ -232,7 +243,7 @@ fn run_subscriber(
             Ok(Some((0x03 | 0x04, pay_len))) => {
                 local_msgs += 1;
                 local_bytes += pay_len as u64;
-                if local_msgs % 1024 == 0 {
+                if local_msgs.is_multiple_of(1024) {
                     msgs_recv.fetch_add(local_msgs, Ordering::Relaxed);
                     bytes_recv.fetch_add(local_bytes, Ordering::Relaxed);
                     local_msgs = 0;
@@ -241,8 +252,9 @@ fn run_subscriber(
             }
             Ok(Some(_)) => {} // Pong or unknown, skip
             Ok(None) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                   || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 // Read timeout — loop back and check stop flag.
             }
             Err(_) => break,
@@ -280,14 +292,36 @@ impl Args {
 
         while let Some(key) = args.next() {
             match key.as_str() {
-                "--addr"     => addr     = args.next().expect("--addr requires a value"),
+                "--addr" => addr = args.next().expect("--addr requires a value"),
                 "--pub-addr" => pub_addr = args.next().expect("--pub-addr requires a value"),
                 "--sub-addr" => sub_addr = args.next().expect("--sub-addr requires a value"),
-                "--pub" => n_pub = args.next().expect("--pub requires a value").parse().unwrap(),
-                "--sub" => n_sub = args.next().expect("--sub requires a value").parse().unwrap(),
-                "--size" => size = args.next().expect("--size requires a value").parse().unwrap(),
+                "--pub" => {
+                    n_pub = args
+                        .next()
+                        .expect("--pub requires a value")
+                        .parse()
+                        .unwrap()
+                }
+                "--sub" => {
+                    n_sub = args
+                        .next()
+                        .expect("--sub requires a value")
+                        .parse()
+                        .unwrap()
+                }
+                "--size" => {
+                    size = args
+                        .next()
+                        .expect("--size requires a value")
+                        .parse()
+                        .unwrap()
+                }
                 "--duration" => {
-                    duration = args.next().expect("--duration requires a value").parse().unwrap()
+                    duration = args
+                        .next()
+                        .expect("--duration requires a value")
+                        .parse()
+                        .unwrap()
                 }
                 "--subject" => subject = args.next().expect("--subject requires a value"),
                 other => {
@@ -298,10 +332,22 @@ impl Args {
         }
 
         // --addr sets both unless overridden individually.
-        if pub_addr.is_empty() { pub_addr = addr.clone(); }
-        if sub_addr.is_empty() { sub_addr = addr; }
+        if pub_addr.is_empty() {
+            pub_addr = addr.clone();
+        }
+        if sub_addr.is_empty() {
+            sub_addr = addr;
+        }
 
-        Args { pub_addr, sub_addr, n_pub, n_sub, size, duration, subject }
+        Args {
+            pub_addr,
+            sub_addr,
+            n_pub,
+            n_sub,
+            size,
+            duration,
+            subject,
+        }
     }
 }
 

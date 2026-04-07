@@ -220,10 +220,6 @@ pub(crate) struct Worker {
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
     worker_index: usize,
-    /// True when any connection's pending write buffer exceeds the soft high-water mark.
-    /// While set, EPOLLIN reads are skipped so the OS TCP receive buffer fills up and
-    /// kernel flow control naturally slows the publisher.
-    backpressure_active: bool,
 }
 
 // --- Connection state machine ---
@@ -301,6 +297,10 @@ pub(crate) struct ClientState {
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     account_id: crate::core::server::AccountId,
+    /// Maximum bytes to read per EPOLLIN event. Shrinks when this client publishes
+    /// to a congested route (TCP flow control throttles the publisher naturally).
+    /// `usize::MAX` means unlimited (default).
+    read_budget: usize,
 }
 
 impl ClientState {
@@ -391,7 +391,6 @@ impl Worker {
                     msgs_delivered_bytes: 0,
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
-                    backpressure_active: false,
                 };
                 worker.run();
             })
@@ -461,10 +460,7 @@ impl Worker {
                         self.remove_conn(conn_id);
                         continue;
                     }
-                    // Skip reads when write buffers are congested: this lets the OS
-                    // TCP receive buffer fill up, triggering kernel flow control that
-                    // slows the publisher without any application-level disconnect.
-                    if ev.events & libc::EPOLLIN as u32 != 0 && !self.backpressure_active {
+                    if ev.events & libc::EPOLLIN as u32 != 0 {
                         self.handle_read(conn_id);
                     }
                     if ev.events & libc::EPOLLOUT as u32 != 0 {
@@ -476,16 +472,7 @@ impl Worker {
             // Flush any pending MsgWriter data after processing all events.
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
-            // Also updates backpressure_active based on current write buffer levels.
             self.flush_pending();
-
-            // When backpressure is active, pause briefly so the OS can drain queued
-            // TCP data to route/subscriber sockets before we accept more from clients.
-            // Without this sleep the event loop spins on level-triggered EPOLLIN events
-            // for connections we are deliberately not reading from.
-            if self.backpressure_active {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
 
             self.flush_metrics();
 
@@ -632,6 +619,7 @@ impl Worker {
             permissions: None,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            read_budget: usize::MAX,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -713,6 +701,7 @@ impl Worker {
             permissions: None,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            read_budget: usize::MAX,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -787,9 +776,8 @@ impl Worker {
             events: libc::EPOLLIN as u32,
             u64: id,
         };
-        let ret = unsafe {
-            libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev)
-        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
         if ret != 0 {
             warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for binary client");
             return;
@@ -827,6 +815,7 @@ impl Worker {
             permissions: None,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            read_budget: usize::MAX,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -983,8 +972,13 @@ impl Worker {
             // Soft limit (max_pending / 2): start applying a proportional sleep after the
             // scan loop so the worker stops reading client data, letting kernel TCP flow
             // control propagate backpressure to the publisher naturally.
-            let max_pending = self.state.buf_config.max_pending;
-            if max_pending > 0 {
+            let is_route = client.ext.is_route();
+            let max_pend = if is_route {
+                self.state.buf_config.max_pending_route
+            } else {
+                self.state.buf_config.max_pending
+            };
+            if max_pend > 0 {
                 let extra = if let Some((_, tl)) = &segs_drain {
                     *tl
                 } else {
@@ -995,12 +989,12 @@ impl Worker {
                     Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
                     Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
                 };
-                if pending > max_pending {
+                if pending > max_pend {
                     warn!(
                         conn_id = *conn_id,
                         conn_type = client.ext.kind(),
                         pending_bytes = pending,
-                        max = max_pending,
+                        max = max_pend,
                         "slow consumer, disconnecting"
                     );
                     counter!("slow_consumers_total", "worker" => self.worker_label.clone())
@@ -1012,11 +1006,22 @@ impl Worker {
                     to_remove.push(*conn_id);
                     continue;
                 }
-                // Soft high-water mark at 50% of max_pending.
-                let hwm = max_pending / 2;
+                // Update route congestion level for cross-worker backpressure.
+                if is_route {
+                    let ratio = pending as f64 / max_pend as f64;
+                    let level = if ratio < 0.25 {
+                        0
+                    } else if ratio < 0.75 {
+                        1
+                    } else {
+                        2
+                    };
+                    client.direct_writer.set_congestion(level);
+                }
+                // Track max congestion across all connections (for metrics).
+                let hwm = max_pend / 2;
                 if pending > hwm {
-                    // congestion in [0, 1): 0 = just crossed HWM, 1 = at max_pending.
-                    let congestion = (pending - hwm) as f64 / (max_pending - hwm) as f64;
+                    let congestion = (pending - hwm) as f64 / (max_pend - hwm) as f64;
                     if congestion > max_congestion {
                         max_congestion = congestion;
                     }
@@ -1317,12 +1322,6 @@ impl Worker {
             }
         }
 
-        // Update the backpressure flag: suppress EPOLLIN reads on the next event loop
-        // iteration while any connection's write buffer is above the soft HWM.
-        // The event loop adds a 1ms sleep when this is set to avoid spinning and to
-        // give route TCP connections time to drain.
-        self.backpressure_active = max_congestion > 0.0;
-
         for conn_id in to_remove {
             self.remove_conn(conn_id);
         }
@@ -1604,18 +1603,26 @@ impl Worker {
 
     fn handle_read_raw(&mut self, conn_id: u64) {
         let mut got_eof = false;
+        let mut total_read = 0usize;
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
                 None => return,
             };
-            match client.read_buf.read_from_fd(client.fd) {
+            let budget = client.read_budget;
+            // Cap total bytes read across all iterations of this loop.
+            let remaining = budget.saturating_sub(total_read);
+            if remaining == 0 {
+                break;
+            }
+            match client.read_buf.read_from_fd(client.fd, remaining) {
                 Ok(0) => {
                     got_eof = true;
                     break;
                 }
                 Ok(n) => {
                     client.read_buf.after_read(n);
+                    total_read += n;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => {
@@ -1648,7 +1655,7 @@ impl Worker {
                     Some(c) => c,
                     None => return,
                 };
-                match client.read_buf.read_from_fd(client.fd) {
+                match client.read_buf.read_from_fd(client.fd, usize::MAX) {
                     Ok(0) => {
                         self.remove_conn(conn_id);
                         return;
@@ -2535,7 +2542,7 @@ impl Worker {
 
     /// Dispatch a parsed op through its handler, then apply the result.
     fn dispatch_and_apply<H: ConnectionHandler>(&mut self, conn_id: u64, op: H::Op) -> bool {
-        let (result, expired) = {
+        let (result, expired, congested) = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             let mut conn_ctx = client.conn_ctx(conn_id);
             let mut worker_ctx = MessageDeliveryHub {
@@ -2550,10 +2557,44 @@ impl Worker {
                 worker_label: &self.worker_label,
                 #[cfg(feature = "worker-affinity")]
                 worker_index: self.worker_index,
+                route_congested: false,
             };
-            H::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+            let (result, expired) = H::handle_op(&mut conn_ctx, &mut worker_ctx, op);
+            (result, expired, worker_ctx.route_congested)
         };
-        self.apply_result(conn_id, result, expired)
+        self.adjust_read_budget(conn_id, congested);
+        let cont = self.apply_result(conn_id, result, expired);
+        // Stop processing more ops from this client when a route is congested.
+        // Remaining data stays in the read buffer; the next event loop iteration
+        // will resume parsing with the reduced read budget in effect.
+        if congested {
+            return false;
+        }
+        cont
+    }
+
+    /// Adjust a connection's read budget based on route congestion.
+    ///
+    /// When a publish hits a congested route, shrink the budget so less data
+    /// is read from this client on the next EPOLLIN. The kernel TCP receive
+    /// buffer fills up, TCP flow control kicks in, and the publisher slows
+    /// down — all without blocking the worker event loop.
+    #[inline]
+    fn adjust_read_budget(&mut self, conn_id: u64, route_congested: bool) {
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if route_congested {
+                // On first congestion, snap from unlimited to a concrete cap.
+                // Then halve on each subsequent congestion signal.
+                if client.read_budget > 65536 {
+                    client.read_budget = 65536;
+                } else {
+                    client.read_budget = (client.read_budget / 2).max(256);
+                }
+            } else if client.read_budget < usize::MAX {
+                // Double toward unlimited when congestion clears.
+                client.read_budget = client.read_budget.saturating_mul(2);
+            }
+        }
     }
 
     /// Handle expired subs cleanup and flush/disconnect from a `HandleResult`.
@@ -2745,7 +2786,7 @@ impl Worker {
                     Some(frame.reply)
                 };
                 let msg = Msg::new(frame.subject, reply, None, frame.payload);
-                let (_, expired) = {
+                let (expired, congested) = {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     let conn_ctx = client.conn_ctx(conn_id);
                     let mut wctx = MessageDeliveryHub {
@@ -2760,18 +2801,29 @@ impl Worker {
                         worker_label: &self.worker_label,
                         #[cfg(feature = "worker-affinity")]
                         worker_index: self.worker_index,
+                        route_congested: false,
                     };
                     *wctx.msgs_received += 1;
                     *wctx.msgs_received_bytes += msg.payload.len() as u64;
-                    wctx.publish(
+                    let (_, expired) = wctx.publish(
                         &msg,
                         conn_ctx.conn_id,
                         &DeliveryScope::local(false),
                         #[cfg(feature = "accounts")]
                         conn_ctx.account_id,
-                    )
+                    );
+                    let congested = wctx.route_congested;
+                    (expired, congested)
                 };
+                self.adjust_read_budget(conn_id, congested);
                 self.apply_result(conn_id, crate::handler::HandleResult::Ok, expired);
+                // Stop processing more frames from this client when a route is
+                // congested — remaining data stays in the read buffer and will be
+                // processed on the next event loop iteration, giving the route
+                // writer time to drain.
+                if congested {
+                    return false;
+                }
             }
             BinOp::Sub => {
                 // subject=pattern, reply=queue, payload=SID as u32 LE (4 bytes)
@@ -2819,10 +2871,14 @@ impl Worker {
                     leaf_perms: None,
                 };
                 {
-                    let mut subs = self.state.get_subs(
-                        #[cfg(feature = "accounts")]
-                        0,
-                    ).write().unwrap();
+                    let mut subs = self
+                        .state
+                        .get_subs(
+                            #[cfg(feature = "accounts")]
+                            0,
+                        )
+                        .write()
+                        .unwrap();
                     subs.insert(sub);
                     self.state.has_subs.store(true, Ordering::Relaxed);
                 }
@@ -2832,7 +2888,11 @@ impl Worker {
                 propagate_all_interest(
                     &self.state,
                     frame.subject.as_ref(),
-                    if frame.reply.is_empty() { None } else { Some(frame.reply.as_ref()) },
+                    if frame.reply.is_empty() {
+                        None
+                    } else {
+                        Some(frame.reply.as_ref())
+                    },
                     true,
                     #[cfg(feature = "accounts")]
                     b"$G",
@@ -2851,12 +2911,18 @@ impl Worker {
                     return true;
                 };
                 let removed = {
-                    let mut subs = self.state.get_subs(
-                        #[cfg(feature = "accounts")]
-                        0,
-                    ).write().unwrap();
+                    let mut subs = self
+                        .state
+                        .get_subs(
+                            #[cfg(feature = "accounts")]
+                            0,
+                        )
+                        .write()
+                        .unwrap();
                     let r = subs.remove(conn_id, sid);
-                    self.state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+                    self.state
+                        .has_subs
+                        .store(!subs.is_empty(), Ordering::Relaxed);
                     r
                 };
                 if removed.is_some() {

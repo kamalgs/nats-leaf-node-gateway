@@ -44,6 +44,10 @@ pub(crate) struct BufConfig {
     /// Maximum pending write bytes per connection before disconnecting as slow consumer.
     /// 0 means unlimited.
     pub max_pending: usize,
+    /// Maximum pending write bytes for route connections before disconnecting.
+    /// Routes aggregate traffic from many publishers and need more headroom than
+    /// individual client connections.
+    pub max_pending_route: usize,
 }
 
 impl Default for BufConfig {
@@ -52,6 +56,7 @@ impl Default for BufConfig {
             max_read_buf: DEFAULT_MAX_BUF,
             write_buf: DEFAULT_MAX_BUF,
             max_pending: 64 * 1024 * 1024,
+            max_pending_route: 128 * 1024 * 1024,
         }
     }
 }
@@ -210,13 +215,18 @@ impl AdaptiveBuf {
     }
 
     /// Read from a raw fd into the buffer's spare capacity (non-blocking).
-    /// Uses libc::read directly for non-blocking socket I/O.
-    pub(crate) fn read_from_fd(&mut self, fd: RawFd) -> io::Result<usize> {
+    ///
+    /// `max_read` caps the number of bytes read in a single syscall. When
+    /// `usize::MAX`, the full spare capacity is used (no overhead). A smaller
+    /// value lets the kernel TCP receive buffer fill up, triggering TCP flow
+    /// control that naturally throttles the sender.
+    pub(crate) fn read_from_fd(&mut self, fd: RawFd, max_read: usize) -> io::Result<usize> {
         if self.buf.remaining_mut() == 0 {
             self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
         }
         let chunk = self.buf.chunk_mut();
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        let len = chunk.len().min(max_read);
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, len) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

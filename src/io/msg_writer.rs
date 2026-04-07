@@ -5,7 +5,7 @@
 //! notified via a shared eventfd to flush the buffer to TCP.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -155,6 +155,10 @@ pub(crate) struct MsgWriter {
     /// When true, encode outgoing route frames as binary (open-wire binary protocol).
     #[cfg(any(feature = "mesh", feature = "binary-client"))]
     binary: bool,
+    /// Cross-worker congestion signal set by the drainer (route writer thread or
+    /// flush_pending), read by publishers before writing.
+    /// 0 = clear, 1 = soft (25-75%), 2 = hard (>75%).
+    congestion: Arc<AtomicU8>,
 }
 
 impl MsgWriter {
@@ -171,6 +175,7 @@ impl MsgWriter {
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             #[cfg(any(feature = "mesh", feature = "binary-client"))]
             binary: false,
+            congestion: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -186,6 +191,7 @@ impl MsgWriter {
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             #[cfg(any(feature = "mesh", feature = "binary-client"))]
             binary: false,
+            congestion: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -201,6 +207,7 @@ impl MsgWriter {
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             binary: true,
+            congestion: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -226,32 +233,43 @@ impl MsgWriter {
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             binary: true,
+            congestion: Arc::new(AtomicU8::new(0)),
         }
     }
 
-    /// Proportional backpressure: if this connection's direct buffer is above the
-    /// soft HWM (32 MB, half the default max_pending), sleep briefly on the *caller's*
-    /// thread before writing.  This works across worker boundaries — the sleep happens
-    /// in whatever worker is processing the publisher, letting the draining worker
-    /// catch up without any shared mutable state.
+    /// Proportional backpressure for client/leaf connections: if buffer is above
+    /// the soft HWM, sleep briefly on the caller's thread.
     ///
-    /// The check acquires and immediately releases the buf lock so the draining
-    /// worker can drain freely during the sleep.
+    /// Route connections use a different mechanism (per-connection read budget via
+    /// the `congestion` atomic) so this is only called from `write_msg`/`write_lmsg`.
     #[inline]
     fn backpressure_check(&self) {
-        const HWM: usize = 32 * 1024 * 1024; // 32 MB soft limit
-        const MAX: usize = 64 * 1024 * 1024; // 64 MB hard limit (matches max_pending)
+        const HWM: usize = 32 * 1024 * 1024;
+        const MAX: usize = 64 * 1024 * 1024;
         let len = self.buf.lock().unwrap().len();
         if len > HWM {
-            // Linear: 1 µs at HWM, 500 µs at max_pending.
-            // Intentionally small — the sleep is on the caller's worker thread,
-            // and sleeping too long stalls the entire worker event loop.
-            // Primary backpressure is TCP flow control via EPOLLIN suppression
-            // in flush_pending; this provides a secondary soft brake.
             let congestion = ((len - HWM) as f64 / (MAX - HWM) as f64).min(1.0);
             let sleep_us = 1 + (congestion * 500.0) as u64;
             std::thread::sleep(std::time::Duration::from_micros(sleep_us));
         }
+    }
+
+    /// Current congestion level (0=clear, 1=soft, 2=hard).
+    /// Lock-free read — safe to call from any worker thread.
+    #[inline]
+    pub(crate) fn congestion(&self) -> u8 {
+        self.congestion.load(Ordering::Relaxed)
+    }
+
+    /// Set the congestion level (called by the drainer after each flush cycle).
+    #[inline]
+    pub(crate) fn set_congestion(&self, level: u8) {
+        self.congestion.store(level, Ordering::Relaxed);
+    }
+
+    /// Current buffer length (acquires the lock briefly).
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf.lock().unwrap().len()
     }
 
     /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
@@ -299,6 +317,10 @@ impl MsgWriter {
     /// In binary mode, `subject` and `payload` are stored as zero-copy `Bytes`
     /// segment refs (O(1) clone) rather than being copied, eliminating two memcpy
     /// calls per routed message. Headers are rare and still serialised inline.
+    /// Format and append an RMSG to the shared buffer (for route/gateway delivery).
+    ///
+    /// No sleep-based backpressure here — route congestion is handled by the
+    /// per-connection read budget in the worker event loop (non-blocking).
     #[cfg(any(feature = "mesh", feature = "gateway", feature = "binary-client"))]
     pub(crate) fn write_rmsg(
         &self,
@@ -308,7 +330,6 @@ impl MsgWriter {
         payload: &Bytes,
         #[cfg(feature = "accounts")] account: &[u8],
     ) {
-        self.backpressure_check();
         #[cfg(any(feature = "mesh", feature = "binary-client"))]
         if self.binary {
             let reply_slice = reply.unwrap_or(b"");

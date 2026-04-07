@@ -5,6 +5,51 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-07 — Non-blocking route backpressure via per-connection read budget (full 11-scenario run)
+
+**Changes since last benchmark:**
+- **Per-connection read budget**: When a publisher writes to a congested route, its read
+  budget shrinks (AIMD: snap to 64KB on first congestion, halve thereafter, min 256B).
+  Smaller budget → less data read from socket → kernel TCP recv buffer fills → TCP flow
+  control throttles the publisher. Non-blocking: no sleeps, no condvars on the worker thread.
+- **AtomicU8 congestion signal** on each route MsgWriter: set by the drainer (worker
+  flush_pending or outbound route writer thread), read by publishers across workers. Zero
+  contention (Relaxed ordering).
+- **Route-specific max_pending** (128MB vs 64MB for clients): routes aggregate traffic from
+  many publishers; higher threshold avoids premature disconnects.
+- **2-second write deadline** on outbound route TCP socket (matching Go nats-server).
+- **Early processing break**: when congestion detected mid-batch, stop processing more ops
+  from that client — remaining data stays in read buffer for next iteration.
+- Removed old backpressure_active EPOLLIN suppression + 1ms sleep (was per-worker, not
+  per-connection; ineffective across workers).
+
+### Throughput (3-run average, 128B msgs; binary scenarios: 10s duration, sub-side rate)
+
+| Scenario | Rust+Binary msg/s | Go+NATS msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | 3,179,065 | 1,405,734 | **226%** |
+| Pub/sub | 1,362,980 | 526,593 | **258%** |
+| Fan-out x5 | 720,450 | 154,844 | **465%** |
+| Leaf→Hub | 707,770 | 450,867 | **156%** |
+| Hub→Leaf | 590,514 | 344,884 | **171%** |
+| Cluster A→B | 691,399 | 455,751 | **151%** |
+| Cluster fan x3 | 291,273 | 172,262 | **169%** |
+| Cluster B+C | 433,625 | 222,664 | **194%** |
+| Gateway A→B | 614,407 | 386,595 | **158%** |
+| Gateway fan | 548,888 | 306,498 | **179%** |
+| GW req-reply | 365 | 503 | **72%** |
+
+**Takeaways:**
+- **Cluster A→B 151%** (was 3% before backpressure fix): delivered rate went from 15K to 691K.
+  Slow consumer disconnects dropped from 17 to 3. The read budget mechanism successfully
+  throttles publishers to match route drain capacity.
+- **Cluster fan x3 169%, B+C 194%**: both above Go now, with honest sub-side measurement.
+- **Local scenarios (pub-only, pub/sub, fan-out)**: unaffected by the backpressure changes
+  since those paths don't touch congested routes.
+- **GW req-reply 72%**: known regression — gateway reply rewriting path under load.
+
+---
+
 ## 2026-04-07 — Route dedup + backpressure + binary-client protocol (full 11-scenario run)
 
 **Changes since last benchmark:**
