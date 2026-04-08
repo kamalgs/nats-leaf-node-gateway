@@ -262,6 +262,17 @@ impl MsgWriter {
         self.buf.lock().unwrap().len()
     }
 
+    /// Append pre-formatted text bytes to the shared buffer and mark as pending.
+    #[inline]
+    fn append_text(&self, data: &[u8]) {
+        let mut buf = self.buf.lock().unwrap();
+        if let DirectBuf::Text(b) = &mut *buf {
+            b.extend_from_slice(data);
+        }
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
     /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
     pub(crate) fn write_msg(
         &self,
@@ -274,12 +285,7 @@ impl MsgWriter {
         self.backpressure_check();
         let mut builder = self.msg_builder.lock().unwrap();
         let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
-        let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
-        }
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
+        self.append_text(data);
     }
 
     /// Format and append an LMSG to the shared buffer (for leaf node delivery).
@@ -293,12 +299,7 @@ impl MsgWriter {
         self.backpressure_check();
         let mut builder = self.msg_builder.lock().unwrap();
         let data = builder.build_lmsg(subject, reply, headers, payload);
-        let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
-        }
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
+        self.append_text(data);
     }
 
     /// Format and append an RMSG to the shared buffer (for route/gateway delivery).
@@ -360,17 +361,21 @@ impl MsgWriter {
             #[cfg(feature = "accounts")]
             account,
         );
+        self.append_text(data);
+    }
+
+    /// Append a binary inline segment and mark as pending.
+    #[inline]
+    fn append_binary_inline(&self, data: Bytes) {
         let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
+        if let DirectBuf::Binary(seg) = &mut *buf {
+            seg.push_inline(data);
         }
         drop(buf);
         self.has_pending.store(true, Ordering::Release);
     }
 
     /// Write a route sub (RS+ or binary Sub) to the shared buffer.
-    ///
-    /// Uses binary framing when this writer is in binary mode, text RS+ otherwise.
     pub(crate) fn write_route_sub(
         &self,
         subject: &[u8],
@@ -380,15 +385,9 @@ impl MsgWriter {
         if self.binary {
             #[cfg(not(feature = "accounts"))]
             let account: &[u8] = b"$G";
-            let queue_slice = queue.unwrap_or(b"");
             let mut tmp = BytesMut::new();
-            bin_proto::write_sub(subject, queue_slice, account, &mut tmp);
-            let mut buf = self.buf.lock().unwrap();
-            if let DirectBuf::Binary(seg) = &mut *buf {
-                seg.push_inline(tmp.freeze());
-            }
-            drop(buf);
-            self.has_pending.store(true, Ordering::Release);
+            bin_proto::write_sub(subject, queue.unwrap_or(b""), account, &mut tmp);
+            self.append_binary_inline(tmp.freeze());
             return;
         }
         let mut builder = self.msg_builder.lock().unwrap();
@@ -406,17 +405,10 @@ impl MsgWriter {
                 account,
             )
         };
-        let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
-        }
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
+        self.append_text(data);
     }
 
     /// Write a route unsub (RS- or binary Unsub) to the shared buffer.
-    ///
-    /// Uses binary framing when this writer is in binary mode, text RS- otherwise.
     pub(crate) fn write_route_unsub(
         &self,
         subject: &[u8],
@@ -428,12 +420,7 @@ impl MsgWriter {
             let account: &[u8] = b"$G";
             let mut tmp = BytesMut::new();
             bin_proto::write_unsub(subject, account, &mut tmp);
-            let mut buf = self.buf.lock().unwrap();
-            if let DirectBuf::Binary(seg) = &mut *buf {
-                seg.push_inline(tmp.freeze());
-            }
-            drop(buf);
-            self.has_pending.store(true, Ordering::Release);
+            self.append_binary_inline(tmp.freeze());
             return;
         }
         let mut builder = self.msg_builder.lock().unwrap();
@@ -451,22 +438,12 @@ impl MsgWriter {
                 account,
             )
         };
-        let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
-        }
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
+        self.append_text(data);
     }
 
     /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS-/RS+ lines).
     pub(crate) fn write_raw(&self, data: &[u8]) {
-        let mut buf = self.buf.lock().unwrap();
-        if let DirectBuf::Text(b) = &mut *buf {
-            b.extend_from_slice(data);
-        }
-        drop(buf);
-        self.has_pending.store(true, Ordering::Release);
+        self.append_text(data);
     }
 
     /// Notify the worker thread that there is data to flush.
