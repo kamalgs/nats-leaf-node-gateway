@@ -150,45 +150,9 @@ fn run_route_coordinator(
 
 /// Supervisor loop for a single outbound route connection.
 fn run_route_supervisor(seed_url: String, state: Arc<ServerState>, shutdown: Arc<AtomicBool>) {
-    let mut backoff = Backoff::new(Duration::from_millis(250), Duration::from_secs(30));
-
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            debug!(seed = %seed_url, "route supervisor shutting down");
-            return;
-        }
-
-        match connect_route(&seed_url, &state, &shutdown) {
-            Ok(()) => {
-                backoff.reset();
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                warn!(seed = %seed_url, "route connection lost, will reconnect");
-            }
-            Err(e) => {
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                warn!(seed = %seed_url, error = %e, "route connection failed");
-            }
-        }
-
-        if shutdown.load(Ordering::Acquire) {
-            return;
-        }
-
-        let delay = backoff.next_delay();
-        debug!(seed = %seed_url, delay_ms = delay.as_millis(), "reconnecting to route peer");
-
-        let end = std::time::Instant::now() + delay;
-        while std::time::Instant::now() < end {
-            if shutdown.load(Ordering::Acquire) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+    crate::connector::common::run_supervisor(&seed_url, &shutdown, || {
+        connect_route(&seed_url, &state, &shutdown)
+    });
 }
 
 /// Normalize a route URL: strip scheme, ensure host:port format.
