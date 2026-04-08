@@ -21,6 +21,68 @@ use open_wire::InboundLeafConfig;
 use open_wire::{Server, ServerConfig};
 use tokio::time::timeout;
 
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+/// A running open-wire server for testing. Shuts down automatically on drop.
+struct TestServer {
+    shutdown: Arc<AtomicBool>,
+    port: u16,
+}
+
+impl TestServer {
+    /// Connect an async-nats client to this server.
+    async fn connect(&self) -> async_nats::Client {
+        async_nats::connect(format!("127.0.0.1:{}", self.port))
+            .await
+            .unwrap_or_else(|e| panic!("connect to port {} failed: {e}", self.port))
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Poll until a server accepts a TCP connection on `port` (up to 5 s).
+fn wait_for_server(port: u16) {
+    let addr = format!("127.0.0.1:{}", port);
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("server did not become ready on port {}", port);
+}
+
+/// Connect an async-nats client to the given port.
+async fn connect_to(port: u16) -> async_nats::Client {
+    async_nats::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap_or_else(|e| panic!("connect to port {port} failed: {e}"))
+}
+
+/// Publish a message and wait for it to arrive on a subscriber.
+async fn publish_and_expect(
+    pub_client: &async_nats::Client,
+    sub: &mut async_nats::Subscriber,
+    subject: &str,
+    payload: &[u8],
+) -> async_nats::Message {
+    pub_client
+        .publish(subject.to_owned(), bytes::Bytes::copy_from_slice(payload))
+        .await
+        .expect("publish failed");
+    pub_client.flush().await.expect("flush failed");
+    timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("timed out waiting for message")
+        .expect("subscription ended")
+}
+
 /// Drain a subscriber, counting messages until a timeout gap with no messages.
 async fn collect_msgs(sub: &mut async_nats::Subscriber, gap_ms: u64) -> u32 {
     let mut count = 0u32;
@@ -125,9 +187,9 @@ impl Drop for NatsServer {
     }
 }
 
-/// Start a Server on the given port with optional hub_url, returning the
-/// shutdown sender. The server runs in a background tokio task.
-fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
+/// Start a Server on the given port with optional hub_url. Waits until the
+/// server is accepting connections before returning.
+fn spawn_leaf(port: u16, hub_url: Option<String>) -> TestServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
@@ -150,31 +212,15 @@ fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
         }
     });
 
-    shutdown
-}
-
-/// Wait until the leaf server accepts a TCP connection.
-async fn wait_for_leaf(port: u16) {
-    let addr = format!("127.0.0.1:{}", port);
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("leaf server did not become ready on port {}", port);
+    wait_for_server(port);
+    TestServer { shutdown, port }
 }
 
 #[tokio::test]
 
 async fn local_pub_sub() {
-    let leaf_port = free_port();
-    let shutdown_tx = spawn_leaf(leaf_port, None);
-    wait_for_leaf(leaf_port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", leaf_port))
-        .await
-        .expect("failed to connect to leaf server");
+    let _server = spawn_leaf(free_port(), None);
+    let client = _server.connect().await;
 
     let mut sub = client
         .subscribe("test.subject")
@@ -184,22 +230,10 @@ async fn local_pub_sub() {
     // Small delay to let subscription propagate
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    client
-        .publish("test.subject", "hello".into())
-        .await
-        .expect("publish failed");
-
-    client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub.next())
-        .await
-        .expect("timed out waiting for message")
-        .expect("subscription stream ended");
+    let msg = publish_and_expect(&client, &mut sub, "test.subject", b"hello").await;
 
     assert_eq!(msg.subject.as_str(), "test.subject");
     assert_eq!(&msg.payload[..], b"hello");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -211,21 +245,14 @@ async fn upstream_forward() {
     let _upstream = NatsServer::start_with_leafnode(upstream_client_port, upstream_leaf_port);
 
     // Start leaf pointing at upstream's leafnode port
-    let leaf_port = free_port();
-    let shutdown_tx = spawn_leaf(
-        leaf_port,
+    let _leaf = spawn_leaf(
+        free_port(),
         Some(format!("nats://127.0.0.1:{}", upstream_leaf_port)),
     );
-    wait_for_leaf(leaf_port).await;
 
     // Connect clients
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_port))
-        .await
-        .expect("failed to connect to leaf");
-
-    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_client_port))
-        .await
-        .expect("failed to connect to upstream");
+    let leaf_client = _leaf.connect().await;
+    let upstream_client = connect_to(upstream_client_port).await;
 
     // Leaf subscribes to wildcard
     let mut leaf_sub = leaf_client
@@ -236,23 +263,16 @@ async fn upstream_forward() {
     // Let subscription propagate to upstream via the leaf's hub connection
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Upstream publishes
-    upstream_client
-        .publish("events.hello", "from-upstream".into())
-        .await
-        .expect("upstream publish failed");
-
-    upstream_client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), leaf_sub.next())
-        .await
-        .expect("timed out waiting for upstream message")
-        .expect("subscription stream ended");
+    let msg = publish_and_expect(
+        &upstream_client,
+        &mut leaf_sub,
+        "events.hello",
+        b"from-upstream",
+    )
+    .await;
 
     assert_eq!(msg.subject.as_str(), "events.hello");
     assert_eq!(&msg.payload[..], b"from-upstream");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -264,21 +284,14 @@ async fn leaf_to_upstream() {
     let _upstream = NatsServer::start_with_leafnode(upstream_client_port, upstream_leaf_port);
 
     // Start leaf pointing at upstream's leafnode port
-    let leaf_port = free_port();
-    let shutdown_tx = spawn_leaf(
-        leaf_port,
+    let _leaf = spawn_leaf(
+        free_port(),
         Some(format!("nats://127.0.0.1:{}", upstream_leaf_port)),
     );
-    wait_for_leaf(leaf_port).await;
 
     // Connect clients
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_port))
-        .await
-        .expect("failed to connect to leaf");
-
-    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_client_port))
-        .await
-        .expect("failed to connect to upstream");
+    let leaf_client = _leaf.connect().await;
+    let upstream_client = connect_to(upstream_client_port).await;
 
     // Upstream subscribes
     let mut upstream_sub = upstream_client
@@ -289,23 +302,10 @@ async fn leaf_to_upstream() {
     // Let subscription settle
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Leaf publishes
-    leaf_client
-        .publish("data.test", "from-leaf".into())
-        .await
-        .expect("leaf publish failed");
-
-    leaf_client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), upstream_sub.next())
-        .await
-        .expect("timed out waiting for message on upstream")
-        .expect("subscription stream ended");
+    let msg = publish_and_expect(&leaf_client, &mut upstream_sub, "data.test", b"from-leaf").await;
 
     assert_eq!(msg.subject.as_str(), "data.test");
     assert_eq!(&msg.payload[..], b"from-leaf");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 // --- Wire protocol tests (no feature gate beyond "leaf") ---
@@ -313,13 +313,8 @@ async fn leaf_to_upstream() {
 #[tokio::test]
 
 async fn queue_sub_distribution() {
-    let port = free_port();
-    let shutdown = spawn_leaf(port, None);
-    wait_for_leaf(port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect failed");
+    let _server = spawn_leaf(free_port(), None);
+    let client = _server.connect().await;
 
     let mut sub1 = client
         .queue_subscribe("work.tasks", "workers".into())
@@ -354,20 +349,13 @@ async fn queue_sub_distribution() {
     assert!(c1 >= 1, "sub1 should get at least 1, got {c1}");
     assert!(c2 >= 1, "sub2 should get at least 1, got {c2}");
     assert!(c3 >= 1, "sub3 should get at least 1, got {c3}");
-
-    shutdown.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn multiple_queue_groups() {
-    let port = free_port();
-    let shutdown = spawn_leaf(port, None);
-    wait_for_leaf(port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect failed");
+    let _server = spawn_leaf(free_port(), None);
+    let client = _server.connect().await;
 
     let mut ga1 = client
         .queue_subscribe("events.tick", "group-a".into())
@@ -405,20 +393,13 @@ async fn multiple_queue_groups() {
 
     assert_eq!(a1 + a2, 20, "group-a total should be 20, got {a1}+{a2}");
     assert_eq!(b1 + b2, 20, "group-b total should be 20, got {b1}+{b2}");
-
-    shutdown.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn unsub_max_auto_unsubscribe() {
-    let port = free_port();
-    let shutdown = spawn_leaf(port, None);
-    wait_for_leaf(port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect failed");
+    let _server = spawn_leaf(free_port(), None);
+    let client = _server.connect().await;
 
     let mut sub = client
         .subscribe("unsub.test")
@@ -445,20 +426,13 @@ async fn unsub_max_auto_unsubscribe() {
     }
 
     assert_eq!(count, 5, "should receive exactly 5, got {count}");
-
-    shutdown.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn wildcard_subscriptions() {
-    let port = free_port();
-    let shutdown = spawn_leaf(port, None);
-    wait_for_leaf(port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect failed");
+    let _server = spawn_leaf(free_port(), None);
+    let client = _server.connect().await;
 
     // Subscribe to wildcards and exact
     let mut star_sub = client.subscribe("events.*").await.expect("star sub failed");
@@ -470,17 +444,17 @@ async fn wildcard_subscriptions() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // events.login → matched by *, >, exact
+    // events.login -> matched by *, >, exact
     client
         .publish("events.login", "a".into())
         .await
         .expect("pub failed");
-    // events.logout → matched by *, >
+    // events.logout -> matched by *, >
     client
         .publish("events.logout", "b".into())
         .await
         .expect("pub failed");
-    // events.login.us → matched by > only (two tokens deep)
+    // events.login.us -> matched by > only (two tokens deep)
     client
         .publish("events.login.us", "c".into())
         .await
@@ -496,29 +470,23 @@ async fn wildcard_subscriptions() {
     assert_eq!(star, 2, "events.* should match 2, got {star}");
     assert_eq!(gt, 3, "events.> should match 3, got {gt}");
     assert_eq!(exact, 1, "events.login exact should match 1, got {exact}");
-
-    shutdown.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn no_echo_publish() {
-    let port = free_port();
-    let shutdown = spawn_leaf(port, None);
-    wait_for_leaf(port).await;
+    let _server = spawn_leaf(free_port(), None);
 
     // client_a with no_echo
     let client_a = async_nats::connect_with_options(
-        format!("127.0.0.1:{}", port),
+        format!("127.0.0.1:{}", _server.port),
         async_nats::ConnectOptions::new().no_echo(),
     )
     .await
     .expect("connect a failed");
 
     // client_b normal
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect b failed");
+    let client_b = _server.connect().await;
 
     let mut sub_a = client_a.subscribe("echo.test").await.expect("sub a failed");
     let mut sub_b = client_b.subscribe("echo.test").await.expect("sub b failed");
@@ -545,14 +513,13 @@ async fn no_echo_publish() {
         result_a.is_err(),
         "client_a should not receive its own echo"
     );
-
-    shutdown.store(true, Ordering::Release);
 }
 
 // --- Hub mode helpers ---
 
-/// Start a Server in hub mode (with leafnode_port), returning the shutdown sender.
-fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
+/// Start a Server in hub mode (with leafnode_port). Waits until the server is
+/// accepting connections before returning.
+fn spawn_hub(client_port: u16, leafnode_port: u16) -> TestServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
@@ -575,7 +542,11 @@ fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
         }
     });
 
-    shutdown
+    wait_for_server(client_port);
+    TestServer {
+        shutdown,
+        port: client_port,
+    }
 }
 
 impl NatsServer {
@@ -617,14 +588,8 @@ impl NatsServer {
 #[tokio::test]
 
 async fn hub_mode_local_pub_sub() {
-    let hub_client_port = free_port();
-    let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
-
-    let client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
-        .await
-        .expect("failed to connect to hub");
+    let _hub = spawn_hub(free_port(), free_port());
+    let client = _hub.connect().await;
 
     let mut sub = client
         .subscribe("hub.test")
@@ -633,42 +598,25 @@ async fn hub_mode_local_pub_sub() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    client
-        .publish("hub.test", "hello-hub".into())
-        .await
-        .expect("publish failed");
-
-    client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub.next())
-        .await
-        .expect("timed out waiting for message")
-        .expect("subscription stream ended");
+    let msg = publish_and_expect(&client, &mut sub, "hub.test", b"hello-hub").await;
 
     assert_eq!(msg.subject.as_str(), "hub.test");
     assert_eq!(&msg.payload[..], b"hello-hub");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn hub_mode_leaf_to_hub() {
     // Start Rust hub
-    let hub_client_port = free_port();
     let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
+    let _hub = spawn_hub(free_port(), hub_leaf_port);
 
     // Start Go nats-server as leaf connecting to Rust hub
     let leaf_client_port = free_port();
     let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
 
     // Subscribe on hub
-    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
-        .await
-        .expect("connect to hub failed");
-
+    let hub_client = _hub.connect().await;
     let mut hub_sub = hub_client
         .subscribe("cross.test")
         .await
@@ -678,46 +626,26 @@ async fn hub_mode_leaf_to_hub() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on leaf
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
-        .await
-        .expect("connect to leaf failed");
-
-    leaf_client
-        .publish("cross.test", "from-leaf".into())
-        .await
-        .expect("leaf publish failed");
-
-    leaf_client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), hub_sub.next())
-        .await
-        .expect("timed out waiting for leaf→hub message")
-        .expect("subscription stream ended");
+    let leaf_client = connect_to(leaf_client_port).await;
+    let msg = publish_and_expect(&leaf_client, &mut hub_sub, "cross.test", b"from-leaf").await;
 
     assert_eq!(msg.subject.as_str(), "cross.test");
     assert_eq!(&msg.payload[..], b"from-leaf");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn hub_mode_hub_to_leaf() {
     // Start Rust hub
-    let hub_client_port = free_port();
     let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
+    let _hub = spawn_hub(free_port(), hub_leaf_port);
 
     // Start Go nats-server as leaf connecting to Rust hub
     let leaf_client_port = free_port();
     let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
 
     // Subscribe on leaf
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
-        .await
-        .expect("connect to leaf failed");
-
+    let leaf_client = connect_to(leaf_client_port).await;
     let mut leaf_sub = leaf_client
         .subscribe("reverse.test")
         .await
@@ -727,45 +655,25 @@ async fn hub_mode_hub_to_leaf() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on hub
-    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
-        .await
-        .expect("connect to hub failed");
-
-    hub_client
-        .publish("reverse.test", "from-hub".into())
-        .await
-        .expect("hub publish failed");
-
-    hub_client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), leaf_sub.next())
-        .await
-        .expect("timed out waiting for hub→leaf message")
-        .expect("subscription stream ended");
+    let hub_client = _hub.connect().await;
+    let msg = publish_and_expect(&hub_client, &mut leaf_sub, "reverse.test", b"from-hub").await;
 
     assert_eq!(msg.subject.as_str(), "reverse.test");
     assert_eq!(&msg.payload[..], b"from-hub");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn leaf_subscription_propagation() {
-    // Rust hub + Go leaf: subscribe on leaf, publish from hub → received
-    let hub_client_port = free_port();
+    // Rust hub + Go leaf: subscribe on leaf, publish from hub -> received
     let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
+    let _hub = spawn_hub(free_port(), hub_leaf_port);
 
     let leaf_client_port = free_port();
     let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
 
     // Subscribe on leaf
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
-        .await
-        .expect("connect to leaf failed");
-
+    let leaf_client = connect_to(leaf_client_port).await;
     let mut leaf_sub = leaf_client
         .subscribe("leaf.prop.test")
         .await
@@ -775,43 +683,24 @@ async fn leaf_subscription_propagation() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish from hub
-    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
-        .await
-        .expect("connect to hub failed");
-
-    hub_client
-        .publish("leaf.prop.test", "from-hub".into())
-        .await
-        .expect("hub publish failed");
-    hub_client.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), leaf_sub.next())
-        .await
-        .expect("timed out waiting for leaf sub propagation")
-        .expect("sub ended");
+    let hub_client = _hub.connect().await;
+    let msg = publish_and_expect(&hub_client, &mut leaf_sub, "leaf.prop.test", b"from-hub").await;
 
     assert_eq!(msg.subject.as_str(), "leaf.prop.test");
     assert_eq!(&msg.payload[..], b"from-hub");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn leaf_no_echo() {
-    // Rust hub + Go leaf: sub + pub on same leaf → publisher should NOT get echo
-    let hub_client_port = free_port();
+    // Rust hub + Go leaf: sub + pub on same leaf -> publisher should NOT get echo
     let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
+    let _hub = spawn_hub(free_port(), hub_leaf_port);
 
     let leaf_client_port = free_port();
     let _leaf_server = NatsServer::start_as_leaf(leaf_client_port, hub_leaf_port);
 
-    let leaf_client = async_nats::connect(format!("127.0.0.1:{}", leaf_client_port))
-        .await
-        .expect("connect to leaf failed");
-
+    let leaf_client = connect_to(leaf_client_port).await;
     let mut leaf_sub = leaf_client
         .subscribe("leaf.echo.test")
         .await
@@ -837,18 +726,14 @@ async fn leaf_no_echo() {
     // Should NOT get a second (echoed) copy from the hub
     let dup = timeout(Duration::from_millis(500), leaf_sub.next()).await;
     assert!(dup.is_err(), "should not get echo back through hub");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn leaf_queue_distribution() {
     // Rust hub + 2 Go leaves: queue sub on each + hub, publish 30 from hub
-    let hub_client_port = free_port();
     let hub_leaf_port = free_port();
-    let shutdown_tx = spawn_hub(hub_client_port, hub_leaf_port);
-    wait_for_leaf(hub_client_port).await;
+    let _hub = spawn_hub(free_port(), hub_leaf_port);
 
     let leaf1_port = free_port();
     let _leaf1 = NatsServer::start_as_leaf(leaf1_port, hub_leaf_port);
@@ -856,15 +741,9 @@ async fn leaf_queue_distribution() {
     let leaf2_port = free_port();
     let _leaf2 = NatsServer::start_as_leaf(leaf2_port, hub_leaf_port);
 
-    let hub_client = async_nats::connect(format!("127.0.0.1:{}", hub_client_port))
-        .await
-        .expect("connect hub failed");
-    let leaf1_client = async_nats::connect(format!("127.0.0.1:{}", leaf1_port))
-        .await
-        .expect("connect leaf1 failed");
-    let leaf2_client = async_nats::connect(format!("127.0.0.1:{}", leaf2_port))
-        .await
-        .expect("connect leaf2 failed");
+    let hub_client = _hub.connect().await;
+    let leaf1_client = connect_to(leaf1_port).await;
+    let leaf2_client = connect_to(leaf2_port).await;
 
     // Queue subs
     let mut hub_sub = hub_client
@@ -900,19 +779,18 @@ async fn leaf_queue_distribution() {
     let total = h + l1 + l2;
     assert_eq!(total, 30, "total should be 30, got {h}+{l1}+{l2}");
     assert!(h >= 1 || l1 >= 1 || l2 >= 1, "at least one should get msgs");
-
-    shutdown_tx.store(true, Ordering::Release);
 }
 
 // --- Cluster mode helpers ---
 
-/// Start a Server in cluster mode, returning the shutdown sender.
+/// Start a Server in cluster mode. Waits until the server is accepting
+/// connections before returning.
 fn spawn_cluster_node(
     client_port: u16,
     cluster_port: u16,
     seeds: Vec<String>,
     name: &str,
-) -> Arc<AtomicBool> {
+) -> TestServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
@@ -936,7 +814,11 @@ fn spawn_cluster_node(
         })
         .expect("failed to spawn cluster node thread");
 
-    shutdown
+    wait_for_server(client_port);
+    TestServer {
+        shutdown,
+        port: client_port,
+    }
 }
 
 // --- Cluster mode tests ---
@@ -945,30 +827,22 @@ fn spawn_cluster_node(
 
 async fn cluster_two_node_pub_sub() {
     // Node A: cluster port, no seeds
-    let port_a = free_port();
     let cluster_port_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cluster_port_a, vec![], "node-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cluster_port_a, vec![], "node-a");
 
     // Node B: connects to Node A as seed
-    let port_b = free_port();
-    let cluster_port_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cluster_port_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
         "node-b",
     );
-    wait_for_leaf(port_b).await;
 
     // Let route connection establish
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Client on Node A subscribes
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect to node A failed");
-
+    let client_a = _node_a.connect().await;
     let mut sub_a = client_a
         .subscribe("cluster.test")
         .await
@@ -978,53 +852,30 @@ async fn cluster_two_node_pub_sub() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Client on Node B publishes
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect to node B failed");
-
-    client_b
-        .publish("cluster.test", "hello-cluster".into())
-        .await
-        .expect("publish on B failed");
-
-    client_b.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_a.next())
-        .await
-        .expect("timed out waiting for cluster message")
-        .expect("subscription stream ended");
+    let client_b = _node_b.connect().await;
+    let msg = publish_and_expect(&client_b, &mut sub_a, "cluster.test", b"hello-cluster").await;
 
     assert_eq!(msg.subject.as_str(), "cluster.test");
     assert_eq!(&msg.payload[..], b"hello-cluster");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn cluster_reverse_direction() {
     // Test message flow: publish on A, subscribe on B
-    let port_a = free_port();
     let cluster_port_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cluster_port_a, vec![], "node-a-rev");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cluster_port_a, vec![], "node-a-rev");
 
-    let port_b = free_port();
-    let cluster_port_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cluster_port_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
         "node-b-rev",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Subscribe on Node B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect to B failed");
+    let client_b = _node_b.connect().await;
     let mut sub_b = client_b
         .subscribe("reverse.>")
         .await
@@ -1033,69 +884,43 @@ async fn cluster_reverse_direction() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on Node A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect to A failed");
-    client_a
-        .publish("reverse.hello", "from-a".into())
-        .await
-        .expect("publish on A failed");
-    client_a.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_b.next())
-        .await
-        .expect("timed out waiting for reverse message")
-        .expect("subscription stream ended");
+    let client_a = _node_a.connect().await;
+    let msg = publish_and_expect(&client_a, &mut sub_b, "reverse.hello", b"from-a").await;
 
     assert_eq!(msg.subject.as_str(), "reverse.hello");
     assert_eq!(&msg.payload[..], b"from-a");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn cluster_three_node() {
-    // Three-node cluster: A ← B (seed A), A ← C (seed A)
-    let port_a = free_port();
+    // Three-node cluster: A <- B (seed A), A <- C (seed A)
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "tri-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cport_a, vec![], "tri-a");
 
-    let port_b = free_port();
-    let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cport_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "tri-b",
     );
-    wait_for_leaf(port_b).await;
 
-    let port_c = free_port();
-    let cport_c = free_port();
-    let shutdown_c = spawn_cluster_node(
-        port_c,
-        cport_c,
+    let _node_c = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "tri-c",
     );
-    wait_for_leaf(port_c).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Subscribe on B and C
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect to B failed");
+    let client_b = _node_b.connect().await;
     let mut sub_b = client_b
         .subscribe("tri.test")
         .await
         .expect("subscribe on B failed");
 
-    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
-        .await
-        .expect("connect to C failed");
+    let client_c = _node_c.connect().await;
     let mut sub_c = client_c
         .subscribe("tri.test")
         .await
@@ -1104,9 +929,7 @@ async fn cluster_three_node() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect to A failed");
+    let client_a = _node_a.connect().await;
     client_a
         .publish("tri.test", "from-a".into())
         .await
@@ -1127,10 +950,6 @@ async fn cluster_three_node() {
         .expect("sub C ended");
     assert_eq!(msg_c.subject.as_str(), "tri.test");
     assert_eq!(&msg_c.payload[..], b"from-a");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
-    shutdown_c.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -1138,71 +957,46 @@ async fn cluster_three_node() {
 async fn cluster_gossip_discovery() {
     // Three-node cluster where B and C only seed A.
     // B and C should discover each other via A's gossip and form a direct route.
-    let port_a = free_port();
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "gossip-a");
-    wait_for_leaf(port_a).await;
+    let node_a = spawn_cluster_node(free_port(), cport_a, vec![], "gossip-a");
 
-    let port_b = free_port();
-    let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cport_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "gossip-b",
     );
-    wait_for_leaf(port_b).await;
 
-    let port_c = free_port();
-    let cport_c = free_port();
-    let shutdown_c = spawn_cluster_node(
-        port_c,
-        cport_c,
+    let _node_c = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "gossip-c",
     );
-    wait_for_leaf(port_c).await;
 
-    // Allow time for gossip discovery and route formation between B↔C.
+    // Allow time for gossip discovery and route formation between B<->C.
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
-    // Now shut down node A to prove B↔C have a direct route.
-    shutdown_a.store(true, Ordering::Release);
+    // Now shut down node A to prove B<->C have a direct route.
+    node_a.shutdown.store(true, Ordering::Release);
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Subscribe on C
-    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
-        .await
-        .expect("connect to C failed");
+    let client_c = _node_c.connect().await;
     let mut sub_c = client_c
         .subscribe("gossip.test")
         .await
         .expect("subscribe on C failed");
 
-    // Let subscription propagate via RS+ over B↔C route
+    // Let subscription propagate via RS+ over B<->C route
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect to B failed");
-    client_b
-        .publish("gossip.test", "from-b-via-gossip".into())
-        .await
-        .expect("publish on B failed");
-    client_b.flush().await.expect("flush failed");
-
-    // C should receive the message via the B↔C direct route
-    let msg = timeout(Duration::from_secs(5), sub_c.next())
-        .await
-        .expect("timed out waiting for gossip-routed message")
-        .expect("subscription stream ended");
+    let client_b = _node_b.connect().await;
+    let msg = publish_and_expect(&client_b, &mut sub_c, "gossip.test", b"from-b-via-gossip").await;
 
     assert_eq!(msg.subject.as_str(), "gossip.test");
     assert_eq!(&msg.payload[..], b"from-b-via-gossip");
-
-    shutdown_b.store(true, Ordering::Release);
-    shutdown_c.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -1210,39 +1004,30 @@ async fn cluster_gossip_discovery() {
 async fn cluster_partial_seed() {
     // Chain topology: A seeds B, B seeds C.
     // C should discover A via transitive gossip and form a full mesh.
-    let port_a = free_port();
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "chain-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cport_a, vec![], "chain-a");
 
-    let port_b = free_port();
     let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
         cport_b,
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "chain-b",
     );
-    wait_for_leaf(port_b).await;
 
-    // C only seeds B — should discover A via gossip.
-    let port_c = free_port();
-    let cport_c = free_port();
-    let shutdown_c = spawn_cluster_node(
-        port_c,
-        cport_c,
+    // C only seeds B -- should discover A via gossip.
+    let _node_c = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_b)],
         "chain-c",
     );
-    wait_for_leaf(port_c).await;
 
     // Allow time for gossip discovery and full mesh formation.
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // Subscribe on C
-    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
-        .await
-        .expect("connect to C failed");
+    let client_c = _node_c.connect().await;
     let mut sub_c = client_c
         .subscribe("chain.test")
         .await
@@ -1250,54 +1035,30 @@ async fn cluster_partial_seed() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Publish on A — should reach C via full mesh
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect to A failed");
-    client_a
-        .publish("chain.test", "from-a-chain".into())
-        .await
-        .expect("publish on A failed");
-    client_a.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_c.next())
-        .await
-        .expect("timed out waiting for chain-routed message")
-        .expect("subscription stream ended");
+    // Publish on A -- should reach C via full mesh
+    let client_a = _node_a.connect().await;
+    let msg = publish_and_expect(&client_a, &mut sub_c, "chain.test", b"from-a-chain").await;
 
     assert_eq!(msg.subject.as_str(), "chain.test");
     assert_eq!(&msg.payload[..], b"from-a-chain");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
-    shutdown_c.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn cluster_queue_semantics() {
-    let port_a = free_port();
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "queue-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cport_a, vec![], "queue-a");
 
-    let port_b = free_port();
-    let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cport_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "queue-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    let client_a = _node_a.connect().await;
+    let client_b = _node_b.connect().await;
 
     // 2 queue subs on each node
     let mut qa1 = client_a
@@ -1338,53 +1099,38 @@ async fn cluster_queue_semantics() {
     let total = a1 + a2 + b1 + b2;
     assert_eq!(total, 100, "total should be 100, got {a1}+{a2}+{b1}+{b2}");
     assert!(b1 + b2 >= 1, "node-B should get at least 1, got {b1}+{b2}");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn cluster_one_hop_enforcement() {
     // 3-node cluster: A, B (seed A), C (seed A)
-    let port_a = free_port();
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "hop-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cport_a, vec![], "hop-a");
 
-    let port_b = free_port();
-    let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cport_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "hop-b",
     );
-    wait_for_leaf(port_b).await;
 
-    let port_c = free_port();
-    let cport_c = free_port();
-    let shutdown_c = spawn_cluster_node(
-        port_c,
-        cport_c,
+    let _node_c = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "hop-c",
     );
-    wait_for_leaf(port_c).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Subscribe on C
-    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
-        .await
-        .expect("connect C failed");
+    let client_c = _node_c.connect().await;
     let mut sub_c = client_c.subscribe("hop.test").await.expect("sub C failed");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _node_a.connect().await;
     client_a
         .publish("hop.test", "once".into())
         .await
@@ -1404,60 +1150,38 @@ async fn cluster_one_hop_enforcement() {
         dup.is_err(),
         "should not receive duplicate from re-forwarding"
     );
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
-    shutdown_c.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn cluster_sub_unsub_propagation() {
-    let port_a = free_port();
     let cport_a = free_port();
-    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "prop-a");
-    wait_for_leaf(port_a).await;
+    let _node_a = spawn_cluster_node(free_port(), cport_a, vec![], "prop-a");
 
-    let port_b = free_port();
-    let cport_b = free_port();
-    let shutdown_b = spawn_cluster_node(
-        port_b,
-        cport_b,
+    let _node_b = spawn_cluster_node(
+        free_port(),
+        free_port(),
         vec![format!("nats-route://127.0.0.1:{}", cport_a)],
         "prop-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Subscribe on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _node_a.connect().await;
     let mut sub_a = client_a.subscribe("prop.test").await.expect("sub A failed");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Publish from B → should be received on A
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
-    client_b
-        .publish("prop.test", "before".into())
-        .await
-        .expect("pub failed");
-    client_b.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_a.next())
-        .await
-        .expect("timed out")
-        .expect("sub ended");
+    // Publish from B -> should be received on A
+    let client_b = _node_b.connect().await;
+    let msg = publish_and_expect(&client_b, &mut sub_a, "prop.test", b"before").await;
     assert_eq!(&msg.payload[..], b"before");
 
     // Unsubscribe on A
     sub_a.unsubscribe().await.expect("unsub failed");
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Publish again from B → should NOT be received
+    // Publish again from B -> should NOT be received
     client_b
         .publish("prop.test", "after".into())
         .await
@@ -1469,23 +1193,21 @@ async fn cluster_sub_unsub_propagation() {
         result.is_err() || result.unwrap().is_none(),
         "should not receive after unsub"
     );
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 // --- Gateway mode helpers ---
 
-/// Start a Server in gateway mode, returning the shutdown sender.
+/// Start a Server in gateway mode. Waits until the server is accepting
+/// connections before returning.
 fn spawn_gateway_node(
     client_port: u16,
-    _cluster_port: u16,
+    cluster_port: u16,
     gateway_port: u16,
     gateway_name: &str,
     remotes: Vec<(String, String)>,
-    _cluster_seeds: Vec<String>,
+    cluster_seeds: Vec<String>,
     server_name: &str,
-) -> Arc<AtomicBool> {
+) -> TestServer {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
@@ -1504,8 +1226,8 @@ fn spawn_gateway_node(
         server_name: server_name.to_string(),
 
         cluster: open_wire::ClusterConfig {
-            port: Some(_cluster_port),
-            seeds: _cluster_seeds,
+            port: Some(cluster_port),
+            seeds: cluster_seeds,
             name: Some(gateway_name.to_string()),
         },
         gateway: open_wire::GatewayConfig {
@@ -1523,7 +1245,11 @@ fn spawn_gateway_node(
         })
         .expect("failed to spawn gateway node thread");
 
-    shutdown
+    wait_for_server(client_port);
+    TestServer {
+        shutdown,
+        port: client_port,
+    }
 }
 
 // --- Gateway mode tests ---
@@ -1531,17 +1257,12 @@ fn spawn_gateway_node(
 #[tokio::test]
 
 async fn gateway_basic_pub_sub() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1551,11 +1272,10 @@ async fn gateway_basic_pub_sub() {
         vec![],
         "gw-node-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1565,14 +1285,11 @@ async fn gateway_basic_pub_sub() {
         vec![],
         "gw-node-b",
     );
-    wait_for_leaf(port_b).await;
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Subscribe on B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    let client_b = _gw_b.connect().await;
     let mut sub_b = client_b
         .subscribe("gw.basic.test")
         .await
@@ -1581,41 +1298,22 @@ async fn gateway_basic_pub_sub() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
-    client_a
-        .publish("gw.basic.test", "hello-gw".into())
-        .await
-        .expect("pub failed");
-    client_a.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_b.next())
-        .await
-        .expect("timed out waiting for gateway message")
-        .expect("sub ended");
+    let client_a = _gw_a.connect().await;
+    let msg = publish_and_expect(&client_a, &mut sub_b, "gw.basic.test", b"hello-gw").await;
 
     assert_eq!(msg.subject.as_str(), "gw.basic.test");
     assert_eq!(&msg.payload[..], b"hello-gw");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn gateway_reverse_direction() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1625,11 +1323,10 @@ async fn gateway_reverse_direction() {
         vec![],
         "gw-rev-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1639,13 +1336,10 @@ async fn gateway_reverse_direction() {
         vec![],
         "gw-rev-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Subscribe on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _gw_a.connect().await;
     let mut sub_a = client_a
         .subscribe("gw.rev.test")
         .await
@@ -1654,41 +1348,22 @@ async fn gateway_reverse_direction() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish on B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
-    client_b
-        .publish("gw.rev.test", "from-b".into())
-        .await
-        .expect("pub failed");
-    client_b.flush().await.expect("flush failed");
-
-    let msg = timeout(Duration::from_secs(5), sub_a.next())
-        .await
-        .expect("timed out")
-        .expect("sub ended");
+    let client_b = _gw_b.connect().await;
+    let msg = publish_and_expect(&client_b, &mut sub_a, "gw.rev.test", b"from-b").await;
 
     assert_eq!(msg.subject.as_str(), "gw.rev.test");
     assert_eq!(&msg.payload[..], b"from-b");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn gateway_request_reply() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1698,11 +1373,10 @@ async fn gateway_request_reply() {
         vec![],
         "gw-rr-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1712,13 +1386,10 @@ async fn gateway_request_reply() {
         vec![],
         "gw-rr-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Service on B: subscribe and reply
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    let client_b = _gw_b.connect().await;
     let mut service_sub = client_b
         .subscribe("service.echo")
         .await
@@ -1745,9 +1416,7 @@ async fn gateway_request_reply() {
     });
 
     // Client on A: request
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _gw_a.connect().await;
 
     let reply = timeout(
         Duration::from_secs(10),
@@ -1760,25 +1429,17 @@ async fn gateway_request_reply() {
     assert_eq!(&reply.payload[..], b"echo-reply");
 
     responder.await.expect("responder task failed");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn gateway_queue_groups() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1788,11 +1449,10 @@ async fn gateway_queue_groups() {
         vec![],
         "gw-qq-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1802,13 +1462,10 @@ async fn gateway_queue_groups() {
         vec![],
         "gw-qq-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // 2 queue subs on B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    let client_b = _gw_b.connect().await;
     let mut qb1 = client_b
         .queue_subscribe("gw.queue.test", "qworkers".into())
         .await
@@ -1821,9 +1478,7 @@ async fn gateway_queue_groups() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish 20 from A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _gw_a.connect().await;
     for i in 0..20u32 {
         client_a
             .publish("gw.queue.test", format!("gq-{}", i).into())
@@ -1837,25 +1492,17 @@ async fn gateway_queue_groups() {
     assert_eq!(b1 + b2, 20, "total should be 20, got {b1}+{b2}");
     assert!(b1 >= 1, "qb1 should get at least 1, got {b1}");
     assert!(b2 >= 1, "qb2 should get at least 1, got {b2}");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 #[ignore] // Gateway interest mode transition is timing-sensitive; tracked separately.
 async fn gateway_interest_mode_transition() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1865,11 +1512,10 @@ async fn gateway_interest_mode_transition() {
         vec![],
         "gw-im-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1879,13 +1525,10 @@ async fn gateway_interest_mode_transition() {
         vec![],
         "gw-im-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Subscribe to a known subject on A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _gw_a.connect().await;
     let mut sub_a = client_a
         .subscribe("interest.final")
         .await
@@ -1893,10 +1536,8 @@ async fn gateway_interest_mode_transition() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Publish 1100 unique no-interest subjects from B to trigger Optimistic → InterestOnly
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    // Publish 1100 unique no-interest subjects from B to trigger Optimistic -> InterestOnly
+    let client_b = _gw_b.connect().await;
     for i in 0..1100u32 {
         client_b
             .publish(format!("nointerest.unique.{}", i), "x".into())
@@ -1922,25 +1563,17 @@ async fn gateway_interest_mode_transition() {
 
     assert_eq!(msg.subject.as_str(), "interest.final");
     assert_eq!(&msg.payload[..], b"after-transition");
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }
 
 #[tokio::test]
 
 async fn gateway_fan_out() {
-    let port_a = free_port();
-    let cport_a = free_port();
     let gport_a = free_port();
-
-    let port_b = free_port();
-    let cport_b = free_port();
     let gport_b = free_port();
 
-    let shutdown_a = spawn_gateway_node(
-        port_a,
-        cport_a,
+    let _gw_a = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_a,
         "cluster-a",
         vec![(
@@ -1950,11 +1583,10 @@ async fn gateway_fan_out() {
         vec![],
         "gw-fan-a",
     );
-    wait_for_leaf(port_a).await;
 
-    let shutdown_b = spawn_gateway_node(
-        port_b,
-        cport_b,
+    let _gw_b = spawn_gateway_node(
+        free_port(),
+        free_port(),
         gport_b,
         "cluster-b",
         vec![(
@@ -1964,13 +1596,10 @@ async fn gateway_fan_out() {
         vec![],
         "gw-fan-b",
     );
-    wait_for_leaf(port_b).await;
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     // Subscribe to 5 distinct subjects on B
-    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
-        .await
-        .expect("connect B failed");
+    let client_b = _gw_b.connect().await;
 
     let subjects = [
         "fan.alpha",
@@ -1988,9 +1617,7 @@ async fn gateway_fan_out() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Publish 1 to each from A
-    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
-        .await
-        .expect("connect A failed");
+    let client_a = _gw_a.connect().await;
     for &subj in &subjects {
         client_a
             .publish(subj, format!("payload-{}", subj).into())
@@ -2016,7 +1643,4 @@ async fn gateway_fan_out() {
             format!("payload-{}", subjects[i]).as_bytes()
         );
     }
-
-    shutdown_a.store(true, Ordering::Release);
-    shutdown_b.store(true, Ordering::Release);
 }

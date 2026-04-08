@@ -82,53 +82,12 @@ fn run_gateway_supervisor(
     state: Arc<ServerState>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut backoff = Backoff::new(Duration::from_millis(250), Duration::from_secs(30));
     let mut url_idx = 0;
-
-    loop {
-        if shutdown.load(Ordering::Acquire) {
-            debug!(cluster = %remote.name, "gateway supervisor shutting down");
-            return;
-        }
-
+    crate::connector::common::run_supervisor(&remote.name, &shutdown, || {
         let url = &remote.urls[url_idx % remote.urls.len()];
         url_idx += 1;
-
-        match connect_gateway(url, &remote.name, &state, &shutdown) {
-            Ok(()) => {
-                backoff.reset();
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                warn!(cluster = %remote.name, "gateway connection lost, will reconnect");
-            }
-            Err(e) => {
-                if shutdown.load(Ordering::Acquire) {
-                    return;
-                }
-                warn!(cluster = %remote.name, url, error = %e, "gateway connection failed");
-            }
-        }
-
-        if shutdown.load(Ordering::Acquire) {
-            return;
-        }
-
-        let delay = backoff.next_delay();
-        debug!(
-            cluster = %remote.name,
-            delay_ms = delay.as_millis(),
-            "reconnecting to gateway peer"
-        );
-
-        let end = std::time::Instant::now() + delay;
-        while std::time::Instant::now() < end {
-            if shutdown.load(Ordering::Acquire) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
+        connect_gateway(url, &remote.name, &state, &shutdown)
+    });
 }
 
 /// Parse a gateway URL like "nats://host:port" into a TCP address.
@@ -281,7 +240,7 @@ fn connect_gateway(
     let writer_handle = std::thread::Builder::new()
         .name(format!("gateway-writer-{}", conn_id))
         .spawn(move || {
-            run_gateway_writer(tcp_writer, writer_dw, writer_shutdown);
+            crate::connector::common::run_writer_loop(tcp_writer, writer_dw, writer_shutdown);
         })
         .expect("failed to spawn gateway writer");
 
@@ -342,56 +301,6 @@ fn connect_gateway(
         "outbound gateway connection closed"
     );
     result
-}
-
-/// Writer thread: waits on MsgWriter's eventfd and flushes buffered data to TCP.
-fn run_gateway_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
-    let efd = dw.event_raw_fd();
-    let mut pfds = [libc::pollfd {
-        fd: efd,
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    let mut tcp_out = io::BufWriter::new(tcp);
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            if let Some(data) = dw.drain() {
-                let _ = tcp_out.write_all(&data);
-                let _ = tcp_out.flush();
-            }
-            return;
-        }
-
-        pfds[0].revents = 0;
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 1, 500) };
-        if ret < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            error!(error = %err, "gateway writer poll error");
-            return;
-        }
-
-        if pfds[0].revents & libc::POLLIN != 0 {
-            let mut val: u64 = 0;
-            unsafe {
-                libc::read(efd, &mut val as *mut u64 as *mut libc::c_void, 8);
-            }
-        }
-
-        if let Some(data) = dw.drain() {
-            if let Err(e) = tcp_out.write_all(&data) {
-                debug!(error = %e, "gateway writer TCP error");
-                return;
-            }
-            if let Err(e) = tcp_out.flush() {
-                debug!(error = %e, "gateway writer flush error");
-                return;
-            }
-        }
-    }
 }
 
 /// Main reader loop for an outbound gateway connection.
