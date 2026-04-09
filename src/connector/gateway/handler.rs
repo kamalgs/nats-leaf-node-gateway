@@ -106,25 +106,18 @@ impl GatewayHandler {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Generate synthetic SID for this gateway subscription.
-        let sid = match conn.ext {
-            ConnExt::Gateway {
-                ref mut gateway_sid_counter,
-                ref mut gateway_sids,
-                ref mut gateway_sids_by_subject,
-                ..
-            } => {
-                *gateway_sid_counter += 1;
-                let sid = *gateway_sid_counter;
-                gateway_sids.insert((subject.clone(), queue.clone()), sid);
-                gateway_sids_by_subject
-                    .entry(subject.clone())
-                    .or_default()
-                    .push((queue.clone(), sid));
-                sid
-            }
-            _ => unreachable!("gateway op on non-gateway connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("gateway conn");
+        // Gateway also maintains a secondary subject→(queue,sid) index for unsub.
+        if let ConnExt::Gateway {
+            ref mut gateway_sids_by_subject,
+            ..
+        } = conn.ext
+        {
+            gateway_sids_by_subject
+                .entry(subject.clone())
+                .or_default()
+                .push((queue.clone(), sid));
+        }
 
         let sub = Subscription::new(
             conn.conn_id,

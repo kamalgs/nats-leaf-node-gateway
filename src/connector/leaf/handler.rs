@@ -88,24 +88,7 @@ impl LeafHandler {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.clone()));
 
-        let sid = match conn.ext {
-            ConnExt::Leaf {
-                ref mut leaf_sid_counter,
-                ref mut leaf_sids,
-            } => {
-                *leaf_sid_counter += 1;
-                let sid = *leaf_sid_counter;
-                leaf_sids.insert((subject.clone(), queue.clone()), sid);
-                sid
-            }
-            ConnExt::Client => unreachable!("leaf op on client connection"),
-
-            ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
-
-            ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
-
-            ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("leaf conn");
 
         let upstream_queue = queue_str.clone();
 

@@ -146,20 +146,7 @@ impl RouteHandler {
     ) -> HandleResult {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
-
-        let sid = match conn.ext {
-            ConnExt::Route {
-                ref mut route_sid_counter,
-                ref mut route_sids,
-                ..
-            } => {
-                *route_sid_counter += 1;
-                let sid = *route_sid_counter;
-                route_sids.insert((subject.clone(), queue.clone()), sid);
-                sid
-            }
-            _ => unreachable!("route op on non-route connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("route conn");
 
         let sub = Subscription::new(
             conn.conn_id,
