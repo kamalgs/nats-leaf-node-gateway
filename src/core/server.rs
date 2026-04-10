@@ -21,6 +21,8 @@ use crate::buf::BufConfig;
 use crate::util::RwLockExt;
 
 use crate::connector::leaf::{Upstream, UpstreamCmd};
+#[cfg(feature = "io-uring")]
+use crate::core::uring_worker::IoUringWorker;
 use crate::core::worker::{Worker, WorkerHandle};
 
 use crate::sub_list::MsgWriter;
@@ -1544,7 +1546,7 @@ impl Server {
             .map(|i| {
                 #[cfg(feature = "io-uring")]
                 if self.config.use_io_uring {
-                    return Worker::spawn_uring(i, Arc::clone(&self.state));
+                    return IoUringWorker::spawn(i, Arc::clone(&self.state));
                 }
                 Worker::spawn(i, Arc::clone(&self.state))
             })

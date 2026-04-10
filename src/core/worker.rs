@@ -1,8 +1,8 @@
-//! N-worker reactor event loop.
+//! N-worker epoll event loop.
 //!
-//! Each worker owns one reactor instance (epoll or io_uring) multiplexing many
-//! client connections. MsgWriter notifies the *worker's* single eventfd, so
-//! fan-out to 100 connections on the same worker costs 1 eventfd write, not 100.
+//! Each worker owns one epoll instance multiplexing many client connections.
+//! MsgWriter notifies the *worker's* single eventfd, so fan-out to 100
+//! connections on the same worker costs 1 eventfd write, not 100.
 
 use std::collections::HashMap;
 
@@ -40,7 +40,6 @@ use crate::handler::{
     MessageDeliveryHub,
 };
 use crate::nats_proto;
-use crate::reactor::{EpollReactor, Reactor, ERROR, READABLE, WRITABLE};
 use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
 use crate::util::{LockExt, RwLockExt};
 
@@ -49,8 +48,8 @@ use crate::websocket::{self, DecodeStatus, WsCodec};
 
 use rustls::ServerConnection;
 
-/// Sentinel key in epoll_event.u64 for the worker's eventfd.
-const EVENT_FD_KEY: u64 = 0;
+/// Sentinel key in epoll/io_uring user_data for the worker's eventfd.
+pub(crate) const EVENT_FD_KEY: u64 = 0;
 
 // --- Worker commands ---
 
@@ -95,8 +94,8 @@ pub(crate) enum WorkerCmd {
 /// Handle for the acceptor to send connections and commands to a worker.
 pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
-    event_fd: Arc<OwnedFd>,
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    pub(crate) event_fd: Arc<OwnedFd>,
+    pub(crate) join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WorkerHandle {
@@ -184,34 +183,50 @@ impl WorkerHandle {
     }
 }
 
-// --- Worker ---
+// --- WorkerCore: connection management, protocol processing, metrics ---
+//
+// Shared between `Worker` (epoll) and `IoUringWorker` (io_uring).
 
-pub(crate) struct Worker<R: Reactor> {
-    reactor: R,
-    event_fd: Arc<OwnedFd>,
-    conns: FxHashMap<u64, ClientState>,
-    fd_to_conn: FxHashMap<RawFd, u64>,
-    rx: mpsc::Receiver<WorkerCmd>,
-    state: Arc<ServerState>,
-    info_line: Vec<u8>,
+pub(crate) struct WorkerCore {
+    pub(crate) event_fd: Arc<OwnedFd>,
+    pub(crate) conns: FxHashMap<u64, ClientState>,
+    pub(crate) fd_to_conn: FxHashMap<RawFd, u64>,
+    pub(crate) rx: mpsc::Receiver<WorkerCmd>,
+    pub(crate) state: Arc<ServerState>,
+    pub(crate) info_line: Vec<u8>,
     /// INFO line for inbound leaf connections (port set to leafnode_port).
-    hub_info_line: Vec<u8>,
-    shutdown: bool,
+    pub(crate) hub_info_line: Vec<u8>,
+    pub(crate) shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
     /// Deduplicates across multiple PUBs in the same read buffer.
-    pending_notify: [RawFd; 16],
-    pending_notify_count: usize,
+    pub(crate) pending_notify: [RawFd; 16],
+    pub(crate) pending_notify_count: usize,
     /// Worker index label for metrics.
-    worker_label: String,
+    pub(crate) worker_label: String,
     /// Thread-local metric accumulators — plain u64, no atomics.
     /// Flushed to the global `metrics` recorder once per epoll batch.
-    msgs_received: u64,
-    msgs_received_bytes: u64,
-    msgs_delivered: u64,
-    msgs_delivered_bytes: u64,
+    pub(crate) msgs_received: u64,
+    pub(crate) msgs_received_bytes: u64,
+    pub(crate) msgs_delivered: u64,
+    pub(crate) msgs_delivered_bytes: u64,
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
-    worker_index: usize,
+    pub(crate) worker_index: usize,
+    /// Raw fd of the I/O reactor (epoll or io_uring ring).
+    ///
+    /// Protocol processing methods call `epoll_modify(self.io_fd, ...)` to
+    /// toggle write interest. For the epoll worker this is the epoll fd.
+    /// For the io_uring worker this is set to `-1` — the `epoll_modify` calls
+    /// become harmless no-ops, and the uring event loop uses `epoll_has_out` on
+    /// `ClientState` to decide when to submit SEND SQEs.
+    pub(crate) io_fd: RawFd,
+}
+
+// --- Worker: epoll event loop ---
+
+pub(crate) struct Worker {
+    epoll_fd: OwnedFd,
+    core: WorkerCore,
 }
 
 // --- Connection state machine ---
@@ -258,16 +273,16 @@ struct TlsTransport {
 }
 
 pub(crate) struct ClientState {
-    fd: RawFd,
+    pub(crate) fd: RawFd,
     _stream: TcpStream,
-    read_buf: AdaptiveBuf,
-    write_buf: BytesMut,
-    direct_writer: MsgWriter,
-    direct_buf: Arc<Mutex<DirectBuf>>,
-    has_pending: Arc<AtomicBool>,
+    pub(crate) read_buf: AdaptiveBuf,
+    pub(crate) write_buf: BytesMut,
+    pub(crate) direct_writer: MsgWriter,
+    pub(crate) direct_buf: Arc<Mutex<DirectBuf>>,
+    pub(crate) has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
     transport: Transport,
-    ext: ConnExt,
+    pub(crate) ext: ConnExt,
 
     upstream_txs: Vec<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
@@ -277,11 +292,11 @@ pub(crate) struct ClientState {
     /// When true, send 503 no-responders status for request-reply with zero subscribers.
     no_responders: bool,
     /// When this connection was accepted (for auth timeout).
-    accepted_at: Instant,
+    pub(crate) accepted_at: Instant,
     /// Last time activity was seen on this connection.
-    last_activity: Instant,
+    pub(crate) last_activity: Instant,
     /// Number of server-initiated PINGs sent without a PONG response.
-    pings_outstanding: u32,
+    pub(crate) pings_outstanding: u32,
     /// Number of active subscriptions for this connection.
     pub(crate) sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
@@ -296,6 +311,11 @@ pub(crate) struct ClientState {
 }
 
 impl ClientState {
+    /// Whether the connection is in the Active or Draining phase.
+    pub(crate) fn is_active(&self) -> bool {
+        matches!(self.phase, ConnPhase::Active | ConnPhase::Draining)
+    }
+
     /// Build a per-connection context view for protocol handlers.
     fn conn_ctx(&mut self, conn_id: u64) -> ConnCtx<'_> {
         ConnCtx {
@@ -316,61 +336,81 @@ impl ClientState {
     }
 }
 
-impl Worker<EpollReactor> {
-    /// Spawn a worker thread using the epoll reactor. Returns a handle for sending commands.
+// ---------------------------------------------------------------------------
+// Free-standing epoll helpers — usable without borrowing `self`.
+// ---------------------------------------------------------------------------
+
+fn epoll_register(epoll_fd: RawFd, fd: RawFd, token: u64) -> io::Result<()> {
+    if epoll_fd < 0 {
+        return Ok(()); // io_uring worker — epoll not used
+    }
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: token,
+    };
+    let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn epoll_deregister(epoll_fd: RawFd, fd: RawFd) {
+    if epoll_fd < 0 {
+        return; // io_uring worker — epoll not used
+    }
+    unsafe {
+        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+    }
+}
+
+fn epoll_modify(epoll_fd: RawFd, fd: RawFd, token: u64, enable_out: bool) {
+    if epoll_fd < 0 {
+        return; // io_uring worker — epoll not used
+    }
+    let events = if enable_out {
+        libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
+    } else {
+        libc::EPOLLIN as u32
+    };
+    let mut ev = libc::epoll_event { events, u64: token };
+    unsafe {
+        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut ev);
+    }
+}
+
+impl Worker {
+    /// Spawn a worker thread using epoll. Returns a handle for sending commands.
     pub(crate) fn spawn(index: usize, state: Arc<ServerState>) -> WorkerHandle {
         let (tx, rx) = mpsc::channel();
         let event_fd = Arc::new(create_eventfd());
-        let info_json =
-            serde_json::to_string(&state.info).expect("failed to serialize server info");
-        let info_line = format!("INFO {info_json}\r\n").into_bytes();
-
-        // Build a separate INFO line for inbound leaf connections.
-        // Must have: port = leafnode_port, client_id != 0, leafnode_urls present.
-        // The Go nats-server checks CID != 0 && leafnode_urls != nil to confirm
-        // it connected to a leafnode port (not a client port).
-
-        let hub_info_line = if let Some(lp) = state.leaf.port {
-            let mut leaf_info = state.info.clone();
-            leaf_info.port = lp;
-            leaf_info.client_id = 1; // non-zero signals leafnode port
-            leaf_info.leafnode_urls = Some(vec![format!("{}:{}", leaf_info.host, lp)]);
-            let json = serde_json::to_string(&leaf_info).expect("failed to serialize leaf info");
-            format!("INFO {json}\r\n").into_bytes()
-        } else {
-            info_line.clone()
-        };
-
         let event_fd_clone = Arc::clone(&event_fd);
+
         let join_handle = std::thread::Builder::new()
             .name(format!("worker-{index}"))
             .spawn(move || {
-                let mut reactor = EpollReactor::new().expect("failed to create epoll instance");
-                reactor
-                    .register(event_fd.as_raw_fd(), EVENT_FD_KEY)
-                    .expect("failed to register eventfd");
+                let epoll_fd = unsafe { libc::epoll_create1(0) };
+                assert!(epoll_fd >= 0, "failed to create epoll instance");
+                let epoll_fd: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(epoll_fd) };
 
-                let mut worker = Worker {
-                    reactor,
-                    event_fd,
-                    conns: FxHashMap::default(),
-                    fd_to_conn: FxHashMap::default(),
-                    rx,
-                    state,
-                    info_line,
-
-                    hub_info_line,
-                    shutdown: false,
-                    pending_notify: [-1; 16],
-                    pending_notify_count: 0,
-                    worker_label: index.to_string(),
-                    msgs_received: 0,
-                    msgs_received_bytes: 0,
-                    msgs_delivered: 0,
-                    msgs_delivered_bytes: 0,
-                    #[cfg(feature = "worker-affinity")]
-                    worker_index: index,
+                // Register eventfd with epoll.
+                let mut ev = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: EVENT_FD_KEY,
                 };
+                let ret = unsafe {
+                    libc::epoll_ctl(
+                        epoll_fd.as_raw_fd(),
+                        libc::EPOLL_CTL_ADD,
+                        event_fd.as_raw_fd(),
+                        &mut ev,
+                    )
+                };
+                assert!(ret == 0, "failed to register eventfd with epoll");
+
+                let io_fd = epoll_fd.as_raw_fd();
+                let core = WorkerCore::new(index, state, event_fd, rx, io_fd);
+                let mut worker = Worker { epoll_fd, core };
                 worker.run();
             })
             .expect("failed to spawn worker thread");
@@ -381,82 +421,16 @@ impl Worker<EpollReactor> {
             join_handle: Some(join_handle),
         }
     }
-}
 
-#[cfg(feature = "io-uring")]
-impl Worker<crate::reactor::IoUringReactor> {
-    /// Spawn a worker thread using the io_uring reactor. Returns a handle for sending commands.
-    pub(crate) fn spawn_uring(index: usize, state: Arc<ServerState>) -> WorkerHandle {
-        let (tx, rx) = mpsc::channel();
-        let event_fd = Arc::new(create_eventfd());
-        let info_json =
-            serde_json::to_string(&state.info).expect("failed to serialize server info");
-        let info_line = format!("INFO {info_json}\r\n").into_bytes();
-
-        let hub_info_line = if let Some(lp) = state.leaf.port {
-            let mut leaf_info = state.info.clone();
-            leaf_info.port = lp;
-            leaf_info.client_id = 1;
-            leaf_info.leafnode_urls = Some(vec![format!("{}:{}", leaf_info.host, lp)]);
-            let json = serde_json::to_string(&leaf_info).expect("failed to serialize leaf info");
-            format!("INFO {json}\r\n").into_bytes()
-        } else {
-            info_line.clone()
-        };
-
-        let event_fd_clone = Arc::clone(&event_fd);
-        let join_handle = std::thread::Builder::new()
-            .name(format!("worker-{index}"))
-            .spawn(move || {
-                let mut reactor = crate::reactor::IoUringReactor::new()
-                    .expect("failed to create io_uring instance");
-                reactor
-                    .register(event_fd.as_raw_fd(), EVENT_FD_KEY)
-                    .expect("failed to register eventfd");
-
-                let mut worker = Worker {
-                    reactor,
-                    event_fd,
-                    conns: FxHashMap::default(),
-                    fd_to_conn: FxHashMap::default(),
-                    rx,
-                    state,
-                    info_line,
-
-                    hub_info_line,
-                    shutdown: false,
-                    pending_notify: [-1; 16],
-                    pending_notify_count: 0,
-                    worker_label: index.to_string(),
-                    msgs_received: 0,
-                    msgs_received_bytes: 0,
-                    msgs_delivered: 0,
-                    msgs_delivered_bytes: 0,
-                    #[cfg(feature = "worker-affinity")]
-                    worker_index: index,
-                };
-                worker.run();
-            })
-            .expect("failed to spawn worker thread");
-
-        WorkerHandle {
-            tx,
-            event_fd: event_fd_clone,
-            join_handle: Some(join_handle),
-        }
-    }
-}
-
-impl<R: Reactor> Worker<R> {
     fn run(&mut self) {
-        let mut events = vec![(0u64, 0u32); 256];
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 256];
 
-        // Compute reactor timeout for periodic keepalive and auth timeout checks.
+        // Compute epoll timeout for periodic keepalive and auth timeout checks.
         // Use half the ping interval (capped at 30s) so we check reasonably often.
         // If auth timeout is enabled, ensure we wake up often enough to enforce it.
-        let ping_interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
-        let auth_timeout_ms = self.state.auth_timeout_ms.load(Ordering::Relaxed);
-        let reactor_timeout_ms = {
+        let ping_interval_ms = self.core.state.ping_interval_ms.load(Ordering::Relaxed);
+        let auth_timeout_ms = self.core.state.auth_timeout_ms.load(Ordering::Relaxed);
+        let epoll_timeout_ms = {
             let ping_half = if ping_interval_ms == 0 {
                 u64::MAX
             } else {
@@ -478,31 +452,40 @@ impl<R: Reactor> Worker<R> {
         };
 
         loop {
-            let n = match self.reactor.wait(&mut events, reactor_timeout_ms) {
-                Ok(n) => n,
-                Err(err) => {
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    warn!(error = %err, "reactor wait failed");
-                    break;
-                }
+            let n = unsafe {
+                libc::epoll_wait(
+                    self.epoll_fd.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    epoll_timeout_ms,
+                )
             };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                warn!(error = %err, "epoll_wait failed");
+                break;
+            }
+            let n = n as usize;
 
-            for &(token, revents) in events.iter().take(n) {
+            for ev in &events[..n] {
+                let token = ev.u64;
+                let revents = ev.events;
                 if token == EVENT_FD_KEY {
-                    self.handle_eventfd();
+                    self.core.handle_eventfd();
                 } else {
                     let conn_id = token;
-                    if revents & ERROR != 0 {
-                        self.remove_conn(conn_id);
+                    if revents & libc::EPOLLERR as u32 != 0 {
+                        self.core.remove_conn(conn_id);
                         continue;
                     }
-                    if revents & READABLE != 0 {
-                        self.handle_read(conn_id);
+                    if revents & libc::EPOLLIN as u32 != 0 {
+                        self.core.handle_read(conn_id);
                     }
-                    if revents & WRITABLE != 0 {
-                        self.handle_write(conn_id);
+                    if revents & libc::EPOLLOUT as u32 != 0 {
+                        self.core.handle_write(conn_id);
                     }
                 }
             }
@@ -510,27 +493,78 @@ impl<R: Reactor> Worker<R> {
             // Flush any pending MsgWriter data after processing all events.
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
-            self.flush_pending();
+            self.core.flush_pending();
 
-            self.flush_metrics();
+            self.core.flush_metrics();
 
-            if reactor_timeout_ms > 0 {
-                self.check_pings();
-                self.check_auth_timeout();
+            if epoll_timeout_ms > 0 {
+                self.core.check_pings();
+                self.core.check_auth_timeout();
             }
 
-            if self.shutdown {
+            if self.core.shutdown {
                 break;
             }
         }
 
-        let conn_ids: Vec<u64> = self.conns.keys().copied().collect();
+        let conn_ids: Vec<u64> = self.core.conns.keys().copied().collect();
         for conn_id in conn_ids {
-            self.remove_conn(conn_id);
+            self.core.remove_conn(conn_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkerCore — shared connection management and protocol processing.
+// ---------------------------------------------------------------------------
+
+impl WorkerCore {
+    /// Build a new WorkerCore with shared state.
+    pub(crate) fn new(
+        index: usize,
+        state: Arc<ServerState>,
+        event_fd: Arc<OwnedFd>,
+        rx: mpsc::Receiver<WorkerCmd>,
+        io_fd: RawFd,
+    ) -> Self {
+        let info_json =
+            serde_json::to_string(&state.info).expect("failed to serialize server info");
+        let info_line = format!("INFO {info_json}\r\n").into_bytes();
+
+        let hub_info_line = if let Some(lp) = state.leaf.port {
+            let mut leaf_info = state.info.clone();
+            leaf_info.port = lp;
+            leaf_info.client_id = 1;
+            leaf_info.leafnode_urls = Some(vec![format!("{}:{}", leaf_info.host, lp)]);
+            let json = serde_json::to_string(&leaf_info).expect("failed to serialize leaf info");
+            format!("INFO {json}\r\n").into_bytes()
+        } else {
+            info_line.clone()
+        };
+
+        Self {
+            event_fd,
+            conns: FxHashMap::default(),
+            fd_to_conn: FxHashMap::default(),
+            rx,
+            state,
+            info_line,
+            hub_info_line,
+            shutdown: false,
+            pending_notify: [-1; 16],
+            pending_notify_count: 0,
+            worker_label: index.to_string(),
+            msgs_received: 0,
+            msgs_received_bytes: 0,
+            msgs_delivered: 0,
+            msgs_delivered_bytes: 0,
+            #[cfg(feature = "worker-affinity")]
+            worker_index: index,
+            io_fd,
         }
     }
 
-    fn handle_eventfd(&mut self) {
+    pub(crate) fn handle_eventfd(&mut self) {
         let mut val: u64 = 0;
         unsafe {
             libc::read(
@@ -587,7 +621,7 @@ impl<R: Reactor> Worker<R> {
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        if let Err(e) = self.reactor.register(fd, id) {
+        if let Err(e) = epoll_register(self.io_fd, fd, id) {
             warn!(id, error = %e, "reactor register failed");
             return;
         }
@@ -687,7 +721,7 @@ impl<R: Reactor> Worker<R> {
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        if let Err(e) = self.reactor.register(fd, id) {
+        if let Err(e) = epoll_register(self.io_fd, fd, id) {
             warn!(id, error = %e, "reactor register failed for {kind} conn");
             return;
         }
@@ -809,9 +843,9 @@ impl<R: Reactor> Worker<R> {
         }
     }
 
-    fn remove_conn(&mut self, conn_id: u64) {
+    pub(crate) fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
-            self.reactor.deregister(client.fd, conn_id);
+            epoll_deregister(self.io_fd, client.fd);
             self.fd_to_conn.remove(&client.fd);
             self.state
                 .active_connections
@@ -1134,7 +1168,7 @@ impl<R: Reactor> Worker<R> {
                                     }
                                 }
                                 if !client.epoll_has_out {
-                                    self.reactor.modify(client.fd, *conn_id, true);
+                                    epoll_modify(self.io_fd, client.fd, *conn_id, true);
                                     client.epoll_has_out = true;
                                 }
                             } else {
@@ -1163,7 +1197,7 @@ impl<R: Reactor> Worker<R> {
                                 all.advance(written);
                                 client.write_buf = all;
                                 if !client.epoll_has_out {
-                                    self.reactor.modify(client.fd, *conn_id, true);
+                                    epoll_modify(self.io_fd, client.fd, *conn_id, true);
                                     client.epoll_has_out = true;
                                 }
                             }
@@ -1221,7 +1255,7 @@ impl<R: Reactor> Worker<R> {
                         let err = io::Error::last_os_error();
                         if err.kind() == io::ErrorKind::WouldBlock {
                             if !client.epoll_has_out {
-                                self.reactor.modify(client.fd, *conn_id, true);
+                                epoll_modify(self.io_fd, client.fd, *conn_id, true);
                                 client.epoll_has_out = true;
                             }
                             break;
@@ -1270,7 +1304,7 @@ impl<R: Reactor> Worker<R> {
                         let err = io::Error::last_os_error();
                         if err.kind() == io::ErrorKind::WouldBlock {
                             if !client.epoll_has_out {
-                                self.reactor.modify(client.fd, *conn_id, true);
+                                epoll_modify(self.io_fd, client.fd, *conn_id, true);
                                 client.epoll_has_out = true;
                             }
                             break;
@@ -1298,7 +1332,7 @@ impl<R: Reactor> Worker<R> {
                 Transport::Tls(ref tls) => tls.enc_out.is_empty(),
             };
             if is_empty && client.epoll_has_out {
-                self.reactor.modify(client.fd, *conn_id, false);
+                epoll_modify(self.io_fd, client.fd, *conn_id, false);
                 client.epoll_has_out = false;
             }
         }
@@ -1309,7 +1343,7 @@ impl<R: Reactor> Worker<R> {
     }
 
     /// Send accumulated eventfd notifications to remote workers, then clear.
-    fn flush_notifications(&mut self) {
+    pub(crate) fn flush_notifications(&mut self) {
         let val: u64 = 1;
         for i in 0..self.pending_notify_count {
             unsafe {
@@ -1324,9 +1358,9 @@ impl<R: Reactor> Worker<R> {
     }
 
     /// Flush thread-local metric accumulators to the global recorder.
-    /// Called once per epoll batch — amortises atomic overhead across all
-    /// messages processed in a single `epoll_wait` wake-up.
-    fn flush_metrics(&mut self) {
+    /// Called once per event loop batch — amortises atomic overhead across all
+    /// messages processed in a single wake-up.
+    pub(crate) fn flush_metrics(&mut self) {
         if self.msgs_received > 0 {
             counter!("messages_received_total", "worker" => self.worker_label.clone())
                 .increment(self.msgs_received);
@@ -1386,7 +1420,7 @@ impl<R: Reactor> Worker<R> {
             client.pings_outstanding += 1;
             client.last_activity = now;
             if !client.epoll_has_out {
-                self.reactor.modify(client.fd, *conn_id, true);
+                epoll_modify(self.io_fd, client.fd, *conn_id, true);
                 client.epoll_has_out = true;
             }
         }
@@ -1418,7 +1452,7 @@ impl<R: Reactor> Worker<R> {
                     .write_buf
                     .extend_from_slice(b"-ERR 'Authentication Timeout'\r\n");
                 if !client.epoll_has_out {
-                    self.reactor.modify(client.fd, *conn_id, true);
+                    epoll_modify(self.io_fd, client.fd, *conn_id, true);
                     client.epoll_has_out = true;
                 }
                 to_remove.push(*conn_id);
@@ -1439,7 +1473,7 @@ impl<R: Reactor> Worker<R> {
             }
             client.write_buf.extend_from_slice(info_line);
             if !client.epoll_has_out {
-                self.reactor.modify(client.fd, *conn_id, true);
+                epoll_modify(self.io_fd, client.fd, *conn_id, true);
                 client.epoll_has_out = true;
             }
         }
@@ -1545,7 +1579,7 @@ impl<R: Reactor> Worker<R> {
                         (c.fd, c.epoll_has_out)
                     };
                     if !has_out {
-                        self.reactor.modify(fd, conn_id, true);
+                        epoll_modify(self.io_fd, fd, conn_id, true);
                         if let Some(c) = self.conns.get_mut(&conn_id) {
                             c.epoll_has_out = true;
                         }
@@ -1570,7 +1604,7 @@ impl<R: Reactor> Worker<R> {
             )
         };
         if has_out {
-            self.reactor.modify(fd, conn_id, false);
+            epoll_modify(self.io_fd, fd, conn_id, false);
             if let Some(c) = self.conns.get_mut(&conn_id) {
                 c.epoll_has_out = false;
             }
@@ -1914,13 +1948,13 @@ impl<R: Reactor> Worker<R> {
         }
 
         match modify_action {
-            1 => self.reactor.modify(modify_fd, conn_id, true),
-            2 => self.reactor.modify(modify_fd, conn_id, false),
+            1 => epoll_modify(self.io_fd, modify_fd, conn_id, true),
+            2 => epoll_modify(self.io_fd, modify_fd, conn_id, false),
             _ => {}
         }
     }
 
-    fn process_read_buf(&mut self, conn_id: u64) {
+    pub(crate) fn process_read_buf(&mut self, conn_id: u64) {
         loop {
             // Single lookup: read phase, kind, and can_skip together to avoid
             // separate conns.get calls in dispatch_active and can_skip_publishes.

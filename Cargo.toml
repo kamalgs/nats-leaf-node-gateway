@@ -14,7 +14,7 @@ interest-collapse = []
 subject-mapping = []
 worker-affinity = []  # Subject-based worker affinity tracking
 accounts = []  # Multi-tenant per-account subject isolation
-io-uring = ["dep:io-uring"]  # io_uring reactor (Linux 5.6+, readiness via POLL_ADD)
+io-uring = ["dep:io-uring"]  # io_uring worker (Linux 5.6+, RECV/SEND completion I/O)
 
 [dependencies]
 bytes = "1.4.0"

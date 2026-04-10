@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(feature = "io-uring")]
     if config.use_io_uring {
-        info!("using io_uring reactor");
+        info!("using io_uring worker (RECV/SEND completion I/O)");
     }
 
     let (shutdown, reload) = signals::setup();
