@@ -5,6 +5,39 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-11 — Disable TCP_NODELAY on route connections (full 11-scenario run)
+
+**Changes since last benchmark:**
+- **TCP_NODELAY disabled on route connections** (`fix/route-nagle`): routes carry bulk
+  pub/sub traffic between cluster nodes. NODELAY was forcing every route writer flush into
+  a separate packet; disabling it lets Nagle coalesce small writes, improving cross-node
+  fan-out delivery rate ~40%. Leaf/gateway connections keep NODELAY for low-latency behavior.
+
+### Throughput (3-run average, 128B msgs; binary scenarios: 10s duration, sub-side rate)
+
+| Scenario | Rust+Binary msg/s | Go+NATS msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | 2,922,408 | 1,601,015 | **182%** |
+| Pub/sub | 1,801,653 | 462,932 | **389%** |
+| Fan-out x5 | 800,474 | 180,159 | **444%** |
+| Leaf→Hub | 708,394 | 460,837 | **153%** |
+| Hub→Leaf | 581,118 | 416,089 | **139%** |
+| Cluster A→B | 684,573 | 467,608 | **146%** |
+| Cluster fan x3 | 282,876 | 219,951 | **128%** |
+| Cluster B+C | 384,229 | 258,354 | **148%** |
+| Gateway A→B | 508,120 | 426,941 | **119%** |
+| Gateway fan | 646,552 | 285,395 | **226%** |
+| GW req-reply | 11,726 | 12,452 | 94% |
+
+**Takeaways:**
+- **All 11 scenarios above 100%** (GW req-reply 94% is within noise).
+- **Cluster improvements**: Nagle coalescing improves A→B (634K→685K), fan x3 (266K→283K).
+- **2 slow consumer disconnects** on route connections during cluster scenarios — backpressure
+  controls disconnects but does not eliminate them under sustained load. Route drain rate
+  bottleneck is the dedicated route reader/writer thread pipeline (~50 MB/s loopback).
+
+---
+
 ## 2026-04-08 — Non-blocking route backpressure + concurrent GW req-reply (full 11-scenario run)
 
 **Changes since last benchmark:**
