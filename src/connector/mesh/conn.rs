@@ -197,7 +197,8 @@ fn connect_route(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = parse_route_url(seed_url);
     let tcp = TcpStream::connect(&addr)?;
-    tcp.set_nodelay(true)?;
+    // Routes prioritize bulk throughput; let Nagle coalesce small writes.
+    tcp.set_nodelay(false)?;
 
     let conn_id = next_route_conn_id();
     info!(addr = %addr, conn_id, "outbound route connection established");

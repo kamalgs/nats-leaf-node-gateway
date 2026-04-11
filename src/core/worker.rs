@@ -684,7 +684,10 @@ impl<R: Reactor> Worker<R> {
         let kind = ext.kind();
 
         stream.set_nonblocking(true).ok();
-        stream.set_nodelay(true).ok();
+        // Routes prioritize bulk throughput; let Nagle coalesce small writes.
+        // Leafs/gateways stay NODELAY for interactive low-latency behavior.
+        let nodelay = !matches!(ext, ConnExt::Route { .. });
+        stream.set_nodelay(nodelay).ok();
         let fd = stream.as_raw_fd();
 
         if let Err(e) = self.reactor.register(fd, id) {
