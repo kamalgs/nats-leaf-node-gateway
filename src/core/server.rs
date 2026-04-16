@@ -1193,12 +1193,29 @@ pub(crate) struct ServerState {
     /// Gateway inter-cluster state.
     pub gateway: GatewayState,
 
-    /// Per-subject bitmask of workers with matching subscriptions. Used
-    /// by the sharded-worker dispatch path (ADR-012 step 2). Maintained
-    /// alongside the global sub list today; step 5 switches
-    /// `deliver_to_subs_core` to consult this map to decide which
-    /// workers' inboxes to push into.
+    /// Per-subject bitmask of workers with matching subscriptions.
     pub worker_interest: crate::pubsub::worker_interest::WorkerInterest,
+
+    /// Cross-shard dispatch context, set once by ShardedServer.
+    /// The publish path reads this on every PUB (atomic load via OnceLock).
+    pub shard_dispatch: std::sync::OnceLock<ShardDispatch>,
+
+    /// Slot for the shard inbox receiver. The worker takes it once on
+    /// its first eventfd wake. Only used in sharded mode.
+    pub shard_inbox_slot: std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>>,
+}
+
+/// In-process cross-shard dispatch channels, set by ShardedServer.
+pub struct ShardDispatch {
+    /// This shard's index (0..N). Used to mask out self from the
+    /// interest bitmask.
+    pub shard_index: usize,
+    /// Per-shard inbox senders. Index matches the bit position in
+    /// WorkerInterest masks.
+    pub inboxes: Vec<std::sync::mpsc::Sender<crate::handler::ShardMsg>>,
+    /// Per-shard worker eventfds for waking the target worker after
+    /// pushing to its inbox. Same indexing.
+    pub eventfds: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 impl ServerState {
@@ -1352,6 +1369,8 @@ impl ServerState {
             cluster,
             gateway,
             worker_interest: crate::pubsub::worker_interest::WorkerInterest::new(),
+            shard_dispatch: std::sync::OnceLock::new(),
+            shard_inbox_slot: std::sync::Mutex::new(None),
         }
     }
 
@@ -1406,6 +1425,11 @@ impl ServerState {
 
 impl Server {
     /// Create a new leaf server with the given configuration.
+    /// Borrow the server's config.
+    pub fn config_ref(&self) -> &ServerConfig {
+        &self.config
+    }
+
     pub fn new(config: ServerConfig) -> Self {
         let nonce = if config.client_auth.needs_nonce() {
             generate_nonce()
@@ -1698,6 +1722,24 @@ impl Server {
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.run_with_hook(|_, _| {})
+    }
+
+    /// Spawn worker threads only — no listeners, no accept loop. The
+    /// hook receives the worker handles for connection injection. Blocks
+    /// until shutdown. Used by `ShardedServer` where the accept loop
+    /// lives in the parent, not in each shard.
+    pub fn run_workers_only<F>(&self, hook: F)
+    where
+        F: FnOnce(&[WorkerHandle], &Arc<ServerState>),
+    {
+        self.connect_upstream();
+        let workers = self.spawn_workers();
+        hook(&workers, &self.state);
+        // Park forever — workers run in their own threads and the
+        // ShardedServer's accept loop feeds connections via send_conn.
+        loop {
+            std::thread::park();
+        }
     }
 
     /// Like `run()`, but fires `hook` after worker threads are spawned

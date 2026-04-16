@@ -440,6 +440,8 @@ mod tests {
                 has_interest: AtomicBool::new(false),
             },
             worker_interest: crate::pubsub::worker_interest::WorkerInterest::new(),
+            shard_dispatch: std::sync::OnceLock::new(),
+            shard_inbox_slot: std::sync::Mutex::new(None),
         }
     }
 

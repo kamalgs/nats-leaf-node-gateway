@@ -146,6 +146,11 @@ impl ClientHandler {
 
         *conn.sub_count += 1;
 
+        // Track per-shard interest for cross-shard dispatch.
+        if let Some(ctx) = wctx.state.shard_dispatch.get() {
+            wctx.state.worker_interest.insert(subject_str, ctx.shard_index);
+        }
+
         propagate_all_interest(
             wctx.state,
             subject_str.as_bytes(),
@@ -385,6 +390,11 @@ fn cleanup_removed_sub(
         #[cfg(feature = "accounts")]
         wctx.state.account_name(conn.account_id).as_bytes(),
     );
+
+    if let Some(ctx) = wctx.state.shard_dispatch.get() {
+        wctx.state.worker_interest.remove(&removed.subject, ctx.shard_index);
+    }
+
     #[cfg(feature = "accounts")]
     propagate_reverse_unsub(wctx, conn.account_id, &removed.subject);
     debug!(conn_id = conn.conn_id, sid, subject = %removed.subject, reason);

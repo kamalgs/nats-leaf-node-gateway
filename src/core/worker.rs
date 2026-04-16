@@ -95,7 +95,7 @@ pub(crate) enum WorkerCmd {
 /// Handle for the acceptor to send connections and commands to a worker.
 pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
-    event_fd: Arc<OwnedFd>,
+    pub(crate) event_fd: Arc<OwnedFd>,
     join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -212,6 +212,9 @@ pub(crate) struct Worker<R: Reactor> {
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
     worker_index: usize,
+    /// Cross-shard inbox receiver. When set, the worker drains this on
+    /// every eventfd wake and delivers received messages to its local subs.
+    shard_inbox: Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>,
 }
 
 // --- Connection state machine ---
@@ -370,6 +373,7 @@ impl Worker<EpollReactor> {
                     msgs_delivered_bytes: 0,
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
+                    shard_inbox: None,
                 };
                 worker.run();
             })
@@ -434,6 +438,7 @@ impl Worker<crate::reactor::IoUringReactor> {
                     msgs_delivered_bytes: 0,
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
+                    shard_inbox: None,
                 };
                 worker.run();
             })
@@ -613,6 +618,39 @@ impl<R: Reactor> Worker<R> {
         }
         // Note: flush_pending is called after the event loop iteration in run(),
         // so we don't need to call it here.
+
+        // Take the shard inbox receiver from the slot (once).
+        if self.shard_inbox.is_none() {
+            if let Ok(mut slot) = self.state.shard_inbox_slot.try_lock() {
+                if let Some(rx) = slot.take() {
+                    self.shard_inbox = Some(rx);
+                }
+            }
+        }
+
+        // Drain cross-shard inbox: deliver received messages to local subs.
+        if let Some(ref inbox) = self.shard_inbox {
+            let mut dirty_writers: Vec<crate::sub_list::MsgWriter> = Vec::new();
+            while let Ok(shard_msg) = inbox.try_recv() {
+                let msg = crate::handler::Msg::new(
+                    shard_msg.subject,
+                    shard_msg.reply,
+                    shard_msg.headers.as_ref(),
+                    shard_msg.payload,
+                );
+                crate::handler::deliver_to_subs_upstream_inner(
+                    &self.state,
+                    &msg,
+                    &mut dirty_writers,
+                    &crate::handler::DeliveryScope::from_route(),
+                    #[cfg(feature = "accounts")]
+                    0,
+                );
+            }
+            for w in &dirty_writers {
+                w.notify();
+            }
+        }
     }
 
     fn add_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr, is_websocket: bool) {
@@ -2939,6 +2977,9 @@ impl<R: Reactor> Worker<R> {
                 if let Some(c) = self.conns.get_mut(&conn_id) {
                     c.sub_count += 1;
                 }
+                if let Some(ctx) = self.state.shard_dispatch.get() {
+                    self.state.worker_interest.insert(subject_str, ctx.shard_index);
+                }
                 propagate_all_interest(
                     &self.state,
                     frame.subject.as_ref(),
@@ -2978,9 +3019,12 @@ impl<R: Reactor> Worker<R> {
                         .store(!subs.is_empty(), Ordering::Release);
                     r
                 };
-                if removed.is_some() {
+                if let Some(ref removed) = removed {
                     if let Some(c) = self.conns.get_mut(&conn_id) {
                         c.sub_count = c.sub_count.saturating_sub(1);
+                    }
+                    if let Some(ctx) = self.state.shard_dispatch.get() {
+                        self.state.worker_interest.remove(&removed.subject, ctx.shard_index);
                     }
                 }
             }

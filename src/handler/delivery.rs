@@ -9,7 +9,7 @@
 //! - `forward_to_upstream()` — send to hub via mpsc
 //! - `handle_expired_subs()` — cleanup after delivery
 
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -80,6 +80,38 @@ pub(crate) struct Msg<'a> {
     pub reply: Option<Bytes>,
     pub headers: Option<&'a HeaderMap>,
     pub payload: Bytes,
+}
+
+/// Fully-owned message for cross-shard dispatch via channels.
+/// All fields are `Clone`-cheap (`Bytes` is refcounted, `HeaderMap` clone
+/// is rare since most messages have no headers).
+pub(crate) struct ShardMsg {
+    pub subject: Bytes,
+    pub reply: Option<Bytes>,
+    pub headers: Option<HeaderMap>,
+    pub payload: Bytes,
+}
+
+impl Clone for ShardMsg {
+    fn clone(&self) -> Self {
+        Self {
+            subject: self.subject.clone(),
+            reply: self.reply.clone(),
+            headers: self.headers.clone(),
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl ShardMsg {
+    pub(crate) fn from_msg(msg: &Msg<'_>) -> Self {
+        Self {
+            subject: msg.subject.clone(),
+            reply: msg.reply.clone(),
+            headers: msg.headers.cloned(),
+            payload: msg.payload.clone(),
+        }
+    }
 }
 
 impl<'a> Msg<'a> {
@@ -191,6 +223,36 @@ impl MessageDeliveryHub<'_> {
             expired.extend(cross_expired);
             expired
         };
+
+        // Cross-shard dispatch: if running in sharded mode, push the
+        // message to every remote shard that has matching interest.
+        // The remote shard's worker will drain its inbox and deliver
+        // to its own local subs.
+        if let Some(shard_ctx) = self.state.shard_dispatch.get() {
+            let mask = self.state.worker_interest.matching_workers(msg.subject_str());
+            let remote = mask & !(1u64 << shard_ctx.shard_index);
+            if remote != 0 {
+                let owned = ShardMsg::from_msg(msg);
+                let mut m = remote;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    if let Some(tx) = shard_ctx.inboxes.get(i) {
+                        let _ = tx.send(owned.clone());
+                    }
+                    if let Some(fd) = shard_ctx.eventfds.get(i) {
+                        let val: u64 = 1;
+                        unsafe {
+                            libc::write(
+                                fd.as_raw_fd(),
+                                &val as *const u64 as *const libc::c_void,
+                                8,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         (delivered, expired)
     }
@@ -856,6 +918,8 @@ mod tests {
                 has_interest: AtomicBool::new(false),
             },
             worker_interest: crate::pubsub::worker_interest::WorkerInterest::new(),
+            shard_dispatch: std::sync::OnceLock::new(),
+            shard_inbox_slot: std::sync::Mutex::new(None),
         }
     }
 
