@@ -40,7 +40,9 @@ Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
 ///
 /// Loads a config file as the base when `--config` is supplied, then applies
 /// any flag overrides on top. Returns `(config, config_file_path)`.
-pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error::Error>> {
+/// Returns `(config, config_path, shard_count)`. When `shard_count > 1`
+/// the caller should use `ShardedServer` instead of a single `Server`.
+pub fn from_args() -> Result<(ServerConfig, Option<String>, usize), Box<dyn std::error::Error>> {
     let mut args = pico_args::Arguments::from_env();
 
     let cfg_path: Option<String> = args.opt_value_from_str(["-c", "--config"])?;
@@ -222,6 +224,8 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         }
     }
 
+    let shards: usize = args.opt_value_from_str("--shards")?.unwrap_or(1);
+
     let remaining = args.finish();
     if !remaining.is_empty() {
         for arg in &remaining {
@@ -231,7 +235,7 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         std::process::exit(1);
     }
 
-    Ok((config, cfg_path))
+    Ok((config, cfg_path, shards))
 }
 
 /// Errors that can occur during config parsing.

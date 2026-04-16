@@ -693,7 +693,7 @@ fn fnv_hash_base36(s: &str) -> String {
 ///
 /// Spawns a background HTTP listener thread serving `/metrics` in Prometheus
 /// text format. Uses `metrics-exporter-prometheus` which is sync-compatible.
-fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     builder.with_http_listener(([0, 0, 0, 0], port)).install()?;
     Ok(())
@@ -1783,10 +1783,20 @@ impl Server {
             None
         };
 
+        let binary_listener = if let Some(bin_port) = self.config.binary_port {
+            let bin_addr = format!("{}:{}", self.config.host, bin_port);
+            let bl = TcpListener::bind(&bin_addr)?;
+            info!(addr = %bin_addr, "binary server listening");
+            Some(bl)
+        } else {
+            None
+        };
+
         let has_extra_listeners = ws_listener.is_some()
             || leaf_listener.is_some()
             || cluster_listener.is_some()
-            || gateway_listener.is_some();
+            || gateway_listener.is_some()
+            || binary_listener.is_some();
         if has_extra_listeners {
             listener.set_nonblocking(true)?;
             if let Some(ref wl) = ws_listener {
@@ -1800,6 +1810,9 @@ impl Server {
             }
             if let Some(ref gl) = gateway_listener {
                 gl.set_nonblocking(true)?;
+            }
+            if let Some(ref bl) = binary_listener {
+                bl.set_nonblocking(true)?;
             }
 
             let mut pfds = [
@@ -1834,14 +1847,20 @@ impl Server {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: binary_listener
+                        .as_ref()
+                        .map(|l| l.as_raw_fd())
+                        .unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             loop {
-                pfds[0].revents = 0;
-                pfds[1].revents = 0;
-                pfds[2].revents = 0;
-                pfds[3].revents = 0;
-                pfds[4].revents = 0;
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 5, -1) };
+                for pfd in pfds.iter_mut() {
+                    pfd.revents = 0;
+                }
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, -1) };
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -1882,6 +1901,14 @@ impl Server {
                     if let Some(ref gl) = gateway_listener {
                         while let Ok((stream, addr)) = gl.accept() {
                             self.accept_gateway_tcp(stream, addr, &workers, &mut next_worker);
+                        }
+                    }
+                }
+
+                if pfds[5].revents & libc::POLLIN != 0 {
+                    if let Some(ref bl) = binary_listener {
+                        while let Ok((stream, addr)) = bl.accept() {
+                            self.accept_binary_tcp(stream, addr, &workers, &mut next_worker);
                         }
                     }
                 }

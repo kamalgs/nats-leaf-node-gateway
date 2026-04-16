@@ -1,6 +1,6 @@
 //! Full-mesh route clustering (RS+/RS-/RMSG protocol).
 
-mod conn;
+pub(crate) mod conn;
 mod handler;
 
 pub(crate) use conn::*;

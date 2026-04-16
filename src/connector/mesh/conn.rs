@@ -197,10 +197,21 @@ fn connect_route(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = parse_route_url(seed_url);
     let tcp = TcpStream::connect(&addr)?;
-    // Routes prioritize bulk throughput; let Nagle coalesce small writes.
-    tcp.set_nodelay(false)?;
+    tcp.set_nodelay(false).ok();
+    run_outbound_route(tcp, state, shutdown)
+}
+
+/// Outbound route handshake + reader/writer loop on a pre-connected stream.
+/// Called by `connect_route` (over TCP) and by `ShardedServer` (over
+/// UnixStream-backed TcpStream) — same protocol, different transport.
+pub(crate) fn run_outbound_route(
+    tcp: TcpStream,
+    state: &Arc<ServerState>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
 
     let conn_id = next_route_conn_id();
+    let addr = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "in-process".into());
     info!(addr = %addr, conn_id, "outbound route connection established");
 
     let mut read_buf = BytesMut::with_capacity(state.buf_config.max_read_buf);

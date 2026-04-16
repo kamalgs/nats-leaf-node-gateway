@@ -28,6 +28,7 @@ use super::server::ServerState;
 /// Unix socket pairs that carry the existing route protocol.
 pub struct ShardedServer {
     shards: Vec<Server>,
+    metrics_port: Option<u16>,
 }
 
 impl ShardedServer {
@@ -39,13 +40,16 @@ impl ShardedServer {
     ///   - Metrics port = `base.metrics_port.map(|p| p + i as u16)`
     ///   - No cluster seeds (mesh is wired via Unix sockets, not TCP)
     pub fn new(base: ServerConfig, n: usize) -> Self {
+        let metrics_port = base.metrics_port;
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
             let mut cfg = base.clone();
             cfg.workers = 1;
             cfg.port = base.port + (i as u16) * 10;
             cfg.binary_port = base.binary_port.map(|p| p + (i as u16) * 10);
-            cfg.metrics_port = base.metrics_port.map(|p| p + i as u16);
+            // Metrics recorder is a process-global singleton — install
+            // once in run(), not per-shard.
+            cfg.metrics_port = None;
             cfg.monitoring_port = None;
             // No TCP cluster seeds — the hook below injects Unix pairs.
             cfg.cluster.seeds.clear();
@@ -54,7 +58,7 @@ impl ShardedServer {
 
             shards.push(Server::new(cfg));
         }
-        Self { shards }
+        Self { shards, metrics_port }
     }
 
     /// Start all shards. Blocks until all threads exit (i.e., forever).
@@ -72,6 +76,14 @@ impl ShardedServer {
         let n = self.shards.len();
         if n < 2 {
             return self.shards[0].run();
+        }
+
+        // Install the metrics exporter once for the whole process.
+        // Individual shards have metrics_port=None so they don't try
+        // to set the global recorder again.
+        if let Some(port) = self.metrics_port {
+            super::server::install_metrics_exporter(port)?;
+            info!(port, "prometheus metrics endpoint listening (sharded)");
         }
 
         info!(shards = n, "starting sharded server");
@@ -128,8 +140,26 @@ impl ShardedServer {
                     let tcp_b =
                         unsafe { TcpStream::from_raw_fd(us_b.into_raw_fd()) };
 
+                    // Side A → inject into shard i's worker as INBOUND
+                    // (worker runs the server-side handshake: send INFO,
+                    // wait for CONNECT).
                     inject_route_stream(&reg[i], tcp_a);
-                    inject_route_stream(&reg[j], tcp_b);
+
+                    // Side B → spawn a thread that runs the outbound
+                    // handshake (send CONNECT, wait for INFO) + the
+                    // route reader/writer loops. This thread lives as
+                    // long as the connection.
+                    let state_j = Arc::clone(&reg[j].1);
+                    let shutdown_j = Arc::new(AtomicBool::new(false));
+                    thread::spawn(move || {
+                        if let Err(e) = crate::connector::mesh::conn::run_outbound_route(
+                            tcp_b,
+                            &state_j,
+                            &shutdown_j,
+                        ) {
+                            tracing::warn!(error = %e, "in-process route connection closed");
+                        }
+                    });
                 }
             }
             drop(reg);

@@ -4,7 +4,7 @@
 //!   cargo run -- --port 4222
 //!   cargo run -- --port 4222 --hub nats://localhost:7422
 //!   cargo run -- --workers 8
-//!   cargo run -- --read-buf-max 32768 --write-buf-size 32768
+//!   cargo run -- --shards 4 --binary-port 4224
 //!   cargo run -- --ws-port 8222
 
 mod signals;
@@ -13,9 +13,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use open_wire::{config, Server};
+use open_wire::core::sharded::ShardedServer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (config, cfg_path) = config::from_args()?;
+    let (config, cfg_path, shards) = config::from_args()?;
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if let Some(ref log_path) = config.log_file {
@@ -42,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host = %config.host,
         port = config.port,
         workers = config.workers,
+        shards,
         "starting leaf node server"
     );
 
@@ -62,17 +64,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("using io_uring reactor");
     }
 
-    let (shutdown, reload) = signals::setup();
-    let pid_file = config.pid_file.clone();
-    let server = Server::new(config);
-    let result = server.run_until_shutdown(shutdown, reload, cfg_path.as_deref());
+    if shards > 1 {
+        info!(shards, "sharded mode: each shard is a single-worker instance");
+        let sharded = ShardedServer::new(config, shards);
+        sharded.run()
+    } else {
+        let (shutdown, reload) = signals::setup();
+        let pid_file = config.pid_file.clone();
+        let server = Server::new(config);
+        let result = server.run_until_shutdown(shutdown, reload, cfg_path.as_deref());
 
-    signals::clear();
+        signals::clear();
 
-    if let Some(ref pid_path) = pid_file {
-        let _ = std::fs::remove_file(pid_path);
+        if let Some(ref pid_path) = pid_file {
+            let _ = std::fs::remove_file(pid_path);
+        }
+
+        info!("server shut down gracefully");
+        result
     }
-
-    info!("server shut down gracefully");
-    result
 }
