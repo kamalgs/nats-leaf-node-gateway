@@ -228,6 +228,9 @@ impl MessageDeliveryHub<'_> {
         // message to every remote shard that has matching interest.
         // The remote shard's worker will drain its inbox and deliver
         // to its own local subs.
+        // Cross-shard dispatch: push to interested remote shards, batch
+        // the eventfd notifications alongside the normal MsgWriter
+        // notifications (flushed once after the entire read buffer).
         if let Some(shard_ctx) = self.state.shard_dispatch.get() {
             let mask = shard_ctx.interest.matching_workers(msg.subject_str());
             let remote = mask & !(1u64 << shard_ctx.shard_index);
@@ -241,14 +244,7 @@ impl MessageDeliveryHub<'_> {
                         let _ = tx.send(owned.clone());
                     }
                     if let Some(fd) = shard_ctx.eventfds.get(i) {
-                        let val: u64 = 1;
-                        unsafe {
-                            libc::write(
-                                fd.as_raw_fd(),
-                                &val as *const u64 as *const libc::c_void,
-                                8,
-                            );
-                        }
+                        self.queue_notify(fd.as_raw_fd());
                     }
                 }
             }
