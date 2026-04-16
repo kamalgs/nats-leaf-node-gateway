@@ -1697,6 +1697,17 @@ impl Server {
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_with_hook(|_, _| {})
+    }
+
+    /// Like `run()`, but fires `hook` after worker threads are spawned
+    /// and before the accept loop starts. Exposes the worker handles so
+    /// callers can inject pre-connected route streams (e.g., for
+    /// in-process sharding via `UnixStream::pair()`).
+    pub fn run_with_hook<F>(&self, hook: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&[WorkerHandle], &Arc<ServerState>),
+    {
         if let Some(port) = self.config.metrics_port {
             install_metrics_exporter(port)?;
             info!(port, "prometheus metrics endpoint listening");
@@ -1718,6 +1729,9 @@ impl Server {
         };
 
         let workers = self.spawn_workers();
+
+        hook(&workers, &self.state);
+
         let mut next_worker = 0usize;
 
         let bind_addr = format!("{}:{}", self.config.host, self.config.port);
