@@ -439,6 +439,7 @@ mod tests {
                 interest: std::sync::RwLock::new(FxHashMap::default()),
                 has_interest: AtomicBool::new(false),
             },
+            worker_interest: crate::pubsub::worker_interest::WorkerInterest::new(),
         }
     }
 

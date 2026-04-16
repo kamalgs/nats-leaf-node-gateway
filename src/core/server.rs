@@ -1192,6 +1192,13 @@ pub(crate) struct ServerState {
     pub cluster: ClusterState,
     /// Gateway inter-cluster state.
     pub gateway: GatewayState,
+
+    /// Per-subject bitmask of workers with matching subscriptions. Used
+    /// by the sharded-worker dispatch path (ADR-012 step 2). Maintained
+    /// alongside the global sub list today; step 5 switches
+    /// `deliver_to_subs_core` to consult this map to decide which
+    /// workers' inboxes to push into.
+    pub worker_interest: crate::pubsub::worker_interest::WorkerInterest,
 }
 
 impl ServerState {
@@ -1344,6 +1351,7 @@ impl ServerState {
             leaf,
             cluster,
             gateway,
+            worker_interest: crate::pubsub::worker_interest::WorkerInterest::new(),
         }
     }
 
