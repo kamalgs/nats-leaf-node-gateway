@@ -152,11 +152,17 @@ impl ShardedServer {
                     .flat_map(|(_, fds, _)| fds.iter().cloned())
                     .collect();
 
+                // Shared interest map — ALL shards read/write the same instance.
+                let shared_interest = Arc::new(
+                    crate::pubsub::worker_interest::WorkerInterest::new(),
+                );
+
                 for (i, (_, _, state)) in reg.iter().enumerate() {
                     let dispatch = ShardDispatch {
                         shard_index: i,
                         inboxes: senders.clone(),
                         eventfds: all_eventfds.clone(),
+                        interest: Arc::clone(&shared_interest),
                     };
                     let _ = state.shard_dispatch.set(dispatch);
                 }

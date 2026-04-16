@@ -229,7 +229,7 @@ impl MessageDeliveryHub<'_> {
         // The remote shard's worker will drain its inbox and deliver
         // to its own local subs.
         if let Some(shard_ctx) = self.state.shard_dispatch.get() {
-            let mask = self.state.worker_interest.matching_workers(msg.subject_str());
+            let mask = shard_ctx.interest.matching_workers(msg.subject_str());
             let remote = mask & !(1u64 << shard_ctx.shard_index);
             if remote != 0 {
                 let owned = ShardMsg::from_msg(msg);

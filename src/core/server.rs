@@ -1216,6 +1216,9 @@ pub struct ShardDispatch {
     /// Per-shard worker eventfds for waking the target worker after
     /// pushing to its inbox. Same indexing.
     pub eventfds: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
+    /// Shared cross-shard interest map. ALL shards read/write the SAME
+    /// instance so shard A's publish sees shard B's subscriptions.
+    pub interest: std::sync::Arc<crate::pubsub::worker_interest::WorkerInterest>,
 }
 
 impl ServerState {

@@ -2978,7 +2978,7 @@ impl<R: Reactor> Worker<R> {
                     c.sub_count += 1;
                 }
                 if let Some(ctx) = self.state.shard_dispatch.get() {
-                    self.state.worker_interest.insert(subject_str, ctx.shard_index);
+                    ctx.interest.insert(subject_str, ctx.shard_index);
                 }
                 propagate_all_interest(
                     &self.state,
@@ -3024,7 +3024,7 @@ impl<R: Reactor> Worker<R> {
                         c.sub_count = c.sub_count.saturating_sub(1);
                     }
                     if let Some(ctx) = self.state.shard_dispatch.get() {
-                        self.state.worker_interest.remove(&removed.subject, ctx.shard_index);
+                        ctx.interest.remove(&removed.subject, ctx.shard_index);
                     }
                 }
             }
