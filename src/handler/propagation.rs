@@ -3,12 +3,13 @@
 //! Propagates LS+/LS-, RS+/RS-, and gateway interest changes to connected
 //! leaf, route, and gateway peers. Also handles gateway reply rewriting.
 
+use std::cell::RefCell;
+use std::os::fd::AsRawFd;
+
 use crate::core::server::ServerState;
 use crate::nats_proto;
 use crate::sub_list::MsgWriter;
 use crate::util::RwLockExt;
-
-use std::cell::RefCell;
 
 /// Propagate LS+ (`is_sub=true`) or LS- (`is_sub=false`) to all inbound leaf connections.
 ///
@@ -112,19 +113,18 @@ pub(crate) fn propagate_route_interest(
     subject: &[u8],
     queue: Option<&[u8]>,
     is_sub: bool,
-    #[cfg(feature = "accounts")] account: &[u8],
+    #[cfg(feature = "accounts")] _account: &[u8],
 ) {
-    // Fast exit: no routes connected. Still track the count so that a later
-    // route connection's initial sync (send_existing_route_subs) reflects
-    // accurate local interest.
+    let cluster = state.cluster_state();
+
     let key = (
         bytes::Bytes::copy_from_slice(subject),
         queue.map(bytes::Bytes::copy_from_slice),
     );
     let should_emit = {
-        let mut counts = state.cluster.local_sub_counts.write_or_poison();
+        let mut counts = cluster.local_sub_counts.write_or_poison();
         if is_sub {
-            let c = counts.entry(key).or_insert(0);
+            let c = counts.entry(key.clone()).or_insert(0);
             *c += 1;
             *c == 1
         } else {
@@ -148,6 +148,39 @@ pub(crate) fn propagate_route_interest(
         return;
     }
 
+    // In sharded mode, scatter the RS+/RS- to all shards via inbox
+    // channels. Each shard writes to its own local route_writers.
+    if let Some(ctx) = state.shard_dispatch.get() {
+        let msg = if is_sub {
+            crate::handler::ShardMsg::RouteSub {
+                subject: key.0,
+                queue: key.1,
+            }
+        } else {
+            crate::handler::ShardMsg::RouteUnsub {
+                subject: key.0,
+                queue: key.1,
+            }
+        };
+        for (i, tx) in ctx.inboxes.iter().enumerate() {
+            // Best-effort: drop control messages when the shard inbox is full.
+            // The next 0→1 SUB transition will re-emit a fresh RS+/RS-.
+            let _ = tx.try_send(msg.clone());
+            if let Some(fd) = ctx.eventfds.get(i) {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(
+                        fd.as_raw_fd(),
+                        &val as *const u64 as *const libc::c_void,
+                        8,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    // Non-sharded: write directly to local route_writers.
     let writers = state.cluster.route_writers.read_or_poison();
     if writers.is_empty() {
         return;
@@ -158,14 +191,14 @@ pub(crate) fn propagate_route_interest(
                 subject,
                 queue,
                 #[cfg(feature = "accounts")]
-                account,
+                _account,
             );
         } else {
             writer.write_route_unsub(
                 subject,
                 queue,
                 #[cfg(feature = "accounts")]
-                account,
+                _account,
             );
         }
         writer.notify();
@@ -178,6 +211,20 @@ pub(crate) fn propagate_route_interest(
 /// function replaces the old `send_existing_subs_to_route` and
 /// `send_existing_subs_to_gateway`.
 pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) {
+    if state.shard_dispatch.get().is_some() {
+        let counts = state.cluster_state().local_sub_counts.read_or_poison();
+        for (subj, queue) in counts.keys() {
+            writer.write_route_sub(
+                subj,
+                queue.as_deref(),
+                #[cfg(feature = "accounts")]
+                b"$G",
+            );
+        }
+        writer.notify();
+        return;
+    }
+
     #[cfg(feature = "accounts")]
     {
         for (idx, account_sub) in state.account_subs.iter().enumerate() {

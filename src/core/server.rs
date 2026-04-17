@@ -1079,8 +1079,7 @@ pub(crate) struct ClusterState {
     /// last, matching NATS semantics. Without this, every client SUB would
     /// send an RS+, causing the receiving route to register N distinct route
     /// subs for the same subject → N× over-delivery on the return path.
-    pub local_sub_counts:
-        std::sync::RwLock<FxHashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>>,
+    pub local_sub_counts: std::sync::RwLock<FxHashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>>,
 }
 
 /// Runtime state for gateway inter-cluster connections.
@@ -1202,7 +1201,8 @@ pub(crate) struct ServerState {
 
     /// Slot for the shard inbox receiver. The worker takes it once on
     /// its first eventfd wake. Only used in sharded mode.
-    pub shard_inbox_slot: std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>>,
+    pub shard_inbox_slot:
+        std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>>,
 }
 
 /// In-process cross-shard dispatch channels, set by ShardedServer.
@@ -1210,18 +1210,38 @@ pub struct ShardDispatch {
     /// This shard's index (0..N). Used to mask out self from the
     /// interest bitmask.
     pub shard_index: usize,
-    /// Per-shard inbox senders. Index matches the bit position in
-    /// WorkerInterest masks.
-    pub inboxes: Vec<std::sync::mpsc::Sender<crate::handler::ShardMsg>>,
+    /// Bounded per-shard inbox senders. `try_send` returns Full when
+    /// the target shard can't keep up — the publisher sets `congested`.
+    pub inboxes: Vec<std::sync::mpsc::SyncSender<crate::handler::ShardMsg>>,
     /// Per-shard worker eventfds for waking the target worker after
     /// pushing to its inbox. Same indexing.
     pub eventfds: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
     /// Shared cross-shard interest map. ALL shards read/write the SAME
     /// instance so shard A's publish sees shard B's subscriptions.
     pub interest: std::sync::Arc<crate::pubsub::worker_interest::WorkerInterest>,
+    /// Set when any shard's inbox is full. The publishing worker
+    /// checks this to reduce its read_budget (same mechanism as route
+    /// congestion). Cleared by the publishing worker when all sends
+    /// succeed.
+    pub congested: std::sync::atomic::AtomicBool,
+    /// Shard 0's ServerState — shared cluster metadata authority.
+    /// Used for `local_sub_counts`, `route_peers`, and `connect_tx`
+    /// (NOT `route_writers` — those are per-shard local).
+    pub route_authority: std::sync::Arc<ServerState>,
 }
 
 impl ServerState {
+    /// Returns the shared cluster state for metadata operations
+    /// (local_sub_counts, route_peers, connect_tx). In sharded mode
+    /// this is shard 0's ClusterState. Route_writers are per-shard —
+    /// use `state.cluster.route_writers` for local route connections.
+    pub(crate) fn cluster_state(&self) -> &ClusterState {
+        match self.shard_dispatch.get() {
+            Some(ctx) => &ctx.route_authority.cluster,
+            None => &self.cluster,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         info: ServerInfo,
@@ -1736,10 +1756,11 @@ impl Server {
         F: FnOnce(&[WorkerHandle], &Arc<ServerState>),
     {
         self.connect_upstream();
+
         let workers = self.spawn_workers();
+
         hook(&workers, &self.state);
-        // Park forever — workers run in their own threads and the
-        // ShardedServer's accept loop feeds connections via send_conn.
+
         loop {
             std::thread::park();
         }

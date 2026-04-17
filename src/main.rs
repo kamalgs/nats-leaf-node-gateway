@@ -12,8 +12,8 @@ mod signals;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use open_wire::{config, Server};
 use open_wire::core::sharded::ShardedServer;
+use open_wire::{config, Server};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, cfg_path, shards) = config::from_args()?;
@@ -65,7 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if shards > 1 {
-        info!(shards, "sharded mode: each shard is a single-worker instance");
+        info!(
+            shards,
+            "sharded mode: each shard is a single-worker instance"
+        );
         let sharded = ShardedServer::new(config, shards);
         sharded.run()
     } else {

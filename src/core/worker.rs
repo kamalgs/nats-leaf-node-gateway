@@ -458,7 +458,10 @@ impl<R: Reactor> Worker<R> {
     /// per-worker busy time for Prometheus accounting.
     #[inline]
     fn thread_cpu_us() -> u64 {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         unsafe {
             libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
         }
@@ -628,24 +631,81 @@ impl<R: Reactor> Worker<R> {
             }
         }
 
-        // Drain cross-shard inbox: deliver received messages to local subs.
         if let Some(ref inbox) = self.shard_inbox {
             let mut dirty_writers: Vec<crate::sub_list::MsgWriter> = Vec::new();
-            while let Ok(shard_msg) = inbox.try_recv() {
-                let msg = crate::handler::Msg::new(
-                    shard_msg.subject,
-                    shard_msg.reply,
-                    shard_msg.headers.as_ref(),
-                    shard_msg.payload,
-                );
-                crate::handler::deliver_to_subs_upstream_inner(
-                    &self.state,
-                    &msg,
-                    &mut dirty_writers,
-                    &crate::handler::DeliveryScope::from_route(),
-                    #[cfg(feature = "accounts")]
-                    0,
-                );
+            let mut drained = 0usize;
+            while drained < 256 {
+                let shard_msg = match inbox.try_recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                drained += 1;
+                match shard_msg {
+                    crate::handler::ShardMsg::Deliver {
+                        subject,
+                        reply,
+                        headers,
+                        payload,
+                        skip_routes,
+                        skip_gateways,
+                    } => {
+                        let scope = crate::handler::DeliveryScope {
+                            skip_echo: true,
+                            skip_routes,
+                            skip_gateways,
+                        };
+                        let msg = crate::handler::Msg::new(
+                            subject,
+                            reply,
+                            headers.as_ref(),
+                            payload,
+                        );
+                        crate::handler::deliver_to_subs_upstream_inner(
+                            &self.state,
+                            &msg,
+                            &mut dirty_writers,
+                            &scope,
+                            #[cfg(feature = "accounts")]
+                            0,
+                        );
+                    }
+                    crate::handler::ShardMsg::RouteSub { subject, queue } => {
+                        let writers =
+                            self.state.cluster.route_writers.read_or_poison();
+                        for writer in writers.values() {
+                            writer.write_route_sub(
+                                &subject,
+                                queue.as_deref(),
+                                #[cfg(feature = "accounts")]
+                                b"$G",
+                            );
+                            writer.notify();
+                        }
+                    }
+                    crate::handler::ShardMsg::RouteUnsub { subject, queue } => {
+                        let writers =
+                            self.state.cluster.route_writers.read_or_poison();
+                        for writer in writers.values() {
+                            writer.write_route_unsub(
+                                &subject,
+                                queue.as_deref(),
+                                #[cfg(feature = "accounts")]
+                                b"$G",
+                            );
+                            writer.notify();
+                        }
+                    }
+                    crate::handler::ShardMsg::RouteInfoBroadcast { info_line } => {
+                        let writers =
+                            self.state.cluster.route_writers.read_or_poison();
+                        for writer in writers.values() {
+                            if !writer.is_binary() {
+                                writer.write_raw(&info_line);
+                                writer.notify();
+                            }
+                        }
+                    }
+                }
             }
             for w in &dirty_writers {
                 w.notify();
@@ -914,7 +974,7 @@ impl<R: Reactor> Worker<R> {
                 } = client.ext
                 {
                     self.state
-                        .cluster
+                        .cluster_state()
                         .route_peers
                         .lock_or_poison()
                         .connected
@@ -2224,7 +2284,7 @@ impl<R: Reactor> Worker<R> {
                         // bidirectional seed configs from creating two route connections
                         // per pair, which would double-deliver every routed message.
                         let is_duplicate = {
-                            let mut peers = self.state.cluster.route_peers.lock_or_poison();
+                            let mut peers = self.state.cluster_state().route_peers.lock_or_poison();
                             if peers.connected.contains_key(sid.as_str()) {
                                 true
                             } else {
