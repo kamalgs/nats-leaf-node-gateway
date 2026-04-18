@@ -94,7 +94,11 @@ fn spawn_server(workers: usize) -> Running {
     });
     wait_for_port(port);
     wait_for_port(binary_port);
-    Running { shutdown, port, binary_port }
+    Running {
+        shutdown,
+        port,
+        binary_port,
+    }
 }
 
 // ─── Binary-protocol frame helpers (matches `src/protocol/bin_proto.rs`) ─────
@@ -133,8 +137,7 @@ fn count_msg_frames(stream: &mut TcpStream, quiet_timeout: Duration) -> usize {
                 last_rx = Instant::now();
                 let subj_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
                 let repl_len = u16::from_le_bytes([hdr[3], hdr[4]]) as usize;
-                let pay_len =
-                    u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) as usize;
+                let pay_len = u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) as usize;
                 let body_len = subj_len + repl_len + pay_len;
                 if body_len > scratch.len() {
                     scratch.resize(body_len + 256, 0);
@@ -316,7 +319,11 @@ async fn binary_sub_mesh_2hub_cross_hub() {
     let _ = a_port; // silence unused
 
     let count = count_msg_frames(&mut sub, Duration::from_secs(1));
-    assert_eq!(count, 1, "mesh cross-hub: got {} msg frames, expected 1", count);
+    assert_eq!(
+        count, 1,
+        "mesh cross-hub: got {} msg frames, expected 1",
+        count
+    );
 }
 
 /// Mesh pair, 2 shards each. Sub on A, pub ALSO on A (same hub). This
@@ -338,7 +345,11 @@ async fn binary_sub_mesh_2hub_same_hub_pub() {
     nats.flush().await.unwrap();
 
     let count = count_msg_frames(&mut sub, Duration::from_secs(1));
-    assert_eq!(count, 1, "mesh same-hub: got {} msg frames, expected 1", count);
+    assert_eq!(
+        count, 1,
+        "mesh same-hub: got {} msg frames, expected 1",
+        count
+    );
 }
 
 /// Mesh pair, pub on A burst. Sub on A. Checks no double-delivery at
@@ -362,7 +373,11 @@ async fn binary_sub_mesh_2hub_same_hub_burst() {
     nats.flush().await.unwrap();
 
     let count = count_msg_frames(&mut sub, Duration::from_secs(1));
-    assert_eq!(count, N, "mesh same-hub burst: got {}, expected {}", count, N);
+    assert_eq!(
+        count, N,
+        "mesh same-hub burst: got {}, expected {}",
+        count, N
+    );
 }
 
 /// ShardedServer with 2 shards. This matches the bench's `OW_SHARDS=2`
@@ -411,13 +426,22 @@ async fn nats_on_multi_worker_no_shards() {
     let pub_client = async_nats::connect(format!("127.0.0.1:{}", rt.port))
         .await
         .unwrap();
-    pub_client.publish("test.sub", "hello".into()).await.unwrap();
+    pub_client
+        .publish("test.sub", "hello".into())
+        .await
+        .unwrap();
     pub_client.flush().await.unwrap();
 
-    let got = tokio::time::timeout(Duration::from_secs(2), futures_util::StreamExt::next(&mut sub))
-        .await
-        .expect("timed out waiting for message");
-    assert!(got.is_some(), "multi-worker NATS control: no message received");
+    let got = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::StreamExt::next(&mut sub),
+    )
+    .await
+    .expect("timed out waiting for message");
+    assert!(
+        got.is_some(),
+        "multi-worker NATS control: no message received"
+    );
 }
 
 /// Same-connection sub+pub on sharded 2. Tests the local-shard
@@ -439,9 +463,12 @@ async fn nats_same_conn_sharded_2() {
     client.publish("test.sub", "hello".into()).await.unwrap();
     client.flush().await.unwrap();
 
-    let got = tokio::time::timeout(Duration::from_secs(2), futures_util::StreamExt::next(&mut sub))
-        .await
-        .expect("timed out");
+    let got = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::StreamExt::next(&mut sub),
+    )
+    .await
+    .expect("timed out");
     assert!(got.is_some(), "sharded(2) same-conn: no message");
 }
 
@@ -464,13 +491,22 @@ async fn nats_client_sharded_2_control() {
     let pub_client = async_nats::connect(format!("127.0.0.1:{}", port))
         .await
         .unwrap();
-    pub_client.publish("test.sub", "hello".into()).await.unwrap();
+    pub_client
+        .publish("test.sub", "hello".into())
+        .await
+        .unwrap();
     pub_client.flush().await.unwrap();
 
-    let got = tokio::time::timeout(Duration::from_secs(3), futures_util::StreamExt::next(&mut sub))
-        .await
-        .expect("timed out waiting for message");
-    assert!(got.is_some(), "sharded(2) NATS control: no message received");
+    let got = tokio::time::timeout(
+        Duration::from_secs(3),
+        futures_util::StreamExt::next(&mut sub),
+    )
+    .await
+    .expect("timed out waiting for message");
+    assert!(
+        got.is_some(),
+        "sharded(2) NATS control: no message received"
+    );
 }
 
 /// ShardedServer with 2 shards, burst publish.
@@ -545,7 +581,9 @@ async fn binary_wildcard_sub_sharded_2_burst() {
         .unwrap();
     const N: usize = 50;
     for i in 0..N {
-        nats.publish(format!("test.sub.{}", i), "x".into()).await.unwrap();
+        nats.publish(format!("test.sub.{}", i), "x".into())
+            .await
+            .unwrap();
     }
     nats.flush().await.unwrap();
 
