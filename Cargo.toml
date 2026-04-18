@@ -56,6 +56,10 @@ harness = false
 name = "e2e"
 path = "tests/e2e.rs"
 
+[[test]]
+name = "binary_delivery"
+path = "tests/binary_delivery.rs"
+
 [profile.release]
 debug = 1
 strip = false
