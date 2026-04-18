@@ -169,11 +169,7 @@ pub(crate) fn propagate_route_interest(
             if let Some(fd) = ctx.eventfds.get(i) {
                 let val: u64 = 1;
                 unsafe {
-                    libc::write(
-                        fd.as_raw_fd(),
-                        &val as *const u64 as *const libc::c_void,
-                        8,
-                    );
+                    libc::write(fd.as_raw_fd(), &val as *const u64 as *const libc::c_void, 8);
                 }
             }
         }

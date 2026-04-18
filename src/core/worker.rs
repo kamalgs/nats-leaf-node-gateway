@@ -205,10 +205,18 @@ pub(crate) struct Worker<R: Reactor> {
     worker_label: String,
     /// Thread-local metric accumulators — plain u64, no atomics.
     /// Flushed to the global `metrics` recorder once per epoll batch.
-    msgs_received: u64,
-    msgs_received_bytes: u64,
-    msgs_delivered: u64,
-    msgs_delivered_bytes: u64,
+    /// Indexed by `ConnKind::as_index()` of the *publisher* connection.
+    msgs_received: [u64; ConnKind::COUNT],
+    msgs_received_bytes: [u64; ConnKind::COUNT],
+    msgs_delivered: [u64; ConnKind::COUNT],
+    msgs_delivered_bytes: [u64; ConnKind::COUNT],
+    /// Cross-shard fan-out tally — fan-outs that landed on this worker
+    /// via `shard_inbox` (no publisher kind known here, sub-side count).
+    msgs_delivered_shard: u64,
+    msgs_delivered_shard_bytes: u64,
+    /// Per-kind active connection count — keeps `connections_active{kind}`
+    /// gauge faithful without scanning `conns` on each accept/remove.
+    conns_active_by_kind: [usize; ConnKind::COUNT],
     /// Worker index within the worker pool (0-based).
     #[cfg(feature = "worker-affinity")]
     worker_index: usize,
@@ -367,10 +375,13 @@ impl Worker<EpollReactor> {
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
                     worker_label: index.to_string(),
-                    msgs_received: 0,
-                    msgs_received_bytes: 0,
-                    msgs_delivered: 0,
-                    msgs_delivered_bytes: 0,
+                    msgs_received: [0; ConnKind::COUNT],
+                    msgs_received_bytes: [0; ConnKind::COUNT],
+                    msgs_delivered: [0; ConnKind::COUNT],
+                    msgs_delivered_bytes: [0; ConnKind::COUNT],
+                    msgs_delivered_shard: 0,
+                    msgs_delivered_shard_bytes: 0,
+                    conns_active_by_kind: [0; ConnKind::COUNT],
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
                     shard_inbox: None,
@@ -432,10 +443,13 @@ impl Worker<crate::reactor::IoUringReactor> {
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
                     worker_label: index.to_string(),
-                    msgs_received: 0,
-                    msgs_received_bytes: 0,
-                    msgs_delivered: 0,
-                    msgs_delivered_bytes: 0,
+                    msgs_received: [0; ConnKind::COUNT],
+                    msgs_received_bytes: [0; ConnKind::COUNT],
+                    msgs_delivered: [0; ConnKind::COUNT],
+                    msgs_delivered_bytes: [0; ConnKind::COUNT],
+                    msgs_delivered_shard: 0,
+                    msgs_delivered_shard_bytes: 0,
+                    conns_active_by_kind: [0; ConnKind::COUNT],
                     #[cfg(feature = "worker-affinity")]
                     worker_index: index,
                     shard_inbox: None,
@@ -656,7 +670,8 @@ impl<R: Reactor> Worker<R> {
                         };
                         let msg =
                             crate::handler::Msg::new(subject, reply, headers.as_ref(), payload);
-                        crate::handler::deliver_to_subs_upstream_inner(
+                        let payload_len = msg.payload.len() as u64;
+                        let (delivered, _expired) = crate::handler::deliver_to_subs_upstream_inner(
                             &self.state,
                             &msg,
                             &mut dirty_writers,
@@ -664,6 +679,10 @@ impl<R: Reactor> Worker<R> {
                             #[cfg(feature = "accounts")]
                             0,
                         );
+                        if delivered > 0 {
+                            self.msgs_delivered_shard += delivered as u64;
+                            self.msgs_delivered_shard_bytes += payload_len * delivered as u64;
+                        }
                     }
                     crate::handler::ShardMsg::RouteSub { subject, queue } => {
                         let writers = self.state.cluster.route_writers.read_or_poison();
@@ -781,9 +800,14 @@ impl<R: Reactor> Worker<R> {
         self.fd_to_conn.insert(fd, id);
         self.conns.insert(id, client);
 
-        counter!("connections_total", "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
+        let kind = ConnKind::Client;
+        self.conns_active_by_kind[kind.as_index()] += 1;
+        counter!("connections_total",
+            "worker" => self.worker_label.clone(), "kind" => kind.as_str())
+        .increment(1);
+        gauge!("connections_active",
+            "worker" => self.worker_label.clone(), "kind" => kind.as_str())
+        .set(self.conns_active_by_kind[kind.as_index()] as f64);
 
         if is_websocket {
             debug!(id, addr = %addr, "accepted websocket connection on worker");
@@ -806,6 +830,7 @@ impl<R: Reactor> Worker<R> {
         ext: ConnExt,
     ) {
         let kind = ext.kind();
+        let kind_tag = ext.kind_tag();
 
         stream.set_nonblocking(true).ok();
         // Routes prioritize bulk throughput; let Nagle coalesce small writes.
@@ -859,10 +884,13 @@ impl<R: Reactor> Worker<R> {
         self.fd_to_conn.insert(fd, id);
         self.conns.insert(id, client);
 
-        let metric = format!("{kind}_connections_total");
-        counter!(metric, "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
+        self.conns_active_by_kind[kind_tag.as_index()] += 1;
+        counter!("connections_total",
+            "worker" => self.worker_label.clone(), "kind" => kind_tag.as_str())
+        .increment(1);
+        gauge!("connections_active",
+            "worker" => self.worker_label.clone(), "kind" => kind_tag.as_str())
+        .set(self.conns_active_by_kind[kind_tag.as_index()] as f64);
 
         debug!(id, addr = %addr, "accepted inbound {kind} connection");
         self.try_flush_conn(id);
@@ -944,6 +972,15 @@ impl<R: Reactor> Worker<R> {
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
 
+            let kind_tag = client.ext.kind_tag();
+            let kind_idx = kind_tag.as_index();
+            if self.conns_active_by_kind[kind_idx] > 0 {
+                self.conns_active_by_kind[kind_idx] -= 1;
+            }
+            gauge!("connections_active",
+                "worker" => self.worker_label.clone(), "kind" => kind_tag.as_str())
+            .set(self.conns_active_by_kind[kind_idx] as f64);
+
             if client.ext.is_leaf() {
                 self.state
                     .leaf
@@ -994,8 +1031,6 @@ impl<R: Reactor> Worker<R> {
             }
 
             cleanup_conn(conn_id, &self.state);
-            gauge!("connections_active", "worker" => self.worker_label.clone())
-                .set(self.conns.len() as f64);
             debug!(conn_id, "connection removed");
         }
     }
@@ -1455,38 +1490,57 @@ impl<R: Reactor> Worker<R> {
     /// Called once per epoll batch — amortises atomic overhead across all
     /// messages processed in a single `epoll_wait` wake-up.
     fn flush_metrics(&mut self) {
-        if self.msgs_received > 0 {
-            counter!("messages_received_total", "worker" => self.worker_label.clone())
-                .increment(self.msgs_received);
-            counter!("messages_received_bytes", "worker" => self.worker_label.clone())
-                .increment(self.msgs_received_bytes);
-            self.state
-                .stats
-                .in_msgs
-                .fetch_add(self.msgs_received, Ordering::Relaxed);
-            self.state
-                .stats
-                .in_bytes
-                .fetch_add(self.msgs_received_bytes, Ordering::Relaxed);
-            self.msgs_received = 0;
-            self.msgs_received_bytes = 0;
+        for (idx, kind) in ConnKind::ALL {
+            let r = self.msgs_received[idx];
+            if r > 0 {
+                let rb = self.msgs_received_bytes[idx];
+                counter!("messages_received_total",
+                    "worker" => self.worker_label.clone(), "kind" => kind)
+                .increment(r);
+                counter!("messages_received_bytes",
+                    "worker" => self.worker_label.clone(), "kind" => kind)
+                .increment(rb);
+                self.state.stats.in_msgs.fetch_add(r, Ordering::Relaxed);
+                self.state.stats.in_bytes.fetch_add(rb, Ordering::Relaxed);
+                self.msgs_received[idx] = 0;
+                self.msgs_received_bytes[idx] = 0;
+            }
+            let d = self.msgs_delivered[idx];
+            if d > 0 {
+                let db = self.msgs_delivered_bytes[idx];
+                counter!("messages_delivered_total",
+                    "worker" => self.worker_label.clone(), "kind" => kind)
+                .increment(d);
+                counter!("messages_delivered_bytes",
+                    "worker" => self.worker_label.clone(), "kind" => kind)
+                .increment(db);
+                self.state.stats.out_msgs.fetch_add(d, Ordering::Relaxed);
+                self.state.stats.out_bytes.fetch_add(db, Ordering::Relaxed);
+                self.msgs_delivered[idx] = 0;
+                self.msgs_delivered_bytes[idx] = 0;
+            }
         }
-        if self.msgs_delivered > 0 {
-            counter!("messages_delivered_total", "worker" => self.worker_label.clone())
-                .increment(self.msgs_delivered);
-            counter!("messages_delivered_bytes", "worker" => self.worker_label.clone())
-                .increment(self.msgs_delivered_bytes);
+        if self.msgs_delivered_shard > 0 {
+            counter!("messages_delivered_shard_total",
+                "worker" => self.worker_label.clone())
+            .increment(self.msgs_delivered_shard);
+            counter!("messages_delivered_shard_bytes",
+                "worker" => self.worker_label.clone())
+            .increment(self.msgs_delivered_shard_bytes);
             self.state
                 .stats
                 .out_msgs
-                .fetch_add(self.msgs_delivered, Ordering::Relaxed);
+                .fetch_add(self.msgs_delivered_shard, Ordering::Relaxed);
             self.state
                 .stats
                 .out_bytes
-                .fetch_add(self.msgs_delivered_bytes, Ordering::Relaxed);
-            self.msgs_delivered = 0;
-            self.msgs_delivered_bytes = 0;
+                .fetch_add(self.msgs_delivered_shard_bytes, Ordering::Relaxed);
+            self.msgs_delivered_shard = 0;
+            self.msgs_delivered_shard_bytes = 0;
         }
+        // pending write_buf depth across this worker's connections.
+        let pending: usize = self.conns.values().map(|c| c.write_buf.len()).sum();
+        gauge!("pending_write_bytes", "worker" => self.worker_label.clone()).set(pending as f64);
     }
 
     /// Send keepalive PINGs to idle connections and close unresponsive ones.
@@ -2700,16 +2754,17 @@ impl<R: Reactor> Worker<R> {
             let Some(client) = self.conns.get_mut(&conn_id) else {
                 return false;
             };
+            let kind_idx = client.ext.kind_tag().as_index();
             let mut conn_ctx = client.conn_ctx(conn_id);
             let mut worker_ctx = MessageDeliveryHub {
                 state: &self.state,
                 event_fd: self.event_fd.as_raw_fd(),
                 pending_notify: &mut self.pending_notify,
                 pending_notify_count: &mut self.pending_notify_count,
-                msgs_received: &mut self.msgs_received,
-                msgs_received_bytes: &mut self.msgs_received_bytes,
-                msgs_delivered: &mut self.msgs_delivered,
-                msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                msgs_received: &mut self.msgs_received[kind_idx],
+                msgs_received_bytes: &mut self.msgs_received_bytes[kind_idx],
+                msgs_delivered: &mut self.msgs_delivered[kind_idx],
+                msgs_delivered_bytes: &mut self.msgs_delivered_bytes[kind_idx],
                 worker_label: &self.worker_label,
                 #[cfg(feature = "worker-affinity")]
                 worker_index: self.worker_index,
@@ -2953,16 +3008,17 @@ impl<R: Reactor> Worker<R> {
                     let Some(client) = self.conns.get_mut(&conn_id) else {
                         return false;
                     };
+                    let kind_idx = client.ext.kind_tag().as_index();
                     let conn_ctx = client.conn_ctx(conn_id);
                     let mut wctx = MessageDeliveryHub {
                         state: &self.state,
                         event_fd: self.event_fd.as_raw_fd(),
                         pending_notify: &mut self.pending_notify,
                         pending_notify_count: &mut self.pending_notify_count,
-                        msgs_received: &mut self.msgs_received,
-                        msgs_received_bytes: &mut self.msgs_received_bytes,
-                        msgs_delivered: &mut self.msgs_delivered,
-                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                        msgs_received: &mut self.msgs_received[kind_idx],
+                        msgs_received_bytes: &mut self.msgs_received_bytes[kind_idx],
+                        msgs_delivered: &mut self.msgs_delivered[kind_idx],
+                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes[kind_idx],
                         worker_label: &self.worker_label,
                         #[cfg(feature = "worker-affinity")]
                         worker_index: self.worker_index,

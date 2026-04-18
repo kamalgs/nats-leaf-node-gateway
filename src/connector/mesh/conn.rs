@@ -891,11 +891,7 @@ pub(crate) fn broadcast_route_info(state: &ServerState) {
             if let Some(fd) = ctx.eventfds.get(i) {
                 let val: u64 = 1;
                 unsafe {
-                    libc::write(
-                        fd.as_raw_fd(),
-                        &val as *const u64 as *const libc::c_void,
-                        8,
-                    );
+                    libc::write(fd.as_raw_fd(), &val as *const u64 as *const libc::c_void, 8);
                 }
             }
         }
@@ -916,11 +912,7 @@ pub(crate) fn broadcast_route_info(state: &ServerState) {
 /// Dispatch a message to remote shards via cross-shard channels.
 /// Used by the outbound route reader thread which is not inside a
 /// worker's event loop and therefore doesn't go through `publish()`.
-fn dispatch_to_remote_shards(
-    state: &ServerState,
-    msg: &Msg<'_>,
-    scope: &DeliveryScope,
-) {
+fn dispatch_to_remote_shards(state: &ServerState, msg: &Msg<'_>, scope: &DeliveryScope) {
     let Some(ctx) = state.shard_dispatch.get() else {
         return;
     };
@@ -948,11 +940,7 @@ fn dispatch_to_remote_shards(
         if let Some(fd) = ctx.eventfds.get(i) {
             let val: u64 = 1;
             unsafe {
-                libc::write(
-                    fd.as_raw_fd(),
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
+                libc::write(fd.as_raw_fd(), &val as *const u64 as *const libc::c_void, 8);
             }
         }
     }

@@ -92,6 +92,7 @@ pub(crate) enum ConnExt {
 }
 
 /// Lightweight tag for dispatch — always compiled, no cfg gates on the enum itself.
+#[derive(Clone, Copy)]
 pub(crate) enum ConnKind {
     /// Normal NATS client connection.
     Client,
@@ -103,6 +104,44 @@ pub(crate) enum ConnKind {
     Gateway,
     /// Binary-protocol client connection.
     BinaryClient,
+}
+
+impl ConnKind {
+    /// Number of variants — for fixed-size per-kind accumulator arrays.
+    pub(crate) const COUNT: usize = 5;
+
+    /// Stable index in `[0, COUNT)` for array-keyed accumulators.
+    #[inline]
+    pub(crate) fn as_index(&self) -> usize {
+        match self {
+            Self::Client => 0,
+            Self::Leaf => 1,
+            Self::Route => 2,
+            Self::Gateway => 3,
+            Self::BinaryClient => 4,
+        }
+    }
+
+    /// Static label for Prometheus `kind` dimension.
+    #[inline]
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Leaf => "leaf",
+            Self::Route => "route",
+            Self::Gateway => "gateway",
+            Self::BinaryClient => "binary",
+        }
+    }
+
+    /// Iteration helper: `(index, label)` for every variant.
+    pub(crate) const ALL: [(usize, &'static str); Self::COUNT] = [
+        (0, "client"),
+        (1, "leaf"),
+        (2, "route"),
+        (3, "gateway"),
+        (4, "binary"),
+    ];
 }
 
 impl ConnExt {
