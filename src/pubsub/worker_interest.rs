@@ -65,8 +65,7 @@ impl WorkerInterestEntry {
     fn add(&self, worker_id: usize) -> bool {
         let prev = self.per_worker[worker_id].fetch_add(1, Ordering::AcqRel);
         if prev == 0 {
-            self.mask
-                .fetch_or(1u64 << worker_id, Ordering::AcqRel);
+            self.mask.fetch_or(1u64 << worker_id, Ordering::AcqRel);
             true
         } else {
             false
@@ -85,16 +84,10 @@ impl WorkerInterestEntry {
             if cur == 0 {
                 return false;
             }
-            match slot.compare_exchange_weak(
-                cur,
-                cur - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match slot.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => {
                     if cur == 1 {
-                        self.mask
-                            .fetch_and(!(1u64 << worker_id), Ordering::AcqRel);
+                        self.mask.fetch_and(!(1u64 << worker_id), Ordering::AcqRel);
                         return true;
                     }
                     return false;

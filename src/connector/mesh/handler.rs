@@ -109,8 +109,9 @@ impl ConnectionHandler for RouteHandler {
             }
             RouteOp::Info(info) => {
                 if !info.connect_urls.is_empty() {
-                    let mut peers = wctx.state.cluster.route_peers.lock_or_poison();
-                    let tx = wctx.state.cluster.connect_tx.lock_or_poison();
+                    let cs = wctx.state.cluster_state();
+                    let mut peers = cs.route_peers.lock_or_poison();
+                    let tx = cs.connect_tx.lock_or_poison();
                     for url in &info.connect_urls {
                         let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
@@ -163,6 +164,10 @@ impl RouteHandler {
         }
 
         *conn.sub_count += 1;
+
+        if let Some(ctx) = wctx.state.shard_dispatch.get() {
+            ctx.interest.insert(subject_str, ctx.shard_index);
+        }
 
         propagate_gateway_interest(
             wctx.state,
@@ -228,6 +233,10 @@ impl RouteHandler {
 
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
+
+            if let Some(ctx) = wctx.state.shard_dispatch.get() {
+                ctx.interest.remove(&removed.subject, ctx.shard_index);
+            }
 
             propagate_gateway_interest(
                 wctx.state,

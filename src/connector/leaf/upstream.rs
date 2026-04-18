@@ -203,7 +203,11 @@ fn connect_and_run(
 ) -> Result<(mpsc::Sender<UpstreamCmd>, TcpStream), Box<dyn std::error::Error>> {
     // Clear remote interests from any previous connection; hub will resend LS+ for active subs.
     {
-        let mut ri = state.leaf.remote_interests.write().expect("remote_interests poisoned");
+        let mut ri = state
+            .leaf
+            .remote_interests
+            .write()
+            .expect("remote_interests poisoned");
         ri.clear();
     }
     state

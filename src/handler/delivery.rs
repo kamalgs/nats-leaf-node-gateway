@@ -82,34 +82,46 @@ pub(crate) struct Msg<'a> {
     pub payload: Bytes,
 }
 
-/// Fully-owned message for cross-shard dispatch via channels.
-/// All fields are `Clone`-cheap (`Bytes` is refcounted, `HeaderMap` clone
-/// is rare since most messages have no headers).
-pub(crate) struct ShardMsg {
-    pub subject: Bytes,
-    pub reply: Option<Bytes>,
-    pub headers: Option<HeaderMap>,
-    pub payload: Bytes,
-}
-
-impl Clone for ShardMsg {
-    fn clone(&self) -> Self {
-        Self {
-            subject: self.subject.clone(),
-            reply: self.reply.clone(),
-            headers: self.headers.clone(),
-            payload: self.payload.clone(),
-        }
-    }
+/// Cross-shard message sent via inbox channels.
+///
+/// `Deliver` carries a data message for fan-out to local subscribers.
+/// Control variants (`RouteSub`, `RouteUnsub`, `RouteInfoBroadcast`)
+/// implement scatter-gather interest propagation so each shard writes
+/// RS+/RS-/INFO to its own local route connections.
+#[derive(Clone)]
+pub(crate) enum ShardMsg {
+    /// Data message — deliver to local subscribers.
+    Deliver {
+        subject: Bytes,
+        reply: Option<Bytes>,
+        headers: Option<HeaderMap>,
+        payload: Bytes,
+        skip_routes: bool,
+        skip_gateways: bool,
+    },
+    /// Scatter RS+ to local route connections.
+    RouteSub {
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    /// Scatter RS- to local route connections.
+    RouteUnsub {
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    /// Scatter route INFO update to local route connections.
+    RouteInfoBroadcast { info_line: Bytes },
 }
 
 impl ShardMsg {
-    pub(crate) fn from_msg(msg: &Msg<'_>) -> Self {
-        Self {
+    pub(crate) fn deliver_from_msg(msg: &Msg<'_>, scope: &DeliveryScope) -> Self {
+        Self::Deliver {
             subject: msg.subject.clone(),
             reply: msg.reply.clone(),
             headers: msg.headers.cloned(),
             payload: msg.payload.clone(),
+            skip_routes: scope.skip_routes,
+            skip_gateways: scope.skip_gateways,
         }
     }
 }
@@ -224,21 +236,28 @@ impl MessageDeliveryHub<'_> {
             expired
         };
 
-        // Cross-shard dispatch: if running in sharded mode, push the
-        // message to every remote shard that has matching interest.
-        // The remote shard's worker will drain its inbox and deliver
-        // to its own local subs.
         if let Some(shard_ctx) = self.state.shard_dispatch.get() {
-            let mask = shard_ctx.interest.matching_workers(msg.subject_str());
+            let exact_mask = shard_ctx.interest.matching_workers(msg.subject_str());
+            // When no exact match exists, broadcast to all shards so
+            // wildcard subscribers on remote shards still receive the
+            // message. Each shard's SubList has its own wildcard trie.
+            let mask = if exact_mask != 0 {
+                exact_mask
+            } else {
+                (1u64 << shard_ctx.inboxes.len()) - 1
+            };
             let remote = mask & !(1u64 << shard_ctx.shard_index);
             if remote != 0 {
-                let owned = ShardMsg::from_msg(msg);
+                let owned = ShardMsg::deliver_from_msg(msg, scope);
+                let mut any_full = false;
                 let mut m = remote;
                 while m != 0 {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
                     if let Some(tx) = shard_ctx.inboxes.get(i) {
-                        let _ = tx.send(owned.clone());
+                        if tx.try_send(owned.clone()).is_err() {
+                            any_full = true;
+                        }
                     }
                     if let Some(fd) = shard_ctx.eventfds.get(i) {
                         let val: u64 = 1;
@@ -250,6 +269,19 @@ impl MessageDeliveryHub<'_> {
                             );
                         }
                     }
+                }
+                if any_full {
+                    shard_ctx
+                        .congested
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Mirror shard channel backpressure into route_congested so
+                    // the worker reduces this client's read budget via the same
+                    // adjust_read_budget path used for route MsgWriter congestion.
+                    self.route_congested = true;
+                } else {
+                    shard_ctx
+                        .congested
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -431,9 +463,10 @@ pub(crate) fn deliver_to_subs(
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
-            // Signal route congestion so the worker can reduce this client's read budget.
-
-            if sub.is_route() && sub.writer.congestion() >= 1 {
+            // Signal sink congestion so the worker can reduce this client's read budget.
+            // Applies uniformly to client, leaf, and route subs — any slow consumer
+            // trips the publisher's TCP flow control via the same read_budget path.
+            if sub.writer.congestion() >= 1 {
                 wctx.route_congested = true;
             }
         },
@@ -531,7 +564,11 @@ pub(crate) fn forward_to_upstream(
             Ok(s) => s,
             Err(_) => return,
         };
-        let interests = state.leaf.remote_interests.read().expect("remote_interests poisoned");
+        let interests = state
+            .leaf
+            .remote_interests
+            .read()
+            .expect("remote_interests poisoned");
         let matches = interests
             .iter()
             .any(|pattern| crate::sub_list::subject_matches(pattern, subject_str));

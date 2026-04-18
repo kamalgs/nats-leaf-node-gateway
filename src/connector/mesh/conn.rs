@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,8 +178,8 @@ fn parse_route_url(url: &str) -> String {
 /// Process `connect_urls` from a peer's INFO, adding new URLs to
 /// `known_urls` and sending them to the coordinator channel.
 pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) {
-    let mut peers = state.cluster.route_peers.lock_or_poison();
-    let tx = state.cluster.connect_tx.lock_or_poison();
+    let mut peers = state.cluster_state().route_peers.lock_or_poison();
+    let tx = state.cluster_state().connect_tx.lock_or_poison();
     for url in connect_urls {
         let normalized = normalize_route_url(url);
         if peers.known_urls.insert(normalized.clone()) {
@@ -209,9 +210,11 @@ pub(crate) fn run_outbound_route(
     state: &Arc<ServerState>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-
     let conn_id = next_route_conn_id();
-    let addr = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "in-process".into());
+    let addr = tcp
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "in-process".into());
     info!(addr = %addr, conn_id, "outbound route connection established");
 
     let mut read_buf = BytesMut::with_capacity(state.buf_config.max_read_buf);
@@ -635,21 +638,20 @@ fn handle_route_op(
             payload,
             ..
         } => {
+            let scope = DeliveryScope::from_route();
             let msg = Msg::new(
                 subject.clone(),
                 reply.clone(),
                 headers.as_ref(),
                 payload.clone(),
             );
-            // One-hop: skip route subs — messages from a route peer are never
-            // re-forwarded to other route peers.
             let (_delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &msg,
                 dirty_writers,
-                &DeliveryScope::from_route(),
+                &scope,
                 #[cfg(feature = "accounts")]
-                0, // account_id — will use actual account from wire in Phase 4
+                0,
             );
             handle_expired_subs_upstream(
                 &expired,
@@ -657,6 +659,7 @@ fn handle_route_op(
                 #[cfg(feature = "accounts")]
                 0,
             );
+            dispatch_to_remote_shards(state, &msg, &scope);
         }
         RouteOp::Ping => {
             let mut w = io::BufWriter::new(tcp);
@@ -750,6 +753,7 @@ fn handle_bin_frame(
             }
         }
         BinOp::Msg => {
+            let scope = DeliveryScope::from_route();
             let reply = if frame.reply.is_empty() {
                 None
             } else {
@@ -760,7 +764,7 @@ fn handle_bin_frame(
                 state,
                 &msg,
                 dirty_writers,
-                &DeliveryScope::from_route(),
+                &scope,
                 #[cfg(feature = "accounts")]
                 0,
             );
@@ -770,6 +774,7 @@ fn handle_bin_frame(
                 #[cfg(feature = "accounts")]
                 0,
             );
+            dispatch_to_remote_shards(state, &msg, &scope);
         }
         BinOp::HMsg => {
             // Payload layout: [4B hdr_len LE][hdr_bytes][body]
@@ -796,12 +801,13 @@ fn handle_bin_frame(
             } else {
                 Some(frame.reply.clone())
             };
+            let scope = DeliveryScope::from_route();
             let msg = Msg::new(frame.subject.clone(), reply, Some(&headers), payload);
             let (_delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &msg,
                 dirty_writers,
-                &DeliveryScope::from_route(),
+                &scope,
                 #[cfg(feature = "accounts")]
                 0,
             );
@@ -811,6 +817,7 @@ fn handle_bin_frame(
                 #[cfg(feature = "accounts")]
                 0,
             );
+            dispatch_to_remote_shards(state, &msg, &scope);
         }
         BinOp::Ping => {
             let mut w = io::BufWriter::new(tcp);
@@ -830,7 +837,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_port = state.cluster.port.unwrap_or(0);
 
     let connect_urls = {
-        let peers = state.cluster.route_peers.lock_or_poison();
+        let peers = state.cluster_state().route_peers.lock_or_poison();
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
         if urls.is_empty() {
             String::new()
@@ -871,15 +878,83 @@ fn build_route_connect(state: &ServerState) -> String {
 /// Broadcast updated INFO (with current `connect_urls`) to all connected route peers.
 pub(crate) fn broadcast_route_info(state: &ServerState) {
     let info_line = build_route_info(state);
+
+    // In sharded mode, scatter to all shards — each writes to its local routes.
+    if let Some(ctx) = state.shard_dispatch.get() {
+        let msg = crate::handler::ShardMsg::RouteInfoBroadcast {
+            info_line: bytes::Bytes::from(info_line.into_bytes()),
+        };
+        for (i, tx) in ctx.inboxes.iter().enumerate() {
+            // Best-effort: drop INFO broadcasts when a shard inbox is full.
+            // Routes will receive the next INFO update when they reconnect.
+            let _ = tx.try_send(msg.clone());
+            if let Some(fd) = ctx.eventfds.get(i) {
+                let val: u64 = 1;
+                unsafe {
+                    libc::write(
+                        fd.as_raw_fd(),
+                        &val as *const u64 as *const libc::c_void,
+                        8,
+                    );
+                }
+            }
+        }
+        return;
+    }
+
     let info_bytes = info_line.as_bytes();
     let writers = state.cluster.route_writers.read_or_poison();
     for writer in writers.values() {
-        // Binary-mode connections don't use text INFO gossip.
         if writer.is_binary() {
             continue;
         }
         writer.write_raw(info_bytes);
         writer.notify();
+    }
+}
+
+/// Dispatch a message to remote shards via cross-shard channels.
+/// Used by the outbound route reader thread which is not inside a
+/// worker's event loop and therefore doesn't go through `publish()`.
+fn dispatch_to_remote_shards(
+    state: &ServerState,
+    msg: &Msg<'_>,
+    scope: &DeliveryScope,
+) {
+    let Some(ctx) = state.shard_dispatch.get() else {
+        return;
+    };
+    let exact_mask = ctx.interest.matching_workers(msg.subject_str());
+    let mask = if exact_mask != 0 {
+        exact_mask
+    } else {
+        (1u64 << ctx.inboxes.len()) - 1
+    };
+    let remote = mask & !(1u64 << ctx.shard_index);
+    if remote == 0 {
+        return;
+    }
+    let owned = crate::handler::ShardMsg::deliver_from_msg(msg, scope);
+    let mut m = remote;
+    while m != 0 {
+        let i = m.trailing_zeros() as usize;
+        m &= m - 1;
+        if let Some(tx) = ctx.inboxes.get(i) {
+            // Best-effort: if a shard inbox is full, the remote shard is
+            // overloaded. Drop this delivery — the route reader is not inside
+            // a worker event loop so there is no read_budget to reduce here.
+            let _ = tx.try_send(owned.clone());
+        }
+        if let Some(fd) = ctx.eventfds.get(i) {
+            let val: u64 = 1;
+            unsafe {
+                libc::write(
+                    fd.as_raw_fd(),
+                    &val as *const u64 as *const libc::c_void,
+                    8,
+                );
+            }
+        }
     }
 }
 
