@@ -44,3 +44,23 @@ event batch, `flush_pending()` iterates all local connections with
 - **Negative:** Batching adds latency — a message is not signalled until the
   entire read buffer is processed. In practice, epoll returns quickly and
   the added latency is sub-microsecond.
+
+## Addendum: Broadcast FD experiment (2026-04-19, abandoned)
+
+A follow-on experiment replaced the per-worker eventfd array with a single
+shared `broadcast_fd` on `ServerState`, registered in every worker's epoll.
+One write wakes all workers simultaneously, reducing `flush_notifications()`
+to a single unconditional syscall regardless of fan-out width.
+
+**Result:** throughput was unchanged (585K msg/s) but binary p99 degraded 5×
+(146ms → ~725ms avg across two reps) at 5K users / 3 hubs on c5.xlarge.
+
+**Root cause:** with 4 workers per hub, every cross-worker delivery wakes all
+4 workers instead of just the one with pending work. The three spurious wakes
+scan their connection lists, find nothing, and return — but the extra cache
+pressure and scheduling jitter accumulates into p99 latency. At the fan-out
+ratios observed (~190×), the thundering-herd cost dominates the syscall savings.
+
+**Conclusion:** the deduplicated per-fd array (O(unique workers) per batch,
+max 16 entries) is the correct design. Branch `feat/broadcast-fd` was
+abandoned; the dedup-only commit (`9e01584`) on `main` is the accepted state.
