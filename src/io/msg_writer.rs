@@ -4,7 +4,7 @@
 //! MSG/HMSG wire bytes directly into this shared buffer. The worker thread is
 //! notified via a shared eventfd to flush the buffer to TCP.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -438,6 +438,11 @@ impl MsgWriter {
                 8,
             );
         }
+    }
+
+    /// Return the raw fd of the shared eventfd for deduplication purposes.
+    pub(crate) fn event_fd_raw(&self) -> RawFd {
+        self.event_fd.as_raw_fd()
     }
 
     /// Drain all buffered data. Returns `None` if buffer was empty.

@@ -693,7 +693,7 @@ impl<R: Reactor> Worker<R> {
                                 #[cfg(feature = "accounts")]
                                 b"$G",
                             );
-                            writer.notify();
+                            dirty_writers.push(writer.clone());
                         }
                     }
                     crate::handler::ShardMsg::RouteUnsub { subject, queue } => {
@@ -705,7 +705,7 @@ impl<R: Reactor> Worker<R> {
                                 #[cfg(feature = "accounts")]
                                 b"$G",
                             );
-                            writer.notify();
+                            dirty_writers.push(writer.clone());
                         }
                     }
                     crate::handler::ShardMsg::RouteInfoBroadcast { info_line } => {
@@ -713,12 +713,16 @@ impl<R: Reactor> Worker<R> {
                         for writer in writers.values() {
                             if !writer.is_binary() {
                                 writer.write_raw(&info_line);
-                                writer.notify();
+                                dirty_writers.push(writer.clone());
                             }
                         }
                     }
                 }
             }
+            // Notify each unique eventfd once — multiple messages to the same worker
+            // (same eventfd) are deduplicated to avoid redundant write() syscalls.
+            dirty_writers.sort_unstable_by_key(|w| w.event_fd_raw());
+            dirty_writers.dedup_by_key(|w| w.event_fd_raw());
             for w in &dirty_writers {
                 w.notify();
             }
