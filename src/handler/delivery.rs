@@ -463,10 +463,10 @@ pub(crate) fn deliver_to_subs(
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
-            // Signal sink congestion so the worker can reduce this client's read budget.
-            // Applies uniformly to client, leaf, and route subs — any slow consumer
-            // trips the publisher's TCP flow control via the same read_budget path.
-            if sub.writer.congestion() >= 1 {
+            // Only hard route congestion (>75% buffer) triggers read_budget throttling.
+            // Soft congestion (25-75%) is informational; throttling all publishers on
+            // a 25%-full buffer causes thundering-herd over-correction at 10K+ users.
+            if sub.is_route() && sub.writer.congestion() >= 2 {
                 wctx.route_congested = true;
             }
         },

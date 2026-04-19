@@ -2803,11 +2803,13 @@ impl<R: Reactor> Worker<R> {
                 if client.read_budget > 65536 {
                     client.read_budget = 65536;
                 } else {
-                    client.read_budget = (client.read_budget / 2).max(256);
+                    client.read_budget = (client.read_budget / 2).max(8192);
                 }
             } else if client.read_budget < usize::MAX {
-                // Double toward unlimited when congestion clears.
-                client.read_budget = client.read_budget.saturating_mul(2);
+                // Recover 16× per clear batch (7 steps to unlimited vs 51 with 2×),
+                // preventing the stuck-throttle where brief congestion spikes keep
+                // the budget pinned near the floor for dozens of batches.
+                client.read_budget = client.read_budget.saturating_mul(16);
             }
         }
     }
@@ -3145,6 +3147,14 @@ impl<R: Reactor> Worker<R> {
                     if let Some(ctx) = self.state.shard_dispatch.get() {
                         ctx.interest.remove(&removed.subject, ctx.shard_index);
                     }
+                    propagate_all_interest(
+                        &self.state,
+                        removed.subject.as_bytes(),
+                        removed.queue.as_deref().map(str::as_bytes),
+                        false,
+                        #[cfg(feature = "accounts")]
+                        b"$G",
+                    );
                 }
             }
         }
@@ -3253,6 +3263,18 @@ fn cleanup_conn(id: u64, state: &ServerState) {
             for sub in &removed {
                 up.remove_interest(&sub.subject, sub.queue.as_deref());
             }
+        }
+        drop(upstreams);
+
+        for sub in &removed {
+            crate::handler::propagation::propagate_route_interest(
+                state,
+                sub.subject.as_bytes(),
+                sub.queue.as_deref().map(str::as_bytes),
+                false,
+                #[cfg(feature = "accounts")]
+                b"$G",
+            );
         }
     }
 
